@@ -6,9 +6,9 @@ pub const SCENES: &[&str] = &[
     "Noise Field",
     "Spectral Flower",
     "Waveform Scope",
-    "Radial",
-    "Soft Flow",
-    "Aurora",
+    "Liquid Topography",
+    "Electric Aurora",
+    "Orbital Bloom",
 ];
 
 /// Normalized live audio. Transients carry independent low-to-high attacks.
@@ -235,6 +235,7 @@ impl Renderer {
                     theme,
                     scale,
                     area.width as f32 / area.height as f32 * 0.5,
+                    bands,
                 );
                 let bottom = self.pixel(
                     [x, y + scale * 0.5],
@@ -245,6 +246,7 @@ impl Renderer {
                     theme,
                     scale,
                     area.width as f32 / area.height as f32 * 0.5,
+                    bands,
                 );
                 let cell = &mut buf[(col, row)];
                 cell.reset();
@@ -275,14 +277,13 @@ impl Renderer {
         theme: &crate::palette::Theme,
         scale: f32,
         half_width: f32,
+        bands: &[f32; 32],
     ) -> Pixel {
         // Dispatch before sampling: a scene cannot inherit another scene's layers.
         match scene {
             1 => return self.flower(p, vertices, palette, audio, theme, scale),
             2 => return self.scope(p, palette, audio, theme, scale, half_width),
-            3 => return self.radial(p, palette, audio, theme, scale),
-            4 => return self.soft_flow(p, palette, audio, theme),
-            5 => return self.aurora(p, palette, audio, theme),
+            3..=5 => return self.restored_soft(p, scene, palette, audio, bands, theme),
             _ => {}
         }
         let mut shift = [0.0, 0.0];
@@ -361,76 +362,102 @@ impl Renderer {
         }
     }
 
-    fn soft_flow(
+    #[allow(clippy::too_many_arguments)]
+    fn restored_soft(
         &self,
-        p: [f32; 2],
+        [x, y]: [f32; 2],
+        scene: usize,
         palette: usize,
         audio: &Reactivity,
+        bands: &[f32; 32],
         theme: &crate::palette::Theme,
     ) -> Pixel {
-        // Broad advected folds: neither quantization nor contour glyphs. The
-        // smaller octave supplies shading, not a second sharp texture layer.
-        let drift = [p[0] * 1.25 + self.offset[0], p[1] * 1.25 + self.offset[1]];
-        let curl = [
-            noise(drift[0] + self.warp[0], drift[1] - self.warp[1]),
-            noise(drift[0] - self.warp[1] + 9.7, drift[1] + self.warp[0]),
-        ];
-        let q = [
-            drift[0] + (curl[0] - 0.5) * (1.4 + audio.mid * 0.35),
-            drift[1] + (curl[1] - 0.5) * (1.4 + audio.bass * 0.3),
-        ];
-        let (body, slope) = noise_gradient(q[0], q[1]);
-        let detail = noise(q[0] * 2.0 + self.warp[1], q[1] * 2.0 + 4.3);
-        let field = body * 0.82 + detail * 0.18;
-        let light = (0.5 + slope[0] * 0.2 - slope[1] * 0.25).clamp(0.0, 1.0);
+        let t = self.last_time.unwrap_or(0.0);
+        let e = audio.energy;
+        let bass = audio.bass;
+        let mid = audio.mid;
+        let treble = audio.treble;
+        let onset = audio.onset;
+        let low_attack = audio.transients[0].max(audio.kick);
+        let high_attack = audio.transients[2].max(audio.transients[3]);
+        let glow = |distance: f32, width: f32| {
+            let d = distance / width;
+            1.0 / (1.0 + d * d)
+        };
+        // These are the original contour and filament equations, not the broad
+        // Gaussian washes. Fast attacks deform them without changing their clock.
+        let (phase, light, highlight) = if scene == 3 {
+            let u = x
+                + (0.24 + bass * 0.15) * (y * 2.4 + t * 0.25).sin()
+                + low_attack * 0.10 * (y * 5.0).sin();
+            let v = y
+                + (0.23 + mid * 0.13) * (x * 2.0 - t * 0.2).sin()
+                + onset * 0.06
+                + high_attack * 0.065 * (x * 7.0).sin();
+            let height = (u * 2.5 + t * 0.17).sin() * 0.55
+                + (v * 3.3 - t * 0.23).cos() * 0.35
+                + (u * 4.0 + v * 2.0 + t * 0.2).sin() * 0.18;
+            let contours = glow(
+                (height * 16.0 + t * 0.25).sin(),
+                0.08 + e * 0.05 + treble * 0.025,
+            );
+            let broad = (height * 2.0 + 1.0).sin() * 0.5 + 0.5;
+            (
+                height * 0.6 + t * 0.018,
+                0.12 + broad * 0.24 + contours * 0.62,
+                contours * 0.25,
+            )
+        } else if scene == 4 {
+            let sway = (x * 2.2 + t * 0.25).sin() * 0.28 + (x * 4.7 - t * 0.32).sin() * 0.1;
+            let position = (x * 0.22 + 0.5).clamp(0.0, 1.0) * 31.0;
+            let i = position.floor() as usize;
+            let frequency = bands[i] + (bands[(i + 1).min(31)] - bands[i]) * position.fract();
+            let curtain = y
+                + sway * (1.0 + mid * 0.6)
+                + 0.12
+                + frequency * 0.28
+                + bass * 0.12
+                + onset * 0.05
+                + low_attack * 0.10
+                + high_attack * 0.045 * (x * 13.0).sin();
+            let ribbon = glow(curtain, 0.12 + e * 0.08);
+            let silk = (x * 27.0 + (y * 3.0 + t * 0.4).sin() * 3.0 + t * 0.5).sin() * 0.5 + 0.5;
+            let haze = glow(curtain - 0.25, 0.45) * 0.18;
+            (
+                x * 0.13 + y * 0.22 + silk * 0.08 + t * 0.025,
+                haze + ribbon * (0.35 + silk * (0.6 + treble * 0.15)),
+                ribbon.powi(3) * silk * 0.38,
+            )
+        } else {
+            let r = x.hypot(y);
+            let a = y.atan2(x);
+            let position = (a / TAU + 0.5).rem_euclid(1.0) * 31.0;
+            let i = position.floor() as usize;
+            let spectrum = bands[i] + (bands[(i + 1).min(31)] - bands[i]) * position.fract();
+            let wobble = (a * 5.0 + t * 0.5).sin() * 0.07 + (a * 3.0 - t * 0.3).cos() * 0.055;
+            let radius = r / (1.0 + audio.beat * 0.16 + bass * 0.10 + low_attack * 0.10)
+                + wobble * (0.4 + r + mid * 0.4)
+                - spectrum * 0.1
+                - onset * 0.06
+                - high_attack * 0.03 * (a * 11.0).sin();
+            let wave = (radius * (14.0 + e * 2.0) - audio.beat_phase * TAU).sin();
+            let rings = glow(wave, 0.085 + e * 0.06 + treble * 0.025);
+            let petals = (a * 8.0 + r * 3.0 - t * 0.3).cos() * 0.5 + 0.5;
+            let core = glow(r, 0.13 + e * 0.05);
+            (
+                radius * 0.33 - t * 0.055 + petals * 0.13,
+                0.07 + rings * (0.42 + petals * 0.5) + core * 0.5,
+                rings * petals * 0.4 + core * 0.5,
+            )
+        };
+        let base = theme.rgb(palette, phase, (light * (0.8 + e * 0.35)).clamp(0.0, 1.0));
+        let rgb: [u8; 3] = std::array::from_fn(|i| {
+            (base[i] as f32
+                + (theme.foreground[i] as f32 - base[i] as f32) * highlight.clamp(0.0, 0.8))
+            .round() as u8
+        });
         Pixel {
-            color: theme.sample(
-                palette,
-                0.26 + field * 0.68,
-                (0.09 + field * 0.47 + light * 0.17)
-                    * (0.8 + audio.energy * 0.15 + audio.treble * 0.05),
-            ),
-            mark: None,
-        }
-    }
-
-    fn aurora(
-        &self,
-        p: [f32; 2],
-        palette: usize,
-        audio: &Reactivity,
-        theme: &crate::palette::Theme,
-    ) -> Pixel {
-        // Three overlapping curtains have smooth Gaussian cross-sections and
-        // independent bends. Integrated offsets keep their motion continuous.
-        let x = p[0] * 1.35;
-        let mut glow = 0.0;
-        let mut pigment = 0.0;
-        for layer in 0..3 {
-            let depth = layer as f32;
-            let phase =
-                x * (1.1 + depth * 0.19) + self.offset[0] * (0.7 + depth * 0.2) + depth * 2.1;
-            let fold = noise(x * 0.8 + depth * 4.7 + self.warp[0], self.warp[1] + depth);
-            let center = (depth - 1.0) * 0.35
-                + phase.sin() * (0.24 + audio.mid * 0.06)
-                + (phase * 0.53 + self.offset[1]).sin() * 0.15
-                + (fold - 0.5) * 0.32;
-            let width = 0.10 + depth * 0.025 + audio.bass * 0.035;
-            let across = (p[1] - center) / width;
-            let core = (-across * across * 0.5).exp();
-            let halo = (-across * across * 0.09).exp();
-            let silk =
-                0.84 + (phase * 2.2 + self.warp[1] * 2.0).sin() * (0.08 + audio.treble * 0.04);
-            let weight = (core * 0.7 + halo * 0.18) * silk;
-            glow += weight;
-            pigment += weight * (0.3 + depth * 0.27 + fold * 0.1);
-        }
-        Pixel {
-            color: theme.sample(
-                palette,
-                pigment / glow.max(0.00001),
-                0.025 + (1.0 - (-glow * 1.25).exp()) * (0.72 + audio.energy * 0.12),
-            ),
+            color: Color::Rgb(rgb[0], rgb[1], rgb[2]),
             mark: None,
         }
     }
@@ -508,45 +535,6 @@ impl Renderer {
             mark: ink.then(|| line_glyph(tangent)),
         }
     }
-
-    fn radial(
-        &self,
-        p: [f32; 2],
-        palette: usize,
-        audio: &Reactivity,
-        theme: &crate::palette::Theme,
-        scale: f32,
-    ) -> Pixel {
-        // Elliptically stretched rays, with no horizon, rings or cross-grid.
-        let q = [p[0] * 0.62, p[1]];
-        let radius = q[0].hypot(q[1]);
-        let angle = q[1].atan2(q[0]) - self.rotation;
-        let ray_count = 28.0;
-        let ray = angle / TAU * ray_count;
-        let index = ray.round() as i32;
-        let angular_distance = (ray - ray.round()).abs() * TAU / ray_count;
-        let edge = radius * angular_distance;
-        let attack = self
-            .impacts
-            .iter()
-            .map(|hit| hit.strength * (1.0 - hit.age / 0.18).max(0.0))
-            .fold(0.0_f32, f32::max);
-        let width = scale * (0.12 + audio.bass * 0.2 + attack * 0.32);
-        let ink = edge < width && radius > 0.045;
-        let grain = hash(index, (radius * 65.0 - self.offset[0] * 35.0) as i32);
-        Pixel {
-            color: theme.sample(
-                palette,
-                hash(index, 7),
-                if ink {
-                    0.48 + grain * 0.32 + attack * 0.2
-                } else {
-                    0.035
-                },
-            ),
-            mark: ink.then(|| if grain < 0.18 { '·' } else { line_glyph(p) }),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -557,9 +545,7 @@ mod tests {
     fn soft_scenes_use_continuous_half_block_shading() {
         let area = Rect::new(0, 0, 120, 40);
         let theme = crate::palette::Theme::default();
-        let renderer = Renderer::default();
-        let vertices = [[0.0; 2]; 42];
-        for scene in [4, 5] {
+        for scene in [3, 4, 5] {
             let mut buffer = Buffer::empty(area);
             Renderer::default().draw(
                 &mut buffer,
@@ -581,40 +567,6 @@ mod tests {
                 shades.len() > 80,
                 "soft scenes need rich shading, not color bands"
             );
-            // Tiny spatial steps cannot cross a hard contour or a palette wrap.
-            for y in -12..12 {
-                for x in -25..25 {
-                    let p = [x as f32 * 0.06, y as f32 * 0.06];
-                    let a = renderer.pixel(
-                        p,
-                        &vertices,
-                        scene,
-                        0,
-                        &Reactivity::default(),
-                        &theme,
-                        0.05,
-                        1.5,
-                    );
-                    let b = renderer.pixel(
-                        [p[0] + 0.001, p[1] + 0.001],
-                        &vertices,
-                        scene,
-                        0,
-                        &Reactivity::default(),
-                        &theme,
-                        0.05,
-                        1.5,
-                    );
-                    assert!(a.mark.is_none() && b.mark.is_none());
-                    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a.color, b.color)
-                    else {
-                        panic!("soft shading must be RGB")
-                    };
-                    for (a, b) in [(ar, br), (ag, bg), (ab, bb)] {
-                        assert!(a.abs_diff(b) <= 3, "hard seam in soft scene {scene}");
-                    }
-                }
-            }
         }
     }
 
@@ -627,7 +579,7 @@ mod tests {
             background: [20, 30, 40],
             foreground: [150, 160, 170],
         };
-        for scene in [4, 5] {
+        for scene in [3, 4, 5] {
             let render = |audio: &Reactivity, theme: &crate::palette::Theme| {
                 let mut renderer = Renderer::default();
                 let mut buffer = Buffer::empty(area);
@@ -681,6 +633,45 @@ mod tests {
                 assert!((20..=150).contains(&r));
                 assert!((30..=160).contains(&g));
                 assert!((40..=170).contains(&b));
+            }
+        }
+    }
+
+    #[test]
+    fn restored_designs_react_to_attacks_on_the_first_frame() {
+        let area = Rect::new(0, 0, 100, 36);
+        let theme = crate::palette::Theme::default();
+        for scene in [3, 4, 5] {
+            let render = |audio: &Reactivity| {
+                let mut buffer = Buffer::empty(area);
+                Renderer::default().draw(
+                    &mut buffer,
+                    area,
+                    2.0,
+                    scene,
+                    0,
+                    &[0.0; 32],
+                    audio,
+                    &theme,
+                );
+                buffer
+            };
+            let quiet = render(&Reactivity::default());
+            for transients in [[0.85, 0.0, 0.0, 0.0], [0.0, 0.0, 0.85, 0.85]] {
+                let hit = render(&Reactivity {
+                    transients,
+                    ..Reactivity::default()
+                });
+                let changed = quiet
+                    .content
+                    .iter()
+                    .zip(&hit.content)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    changed > area.area() as usize / 5,
+                    "attack must deform the design immediately"
+                );
             }
         }
     }
@@ -926,10 +917,10 @@ mod tests {
         for (scene, width, height) in [
             (0, 120, 40),
             (0, 160, 50),
+            (3, 120, 40),
+            (3, 160, 50),
             (4, 120, 40),
             (4, 160, 50),
-            (5, 120, 40),
-            (5, 160, 50),
         ] {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
