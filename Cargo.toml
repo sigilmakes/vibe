@@ -8,6 +8,7 @@ description = "A colourful, audio-reactive terminal playground"
 ratatui = "0.29"
 crossterm = "0.28"
 rustfft = "6"
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]

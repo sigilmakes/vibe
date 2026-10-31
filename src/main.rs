@@ -1,4 +1,5 @@
 mod audio;
+mod palette;
 mod ui;
 mod visuals;
 
@@ -9,8 +10,6 @@ use std::{
 };
 
 const FRAME_TIME: Duration = Duration::from_millis(16);
-const SCENE_SECONDS: f32 = 20.0;
-const TRANSITION_SECONDS: f32 = 2.5;
 
 fn demo_audio(t: f32) -> audio::AudioState {
     let phase = (t * 2.0).fract();
@@ -32,6 +31,8 @@ fn demo_audio(t: f32) -> audio::AudioState {
     state.mid = 0.25 + (t * 1.3).sin() * 0.15;
     state.treble = hat * 0.7;
     state.onset = kick.max(hat * 0.4);
+    state.transients = [kick, hat * 0.6, hat, hat * 0.8];
+    state.novelty = kick.max(hat);
     state.kick = kick;
     state.beat = kick;
     state.beat_phase = phase;
@@ -51,6 +52,8 @@ fn sensitivity(state: &audio::AudioState, gain: f32) -> visuals::Reactivity {
         mid: scale(state.mid),
         treble: scale(state.treble),
         onset: scale(state.onset),
+        transients: state.transients.map(scale),
+        novelty: scale(state.novelty),
         kick: scale(state.kick),
         beat: scale(state.beat),
         beat_phase: state.beat_phase,
@@ -67,7 +70,6 @@ enum ColorMode {
 #[derive(Clone, Copy)]
 enum MenuKind {
     Root,
-    Scenes,
     Palettes,
 }
 struct Menu {
@@ -77,15 +79,13 @@ struct Menu {
 impl Menu {
     fn items(&self) -> &'static [&'static str] {
         match self.kind {
-            MenuKind::Root => &["Scene", "Palette", "Analysis", "Controls"],
-            MenuKind::Scenes => visuals::SCENES,
-            MenuKind::Palettes => visuals::PALETTES,
+            MenuKind::Root => &["Palette", "Analysis", "Controls"],
+            MenuKind::Palettes => palette::PALETTES,
         }
     }
     fn title(&self) -> &'static str {
         match self.kind {
             MenuKind::Root => "Chromavibe",
-            MenuKind::Scenes => "Scene",
             MenuKind::Palettes => "Palette",
         }
     }
@@ -110,7 +110,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ←/→ or Space  Next scene  a    Auto scenes\n  s             Scenes      p    Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -122,19 +122,13 @@ struct Args {
     /// PipeWire output node name or serial
     #[arg(long, value_name = "NODE")]
     target: Option<String>,
-    /// Starting scene name (see --list)
-    #[arg(long, value_name = "NAME")]
-    scene: Option<String>,
     /// Starting colour palette (see --list)
     #[arg(long, value_name = "NAME")]
     palette: Option<String>,
-    /// Keep the selected scene instead of cycling
-    #[arg(long)]
-    manual: bool,
     /// Visual response strength; does not alter the tempo estimator
     #[arg(long, default_value = "1", value_parser = gain_arg)]
     sensitivity: f32,
-    /// List scenes and palettes
+    /// List terminal-derived palettes
     #[arg(long)]
     list: bool,
     /// Analyze live audio for 1–60 seconds, then print features (default: 12)
@@ -180,15 +174,10 @@ fn main() -> io::Result<()> {
     use clap::Parser;
     let args = Args::parse();
     if args.list {
-        println!(
-            "Scenes:   {}\nPalettes: {}",
-            visuals::SCENES.join(", "),
-            visuals::PALETTES.join(", ")
-        );
+        println!("Palettes: {}", palette::PALETTES.join(", "));
         return Ok(());
     }
-    let initial_scene = choice(args.scene.as_deref(), visuals::SCENES, "scene")?;
-    let initial_palette = choice(args.palette.as_deref(), visuals::PALETTES, "palette")?;
+    let initial_palette = choice(args.palette.as_deref(), palette::PALETTES, "palette")?;
     let mut demo = args.demo;
     let target = args.target;
     let (mut capture, mut shared, mut capture_error) = (None, None, None);
@@ -223,13 +212,12 @@ fn main() -> io::Result<()> {
         ColorMode::Always => crossterm::style::force_color_output(true),
         ColorMode::Never => crossterm::style::force_color_output(false),
     }
+    let theme = palette::detect();
+    let mut renderer = visuals::Renderer::default();
     let mut terminal = ratatui::init();
     let result = (|| -> io::Result<()> {
         let start = Instant::now();
-        let mut scene_start = 0.0;
-        let mut transition_start = None;
-        let (mut scene, mut palette) = (initial_scene, initial_palette);
-        let mut auto = !args.manual;
+        let mut palette = initial_palette;
         let mut analysis = false;
         let mut help = false;
         let mut menu: Option<Menu> = None;
@@ -242,40 +230,18 @@ fn main() -> io::Result<()> {
             } else {
                 snapshot(&shared)
             };
-            if auto
-                && transition_start.is_none()
-                && t - scene_start >= SCENE_SECONDS
-                && (state.kick > 0.5 || state.onset > 0.6 || t - scene_start > SCENE_SECONDS + 4.0)
-            {
-                transition_start = Some(t);
-            }
-            let blend = transition_start
-                .map(|since| ((t - since) / TRANSITION_SECONDS).clamp(0.0, 1.0))
-                .unwrap_or(0.0);
-            if blend >= 1.0 {
-                scene = (scene + 1) % visuals::SCENES.len();
-                scene_start = t;
-                transition_start = None;
-            }
-            let blend = if transition_start.is_some() {
-                blend
-            } else {
-                0.0
-            };
             let reactive = sensitivity(&state, gain);
             let bands = state.bands.map(|x| (x * gain).clamp(0.0, 1.0));
             terminal.draw(|frame| {
                 let area = frame.area();
-                visuals::draw(
+                renderer.draw(
                     frame.buffer_mut(),
                     area,
                     t,
-                    scene,
-                    (scene + 1) % visuals::SCENES.len(),
-                    blend,
                     palette,
                     &bands,
                     &reactive,
+                    &theme,
                 );
                 ui::draw(
                     frame,
@@ -298,9 +264,10 @@ fn main() -> io::Result<()> {
                             capture_error.as_deref().or(state.error.as_deref())
                         },
                     },
+                    &theme,
                 );
                 if let Some(menu) = &menu {
-                    ui::menu(frame, menu.title(), menu.items(), menu.selected);
+                    ui::menu(frame, menu.title(), menu.items(), menu.selected, &theme);
                 }
             })?;
             if event::poll(FRAME_TIME.saturating_sub(frame_start.elapsed()))? {
@@ -329,24 +296,13 @@ fn main() -> io::Result<()> {
                                 MenuKind::Root => match active.selected {
                                     0 => {
                                         menu = Some(Menu {
-                                            kind: MenuKind::Scenes,
-                                            selected: scene,
-                                        })
-                                    }
-                                    1 => {
-                                        menu = Some(Menu {
                                             kind: MenuKind::Palettes,
                                             selected: palette,
                                         })
                                     }
-                                    2 => analysis = true,
+                                    1 => analysis = true,
                                     _ => help = true,
                                 },
-                                MenuKind::Scenes => {
-                                    scene = active.selected;
-                                    scene_start = t;
-                                    transition_start = None;
-                                }
                                 MenuKind::Palettes => palette = active.selected,
                             },
                             _ => menu = Some(active),
@@ -373,26 +329,10 @@ fn main() -> io::Result<()> {
                     }
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Right | KeyCode::Char(' ') => {
-                            scene = (scene + 1) % visuals::SCENES.len();
-                            scene_start = t;
-                            transition_start = None;
-                        }
-                        KeyCode::Left => {
-                            scene = (scene + visuals::SCENES.len() - 1) % visuals::SCENES.len();
-                            scene_start = t;
-                            transition_start = None;
-                        }
                         KeyCode::Char('m') => {
                             menu = Some(Menu {
                                 kind: MenuKind::Root,
                                 selected: 0,
-                            })
-                        }
-                        KeyCode::Char('s') => {
-                            menu = Some(Menu {
-                                kind: MenuKind::Scenes,
-                                selected: scene,
                             })
                         }
                         KeyCode::Char('p') => {
@@ -400,11 +340,6 @@ fn main() -> io::Result<()> {
                                 kind: MenuKind::Palettes,
                                 selected: palette,
                             })
-                        }
-                        KeyCode::Char('a') => {
-                            auto = !auto;
-                            scene_start = t;
-                            transition_start = None;
                         }
                         KeyCode::Char('?') => help = true,
                         KeyCode::Char('+') | KeyCode::Char('=') => gain = (gain + 0.1).min(3.0),
@@ -453,25 +388,22 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn every_scene_renders_on_small_and_large_terminals() {
+    fn composition_renders_on_small_and_large_terminals() {
         let state = sensitivity(&demo_audio(4.2), 1.0);
+        let theme = palette::Theme::default();
         for (w, h) in [(1, 1), (80, 24), (160, 50)] {
-            for scene in 0..visuals::SCENES.len() {
-                let area = ratatui::layout::Rect::new(0, 0, w, h);
-                let mut buffer = ratatui::buffer::Buffer::empty(area);
-                visuals::draw(
-                    &mut buffer,
-                    area,
-                    4.2,
-                    scene,
-                    (scene + 1) % visuals::SCENES.len(),
-                    0.4,
-                    0,
-                    &[0.4; 32],
-                    &state,
-                );
-                assert!(buffer.content.iter().any(|cell| cell.symbol() == "▀"));
-            }
+            let area = ratatui::layout::Rect::new(0, 0, w, h);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            visuals::Renderer::default().draw(
+                &mut buffer,
+                area,
+                4.2,
+                0,
+                &[0.4; 32],
+                &state,
+                &theme,
+            );
+            assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
         }
     }
     #[test]
@@ -485,11 +417,11 @@ mod tests {
     #[test]
     fn menu_navigation_wraps_at_both_ends() {
         let mut menu = Menu {
-            kind: MenuKind::Scenes,
+            kind: MenuKind::Root,
             selected: 0,
         };
         menu.step(-1);
-        assert_eq!(menu.selected, visuals::SCENES.len() - 1);
+        assert_eq!(menu.selected, menu.items().len() - 1);
         menu.step(1);
         assert_eq!(menu.selected, 0);
     }

@@ -1,3 +1,5 @@
+use crate::palette::Theme;
+
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -20,18 +22,19 @@ pub struct Status<'a> {
     pub error: Option<&'a str>,
 }
 
-const BACKGROUND: Color = Color::Rgb(12, 15, 23);
-const MUTED: Color = Color::Rgb(133, 146, 165);
-const CYAN: Color = Color::Rgb(104, 224, 225);
-const PINK: Color = Color::Rgb(239, 131, 197);
-
-fn base() -> Style {
-    Style::default().fg(MUTED).bg(BACKGROUND)
+fn color([r, g, b]: [u8; 3]) -> Color {
+    Color::Rgb(r, g, b)
 }
 
-fn overlay(frame: &mut Frame, area: Rect, lines: Vec<Line<'_>>) {
+fn base(theme: &Theme) -> Style {
+    Style::default()
+        .fg(color(theme.foreground))
+        .bg(color(theme.background))
+}
+
+fn overlay(frame: &mut Frame, area: Rect, lines: Vec<Line<'_>>, theme: &Theme) {
     frame.render_widget(Clear, area);
-    frame.render_widget(Paragraph::new(lines).style(base()), area);
+    frame.render_widget(Paragraph::new(lines).style(base(theme)), area);
 }
 
 fn confident_bpm(status: &Status<'_>) -> Option<f32> {
@@ -53,20 +56,20 @@ fn level(value: f32) -> f32 {
     }
 }
 
-fn envelope(label: &str, value: f32, width: u16, color: Color) -> Line<'static> {
+fn envelope(label: &str, value: f32, width: u16, accent: Color, theme: &Theme) -> Line<'static> {
     let cells = width.saturating_sub(8).min(36) as usize;
     let filled = (level(value) * cells as f32).round() as usize;
     Line::from(vec![
         Span::raw(format!(" {label:<5} ")),
-        Span::styled("━".repeat(filled), Style::default().fg(color)),
+        Span::styled("━".repeat(filled), Style::default().fg(accent)),
         Span::styled(
             "─".repeat(cells - filled),
-            Style::default().fg(Color::Rgb(47, 57, 72)),
+            Style::default().fg(color(theme.ansi[8])),
         ),
     ])
 }
 
-fn spectrum(status: &Status<'_>, width: u16) -> Line<'static> {
+fn spectrum(status: &Status<'_>, width: u16, theme: &Theme) -> Line<'static> {
     let count = width.saturating_sub(2).min(32) as usize;
     let glyphs = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let mut spans = vec![Span::raw(" ")];
@@ -79,11 +82,11 @@ fn spectrum(status: &Status<'_>, width: u16) -> Line<'static> {
             .map(level)
             .fold(0.0, f32::max);
         let color = if i * 3 < count {
-            CYAN
+            color(theme.ansi[4])
         } else if i * 3 < count * 2 {
-            Color::Rgb(168, 167, 244)
+            color(theme.ansi[2])
         } else {
-            PINK
+            color(theme.ansi[3])
         };
         spans.push(Span::styled(
             glyphs[(value * 7.0).round() as usize].to_string(),
@@ -104,39 +107,67 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn help_popup(frame: &mut Frame) {
+fn help_popup(frame: &mut Frame, theme: &Theme) {
     let area = centered(frame.area(), 38, 9);
     let lines = vec![
         Line::styled(
             " Controls",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color(theme.ansi[12]))
+                .add_modifier(Modifier::BOLD),
         ),
         Line::raw(" m     opens menu"),
         Line::raw(" Esc   closes menu / popup"),
         Line::raw(" ↑/↓ Enter navigate / select menus"),
-        Line::raw(" ←/→   quick scene"),
+        Line::raw(" p     palette menu"),
         Line::raw(" +/-   sensitivity"),
         Line::raw(" d     demo"),
         Line::raw(" r     reconnect"),
         Line::raw(" q     quit"),
     ];
-    overlay(frame, area, lines);
+    overlay(frame, area, lines, theme);
 }
 
-fn analysis_popup(frame: &mut Frame, status: &Status<'_>) {
+fn analysis_popup(frame: &mut Frame, status: &Status<'_>, theme: &Theme) {
     let area = centered(frame.area(), 44, 10);
     let lines = vec![
         Line::styled(
             " Analysis",
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(color(theme.ansi[12]))
+                .add_modifier(Modifier::BOLD),
         ),
-        spectrum(status, area.width),
-        envelope("bass", status.bass, area.width, CYAN),
-        envelope("mid", status.mid, area.width, Color::Rgb(168, 167, 244)),
-        envelope("high", status.treble, area.width, PINK),
-        envelope("onset", status.onset, area.width, PINK),
-        envelope("kick", status.kick, area.width, CYAN),
-        envelope("beat", status.beat, area.width, CYAN),
+        spectrum(status, area.width, theme),
+        envelope("bass", status.bass, area.width, color(theme.ansi[4]), theme),
+        envelope("mid", status.mid, area.width, color(theme.ansi[2]), theme),
+        envelope(
+            "high",
+            status.treble,
+            area.width,
+            color(theme.ansi[3]),
+            theme,
+        ),
+        envelope(
+            "onset",
+            status.onset,
+            area.width,
+            color(theme.ansi[11]),
+            theme,
+        ),
+        envelope(
+            "kick",
+            status.kick,
+            area.width,
+            color(theme.ansi[12]),
+            theme,
+        ),
+        envelope(
+            "beat",
+            status.beat,
+            area.width,
+            color(theme.ansi[10]),
+            theme,
+        ),
         Line::raw(format!(" {}", tempo(status))),
         Line::raw(format!(
             " Confidence {:.2} · response {:.1}×",
@@ -144,11 +175,11 @@ fn analysis_popup(frame: &mut Frame, status: &Status<'_>) {
             status.sensitivity
         )),
     ];
-    overlay(frame, area, lines);
+    overlay(frame, area, lines, theme);
 }
 
 /// Draw a compact, opaque menu above the canvas.
-pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize) {
+pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize, theme: &Theme) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
         return;
@@ -168,7 +199,9 @@ pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize) {
     let first = selected.saturating_sub(capacity.saturating_sub(1));
     let mut lines = vec![Line::styled(
         format!(" {title}"),
-        Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(color(theme.ansi[12]))
+            .add_modifier(Modifier::BOLD),
     )];
     for (index, item) in items.iter().enumerate().skip(first).take(capacity) {
         let active = index == selected;
@@ -179,19 +212,19 @@ pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize) {
         );
         let style = if active {
             Style::default()
-                .fg(BACKGROUND)
-                .bg(CYAN)
+                .fg(color(theme.background))
+                .bg(color(theme.foreground))
                 .add_modifier(Modifier::BOLD)
         } else {
-            base()
+            base(theme)
         };
         lines.push(Line::styled(text, style));
     }
-    overlay(frame, area, lines);
+    overlay(frame, area, lines, theme);
 }
 
 /// Leave the canvas untouched unless an explicit popup or error is present.
-pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>) {
+pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>, theme: &Theme) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
         return;
@@ -205,15 +238,16 @@ pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>) 
             area,
             vec![Line::styled(
                 format!(" Audio: {message}"),
-                Style::default().fg(PINK),
+                Style::default().fg(color(theme.ansi[1])),
             )],
+            theme,
         );
     }
     if analysis {
-        analysis_popup(frame, status);
+        analysis_popup(frame, status, theme);
     }
     if help {
-        help_popup(frame);
+        help_popup(frame, theme);
     }
 }
 
@@ -248,7 +282,7 @@ mod tests {
                 for cell in &mut frame.buffer_mut().content {
                     cell.set_symbol("▀");
                 }
-                draw(frame, analysis, help, &status);
+                draw(frame, analysis, help, &status, &Theme::default());
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -327,7 +361,7 @@ mod tests {
             "m     opens menu",
             "Esc   closes",
             "↑/↓ Enter",
-            "←/→",
+            "p     palette menu",
             "+/-",
             "d     demo",
             "r     reconnect",
@@ -335,7 +369,9 @@ mod tests {
         ] {
             assert!(text.contains(control));
         }
-        for obsolete in ["show", "hide", "toggle", "s/p/v", "space", "?", "LIVE"] {
+        for obsolete in [
+            "show", "hide", "toggle", "s/p/v", "space", "?", "LIVE", "←/→", "Scene",
+        ] {
             assert!(!text.contains(obsolete));
         }
     }
@@ -375,8 +411,9 @@ mod tests {
                     menu(
                         frame,
                         "Menu",
-                        &["Scene", "Palette", "Analysis", "Controls"],
+                        &["First", "Second", "Third", "Controls"],
                         3,
+                        &Theme::default(),
                     );
                 })
                 .unwrap();
@@ -384,7 +421,8 @@ mod tests {
             assert_popup_only(buffer, centered(buffer.area, 34, 6));
             if width == 80 {
                 assert!(row(buffer, 13).contains("› Controls"));
-                assert_eq!(buffer[(24, 13)].bg, CYAN);
+                assert_eq!(buffer[(24, 13)].bg, color(Theme::default().foreground));
+                assert_eq!(buffer[(24, 13)].fg, color(Theme::default().background));
                 let text = text(buffer);
                 assert!(!text.contains('─'));
                 assert!(!text.contains('│'));

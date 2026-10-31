@@ -32,6 +32,10 @@ pub struct AudioState {
     pub treble: f32,
     pub onset: f32,
     pub kick: f32,
+    /// Independent low/bass, low-mid/snare, presence, and air attack envelopes.
+    pub transients: [f32; 4],
+    /// Fast, normalized continuous spectral novelty, independent of tempo lock.
+    pub novelty: f32,
     /// Periodicity estimate; half/double-tempo ambiguity is possible.
     pub bpm: Option<f32>,
     pub tempo_confidence: f32,
@@ -132,7 +136,7 @@ const DT: f32 = HOP as f32 / SAMPLE_RATE as f32;
 const NOISE_GATE: f32 = 0.0015;
 const REF_MIN: f32 = 0.025;
 const REF_MAX: f32 = 0.5;
-const REFRACTORY: f32 = 0.128;
+const REFRACTORY: f32 = 0.032;
 
 fn follow(current: f32, target: f32, attack: f32, release: f32) -> f32 {
     let tau = if target > current { attack } else { release };
@@ -145,16 +149,14 @@ struct Analyzer {
     scratch: Vec<Complex<f32>>,
     window: Vec<f32>,
     ranges: [(usize, usize); BANDS],
-    previous: Vec<f32>,
     samples: [f32; FRAMES],
     band_reference: [f32; BANDS],
     band_previous: [f32; BANDS],
-    bass_mean: f32,
-    bass_cooldown: f32,
+    attack_mean: [f32; 4],
+    attack_previous: [f32; 4],
+    attack_cooldown: [f32; 4],
     state: AudioState,
     reference: f32,
-    flux_mean: f32,
-    cooldown: f32,
     quiet_time: f32,
     rhythm: Rhythm,
 }
@@ -180,16 +182,14 @@ impl Analyzer {
             window,
             ranges,
             buffer: vec![Complex::default(); FRAMES],
-            previous: vec![0.0; FRAMES / 2],
             samples: [0.0; FRAMES],
             band_reference: [0.01; BANDS],
             band_previous: [0.0; BANDS],
-            bass_mean: 0.0,
-            bass_cooldown: 0.0,
+            attack_mean: [0.0; 4],
+            attack_previous: [0.0; 4],
+            attack_cooldown: [0.0; 4],
             state: AudioState::default(),
             reference: 0.1,
-            flux_mean: 0.0,
-            cooldown: 0.0,
             quiet_time: 0.0,
             rhythm: Rhythm::default(),
         }
@@ -232,13 +232,9 @@ impl Analyzer {
         self.fft
             .process_with_scratch(&mut self.buffer, &mut self.scratch);
         let mut power = [0.0_f32; 3];
-        let mut flux = 0.0;
-        let mut bass_flux = 0.0;
         for i in 1..FRAMES / 2 {
             let hz = i as f32 * SAMPLE_RATE as f32 / FRAMES as f32;
             let magnitude = self.buffer[i].norm() * (2.0 / FRAMES as f32);
-            let rise = (magnitude - self.previous[i]).max(0.0);
-            self.previous[i] = magnitude;
             if (LOW_HZ..HIGH_HZ).contains(&hz) {
                 let region = if hz < 250.0 {
                     0
@@ -248,12 +244,11 @@ impl Analyzer {
                     2
                 };
                 power[region] += magnitude * magnitude;
-                flux += rise * rise;
-                if region == 0 {
-                    bass_flux += rise * rise;
-                }
             }
         }
+        let mut attacks = [0.0_f32; 4];
+        let mut attack_counts = [0.0_f32; 4];
+        let mut attack_power = [0.0_f32; 4];
         let mut novelty = [0.0_f32; 2];
         let mut counts = [0.0_f32; 2];
         for (i, &(start, end)) in self.ranges.iter().enumerate() {
@@ -268,6 +263,19 @@ impl Analyzer {
             let rise = (compressed - self.band_previous[i]).max(0.0) * gate;
             self.band_previous[i] = compressed;
             self.band_reference[i] = follow(self.band_reference[i], magnitude, 0.8, 1.5);
+            let hz = (start + end) as f32 * 0.5 * SAMPLE_RATE as f32 / FRAMES as f32;
+            let region = if hz < 250.0 {
+                0
+            } else if hz < 2000.0 {
+                1
+            } else if hz < 6000.0 {
+                2
+            } else {
+                3
+            };
+            attacks[region] += rise;
+            attack_power[region] += magnitude * magnitude;
+            attack_counts[region] += 1.0;
             novelty[0] += rise;
             counts[0] += 1.0;
             if end as f32 * SAMPLE_RATE as f32 / FRAMES as f32 <= 300.0 {
@@ -291,30 +299,37 @@ impl Analyzer {
             let target = (0.65 * (power.sqrt() / self.reference).sqrt()).min(1.0) * gate;
             *value = follow(*value, target, 0.04, 0.25);
         }
-        let flux = flux.sqrt() / self.reference * gate;
-        let bass_flux = bass_flux.sqrt() / self.reference * gate;
-        self.cooldown = (self.cooldown - DT).max(0.0);
-        self.bass_cooldown = (self.bass_cooldown - DT).max(0.0);
-        self.state.onset *= (-DT / 0.12).exp();
-        self.state.kick *= (-DT / 0.14).exp();
-        let threshold = 0.025 + self.flux_mean * 2.0;
-        let onset = audible && self.cooldown == 0.0 && flux > threshold;
-        if onset {
-            self.cooldown = REFRACTORY;
-            self.state.onset = (flux / (threshold * 2.0)).clamp(0.0, 1.0);
+        let mut onset = false;
+        let mut fast_novelty = 0.0_f32;
+        for region in 0..4 {
+            let rise = attacks[region] / attack_counts[region].max(1.0);
+            let threshold = 0.008 + self.attack_mean[region] * 2.0;
+            self.attack_cooldown[region] = (self.attack_cooldown[region] - DT).max(0.0);
+            self.state.transients[region] *= (-DT / 0.045).exp();
+            // Independent refractory periods preserve adjacent instruments and
+            // rapid subdivisions; only rising novelty can start a new attack.
+            let minimum_share = if region == 0 { 0.04 } else { 0.004 };
+            let present = attack_power[region] > power.iter().sum::<f32>() * minimum_share;
+            if audible
+                && present
+                && self.attack_cooldown[region] == 0.0
+                && rise > threshold
+                && rise > self.attack_previous[region]
+            {
+                self.state.transients[region] = (rise / (threshold * 2.0)).clamp(0.0, 1.0);
+                self.attack_cooldown[region] = REFRACTORY;
+                onset = true;
+            }
+            if present {
+                fast_novelty = fast_novelty.max((rise / (threshold * 2.0)).min(1.0));
+            }
+            self.attack_previous[region] = rise;
+            self.attack_mean[region] = follow(self.attack_mean[region], rise, 0.8, 0.8);
         }
-        let bass_threshold = 0.02 + self.bass_mean * 2.0;
-        let kick = audible
-            && self.bass_cooldown == 0.0
-            && bass_flux > bass_threshold
-            && power[0] > power.iter().sum::<f32>() * 0.04;
-        if kick {
-            self.bass_cooldown = REFRACTORY;
-            self.state.kick = (bass_flux / (bass_threshold * 2.0)).clamp(0.0, 1.0);
-        }
-        self.flux_mean = follow(self.flux_mean, flux, 0.8, 0.8);
-        self.bass_mean = follow(self.bass_mean, bass_flux, 0.8, 0.8);
-        self.rhythm.push(novelty, onset || kick);
+        self.state.novelty = follow(self.state.novelty, fast_novelty, 0.005, 0.025);
+        self.state.onset = self.state.transients.iter().copied().fold(0.0, f32::max);
+        self.state.kick = self.state.transients[0];
+        self.rhythm.push(novelty, onset);
         if self.quiet_time > 1.5 {
             self.rhythm = Rhythm::default();
         }
@@ -364,7 +379,7 @@ impl Rhythm {
         if !self.frames.is_multiple_of(24) || self.history.len() < (4.0 / DT) as usize {
             return;
         }
-        let min_lag = (60.0 / (180.0 * DT)).floor() as usize;
+        let min_lag = (60.0 / (260.0 * DT)).floor() as usize;
         let max_lag = (60.0 / (60.0 * DT)).ceil() as usize;
         let n = self.history.len();
         let mut correlations = vec![[0.0_f32; 2]; max_lag * 2 + 3];
@@ -446,7 +461,7 @@ impl Rhythm {
         } else {
             0.0
         };
-        let bpm = (60.0 / ((lag as f32 + offset) * DT)).clamp(60.0, 180.0);
+        let bpm = (60.0 / ((lag as f32 + offset) * DT)).clamp(60.0, 260.0);
         if self
             .pending
             .is_some_and(|old| (bpm / old).ln().abs() < 0.06)
@@ -494,6 +509,61 @@ impl Rhythm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bass_and_snare_attacks_thirty_two_ms_apart_remain_independent() {
+        let mut analyzer = Analyzer::new();
+        let mut previous = [0.0; 4];
+        let mut counts = [0; 2];
+        for frame in 0..(6.0 / DT) as usize {
+            let samples = std::array::from_fn(|i| {
+                let t = (frame * HOP + i) as f32 / SAMPLE_RATE as f32;
+                let bass_age = t % (1.0 / 6.0);
+                let snare_age = (t - 0.032).rem_euclid(1.0 / 6.0);
+                0.06 * (std::f32::consts::TAU * 440.0 * t).sin()
+                    + 0.14 * (-bass_age / 0.016).exp() * (std::f32::consts::TAU * 100.0 * t).sin()
+                    + 0.10 * (-snare_age / 0.010).exp() * (std::f32::consts::TAU * 1100.0 * t).sin()
+            });
+            let state = analyzer.analyze(&samples);
+            if frame as f32 * DT > 1.0 {
+                for region in 0..2 {
+                    counts[region] +=
+                        usize::from(state.transients[region] > previous[region] + 0.15);
+                }
+            }
+            assert!((0.0..=1.0).contains(&state.novelty));
+            previous = state.transients;
+        }
+        assert!(
+            counts.iter().all(|&n| n >= 23),
+            "lost bass/snare attacks: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn soft_twelve_hz_attacks_survive_a_sustained_texture() {
+        let mut analyzer = Analyzer::new();
+        let mut attacks = 0;
+        let mut previous = 0.0;
+        for frame in 0..(6.0 / DT) as usize {
+            let samples = std::array::from_fn(|i| {
+                let t = (frame * HOP + i) as f32 / SAMPLE_RATE as f32;
+                let age = t % (1.0 / 12.0);
+                0.12 * (std::f32::consts::TAU * 220.0 * t).sin()
+                    + 0.08 * (std::f32::consts::TAU * 329.63 * t).sin()
+                    + 0.07 * (-age / 0.012).exp() * (std::f32::consts::TAU * 1100.0 * t).sin()
+            });
+            let state = analyzer.analyze(&samples);
+            if frame as f32 * DT > 1.0 && state.onset > previous + 0.15 {
+                attacks += 1;
+            }
+            previous = state.onset;
+        }
+        assert!(
+            attacks >= 45,
+            "only {attacks}/60 soft rapid attacks survived"
+        );
+    }
 
     #[test]
     fn tempo_survives_a_continuous_mix_with_soft_kicks() {
@@ -612,7 +682,7 @@ mod tests {
         let mut retriggers = 0;
         for frame in 0..1400 {
             let state = analyzer.analyze(&frame_at(frame, 1000.0, 0.25));
-            if frame > 80 && state.onset > 0.5 {
+            if frame > 80 && (state.onset > 0.1 || state.novelty > 0.1) {
                 retriggers += 1;
             }
             assert!(state.bpm.is_none());
@@ -639,6 +709,7 @@ mod tests {
             let state = analyzer.analyze(&noise);
             assert!(state.energy < 0.001 && state.bass < 0.001);
             assert!(state.onset < 0.001 && state.kick < 0.001);
+            assert!(state.transients.iter().all(|v| *v < 0.001) && state.novelty < 0.001);
             assert!(state.bpm.is_none());
         }
         assert_eq!(reference, analyzer.reference);
@@ -647,12 +718,13 @@ mod tests {
 
     #[test]
     fn regular_bass_pulses_have_onsets_kicks_and_tempo() {
-        for bpm in [90.0, 120.0] {
+        for bpm in [90.0, 120.0, 200.0] {
             let period = 60.0 / bpm;
             let mut analyzer = Analyzer::new();
             let mut triggers = 0;
             let mut kicks = 0;
             let mut previous = 0.0;
+            let mut last_trigger = 0;
             let mut state = AudioState::default();
             for frame in 0..(12.0 / DT) as usize {
                 let samples = std::array::from_fn(|i| {
@@ -665,8 +737,10 @@ mod tests {
                     }
                 });
                 state = analyzer.analyze(&samples);
-                if state.onset > previous + 0.2 {
+                // A single hit can reach adjacent spectral regions one hop apart.
+                if state.onset > previous + 0.2 && (triggers == 0 || frame - last_trigger > 3) {
                     triggers += 1;
+                    last_trigger = frame;
                 }
                 if state.kick > 0.5 {
                     kicks += 1;
