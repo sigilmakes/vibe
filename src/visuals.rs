@@ -2,7 +2,14 @@ use std::f32::consts::TAU;
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
-pub const SCENES: &[&str] = &["Noise Field", "Spectral Flower", "Waveform Scope", "Radial"];
+pub const SCENES: &[&str] = &[
+    "Noise Field",
+    "Spectral Flower",
+    "Waveform Scope",
+    "Radial",
+    "Soft Flow",
+    "Aurora",
+];
 
 /// Normalized live audio. Transients carry independent low-to-high attacks.
 #[derive(Clone, Copy, Debug, Default)]
@@ -274,6 +281,8 @@ impl Renderer {
             1 => return self.flower(p, vertices, palette, audio, theme, scale),
             2 => return self.scope(p, palette, audio, theme, scale, half_width),
             3 => return self.radial(p, palette, audio, theme, scale),
+            4 => return self.soft_flow(p, palette, audio, theme),
+            5 => return self.aurora(p, palette, audio, theme),
             _ => {}
         }
         let mut shift = [0.0, 0.0];
@@ -349,6 +358,80 @@ impl Renderer {
                 },
             ),
             mark,
+        }
+    }
+
+    fn soft_flow(
+        &self,
+        p: [f32; 2],
+        palette: usize,
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+    ) -> Pixel {
+        // Broad advected folds: neither quantization nor contour glyphs. The
+        // smaller octave supplies shading, not a second sharp texture layer.
+        let drift = [p[0] * 1.25 + self.offset[0], p[1] * 1.25 + self.offset[1]];
+        let curl = [
+            noise(drift[0] + self.warp[0], drift[1] - self.warp[1]),
+            noise(drift[0] - self.warp[1] + 9.7, drift[1] + self.warp[0]),
+        ];
+        let q = [
+            drift[0] + (curl[0] - 0.5) * (1.4 + audio.mid * 0.35),
+            drift[1] + (curl[1] - 0.5) * (1.4 + audio.bass * 0.3),
+        ];
+        let (body, slope) = noise_gradient(q[0], q[1]);
+        let detail = noise(q[0] * 2.0 + self.warp[1], q[1] * 2.0 + 4.3);
+        let field = body * 0.82 + detail * 0.18;
+        let light = (0.5 + slope[0] * 0.2 - slope[1] * 0.25).clamp(0.0, 1.0);
+        Pixel {
+            color: theme.sample(
+                palette,
+                0.26 + field * 0.68,
+                (0.09 + field * 0.47 + light * 0.17)
+                    * (0.8 + audio.energy * 0.15 + audio.treble * 0.05),
+            ),
+            mark: None,
+        }
+    }
+
+    fn aurora(
+        &self,
+        p: [f32; 2],
+        palette: usize,
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+    ) -> Pixel {
+        // Three overlapping curtains have smooth Gaussian cross-sections and
+        // independent bends. Integrated offsets keep their motion continuous.
+        let x = p[0] * 1.35;
+        let mut glow = 0.0;
+        let mut pigment = 0.0;
+        for layer in 0..3 {
+            let depth = layer as f32;
+            let phase =
+                x * (1.1 + depth * 0.19) + self.offset[0] * (0.7 + depth * 0.2) + depth * 2.1;
+            let fold = noise(x * 0.8 + depth * 4.7 + self.warp[0], self.warp[1] + depth);
+            let center = (depth - 1.0) * 0.35
+                + phase.sin() * (0.24 + audio.mid * 0.06)
+                + (phase * 0.53 + self.offset[1]).sin() * 0.15
+                + (fold - 0.5) * 0.32;
+            let width = 0.10 + depth * 0.025 + audio.bass * 0.035;
+            let across = (p[1] - center) / width;
+            let core = (-across * across * 0.5).exp();
+            let halo = (-across * across * 0.09).exp();
+            let silk =
+                0.84 + (phase * 2.2 + self.warp[1] * 2.0).sin() * (0.08 + audio.treble * 0.04);
+            let weight = (core * 0.7 + halo * 0.18) * silk;
+            glow += weight;
+            pigment += weight * (0.3 + depth * 0.27 + fold * 0.1);
+        }
+        Pixel {
+            color: theme.sample(
+                palette,
+                pigment / glow.max(0.00001),
+                0.025 + (1.0 - (-glow * 1.25).exp()) * (0.72 + audio.energy * 0.12),
+            ),
+            mark: None,
         }
     }
 
@@ -471,6 +554,138 @@ mod tests {
     use super::*;
 
     #[test]
+    fn soft_scenes_use_continuous_half_block_shading() {
+        let area = Rect::new(0, 0, 120, 40);
+        let theme = crate::palette::Theme::default();
+        let renderer = Renderer::default();
+        let vertices = [[0.0; 2]; 42];
+        for scene in [4, 5] {
+            let mut buffer = Buffer::empty(area);
+            Renderer::default().draw(
+                &mut buffer,
+                area,
+                0.0,
+                scene,
+                0,
+                &[0.0; 32],
+                &Reactivity::default(),
+                &theme,
+            );
+            assert!(buffer.content.iter().all(|cell| cell.symbol() == "▀"));
+            let shades: std::collections::HashSet<_> = buffer
+                .content
+                .iter()
+                .flat_map(|cell| [cell.fg, cell.bg])
+                .collect();
+            assert!(
+                shades.len() > 80,
+                "soft scenes need rich shading, not color bands"
+            );
+            // Tiny spatial steps cannot cross a hard contour or a palette wrap.
+            for y in -12..12 {
+                for x in -25..25 {
+                    let p = [x as f32 * 0.06, y as f32 * 0.06];
+                    let a = renderer.pixel(
+                        p,
+                        &vertices,
+                        scene,
+                        0,
+                        &Reactivity::default(),
+                        &theme,
+                        0.05,
+                        1.5,
+                    );
+                    let b = renderer.pixel(
+                        [p[0] + 0.001, p[1] + 0.001],
+                        &vertices,
+                        scene,
+                        0,
+                        &Reactivity::default(),
+                        &theme,
+                        0.05,
+                        1.5,
+                    );
+                    assert!(a.mark.is_none() && b.mark.is_none());
+                    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a.color, b.color)
+                    else {
+                        panic!("soft shading must be RGB")
+                    };
+                    for (a, b) in [(ar, br), (ag, bg), (ab, bb)] {
+                        assert!(a.abs_diff(b) <= 3, "hard seam in soft scene {scene}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn soft_scenes_respond_to_each_audio_region_and_the_active_theme() {
+        let area = Rect::new(0, 0, 80, 28);
+        let theme = crate::palette::Theme::default();
+        let custom = crate::palette::Theme {
+            ansi: [[100, 120, 140]; 16],
+            background: [20, 30, 40],
+            foreground: [150, 160, 170],
+        };
+        for scene in [4, 5] {
+            let render = |audio: &Reactivity, theme: &crate::palette::Theme| {
+                let mut renderer = Renderer::default();
+                let mut buffer = Buffer::empty(area);
+                for frame in 0..=12 {
+                    renderer.draw(
+                        &mut buffer,
+                        area,
+                        frame as f32 / 60.0,
+                        scene,
+                        0,
+                        &[0.0; 32],
+                        audio,
+                        theme,
+                    );
+                }
+                buffer
+            };
+            let quiet = render(&Reactivity::default(), &theme);
+            for audio in [
+                Reactivity {
+                    bass: 0.8,
+                    ..Reactivity::default()
+                },
+                Reactivity {
+                    mid: 0.8,
+                    ..Reactivity::default()
+                },
+                Reactivity {
+                    treble: 0.8,
+                    ..Reactivity::default()
+                },
+            ] {
+                let active = render(&audio, &theme);
+                let changed = quiet
+                    .content
+                    .iter()
+                    .zip(&active.content)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    changed > area.area() as usize / 10,
+                    "each audio region must visibly affect soft scene {scene}"
+                );
+            }
+            let themed = render(&Reactivity::default(), &custom);
+            assert_ne!(quiet, themed);
+            for color in themed.content.iter().flat_map(|cell| [cell.fg, cell.bg]) {
+                let Color::Rgb(r, g, b) = color else {
+                    panic!("RGB shading expected")
+                };
+                assert!((20..=150).contains(&r));
+                assert!((30..=160).contains(&g));
+                assert!((40..=170).contains(&b));
+            }
+        }
+    }
+
+    #[test]
     fn field_uses_real_terminal_texture() {
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
@@ -526,7 +741,7 @@ mod tests {
 
     #[test]
     fn scenes_are_distinct_and_pcm_belongs_only_to_scope() {
-        assert_eq!(SCENES.len(), 4);
+        assert_eq!(SCENES.len(), 6);
         let area = Rect::new(0, 0, 100, 36);
         let theme = crate::palette::Theme::default();
         let quiet = Reactivity::default();
@@ -708,7 +923,14 @@ mod tests {
     #[test]
     #[ignore = "release-only renderer timing, excludes terminal I/O"]
     fn renderer_frame_budget() {
-        for (width, height) in [(120, 40), (160, 50)] {
+        for (scene, width, height) in [
+            (0, 120, 40),
+            (0, 160, 50),
+            (4, 120, 40),
+            (4, 160, 50),
+            (5, 120, 40),
+            (5, 160, 50),
+        ] {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
             let mut renderer = Renderer::default();
@@ -728,7 +950,7 @@ mod tests {
                     &mut buffer,
                     area,
                     i as f32 / 60.0,
-                    0,
+                    scene,
                     0,
                     &[0.6; 32],
                     &audio,
@@ -737,7 +959,8 @@ mod tests {
                 std::hint::black_box(&buffer);
             }
             eprintln!(
-                "{width}x{height}: {:.2} ms/frame",
+                "{} {width}x{height}: {:.2} ms/frame",
+                SCENES[scene],
                 start.elapsed().as_secs_f64() * 1000.0 / 180.0
             );
         }

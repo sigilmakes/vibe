@@ -220,10 +220,11 @@ fn main() -> io::Result<()> {
         ColorMode::Always => crossterm::style::force_color_output(true),
         ColorMode::Never => crossterm::style::force_color_output(false),
     }
-    let theme = palette::detect();
+
     let mut renderer = visuals::Renderer::default();
     let mut terminal = ratatui::init();
     let result = (|| -> io::Result<()> {
+        let mut input = palette::TerminalInput::open()?;
         let start = Instant::now();
         let mut scene = initial_scene;
         let mut palette = initial_palette;
@@ -251,7 +252,7 @@ fn main() -> io::Result<()> {
                     palette,
                     &bands,
                     &reactive,
-                    &theme,
+                    &input.theme,
                 );
                 ui::draw(
                     frame,
@@ -274,108 +275,130 @@ fn main() -> io::Result<()> {
                             capture_error.as_deref().or(state.error.as_deref())
                         },
                     },
-                    &theme,
+                    &input.theme,
                 );
                 if let Some(menu) = &menu {
-                    ui::menu(frame, menu.title(), menu.items(), menu.selected, &theme);
+                    ui::menu(
+                        frame,
+                        menu.title(),
+                        menu.items(),
+                        menu.selected,
+                        &input.theme,
+                    );
                 }
             })?;
-            if event::poll(FRAME_TIME.saturating_sub(frame_start.elapsed()))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(event::KeyModifiers::CONTROL)
-                    {
-                        break;
-                    }
-                    if let Some(mut active) = menu.take() {
-                        match key.code {
-                            KeyCode::Esc => {}
-                            KeyCode::Char('q') => break,
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                active.step(-1);
-                                menu = Some(active);
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                active.step(1);
-                                menu = Some(active);
-                            }
-                            KeyCode::Enter => match active.kind {
-                                MenuKind::Root => match active.selected {
-                                    0 => {
-                                        menu = Some(Menu {
-                                            kind: MenuKind::Scenes,
-                                            selected: scene,
-                                        })
-                                    }
-                                    1 => {
-                                        menu = Some(Menu {
-                                            kind: MenuKind::Palettes,
-                                            selected: palette,
-                                        })
-                                    }
-                                    2 => analysis = true,
-                                    _ => help = true,
-                                },
-                                MenuKind::Scenes => {
-                                    scene = active.selected;
-                                    renderer = visuals::Renderer::default();
-                                }
-                                MenuKind::Palettes => palette = active.selected,
-                            },
-                            _ => menu = Some(active),
-                        }
-                        continue;
-                    }
-                    if analysis {
-                        match key.code {
-                            KeyCode::Esc => analysis = false,
-                            KeyCode::Char('q') => break,
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if help {
-                        match key.code {
-                            KeyCode::Esc => {
-                                help = false;
-                                continue;
-                            }
-                            KeyCode::Char('q') => break,
-                            _ => continue,
-                        }
-                    }
+            if let Some(Event::Key(key)) =
+                input.read(FRAME_TIME.saturating_sub(frame_start.elapsed()))?
+            {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(event::KeyModifiers::CONTROL)
+                {
+                    break;
+                }
+                if let Some(mut active) = menu.take() {
                     match key.code {
-                        KeyCode::Left | KeyCode::Right => {
-                            scene = if key.code == KeyCode::Left {
-                                (scene + visuals::SCENES.len() - 1) % visuals::SCENES.len()
-                            } else {
-                                (scene + 1) % visuals::SCENES.len()
-                            };
-                            renderer = visuals::Renderer::default();
+                        KeyCode::Esc => {}
+                        KeyCode::Char('q') => break,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            active.step(-1);
+                            menu = Some(active);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            active.step(1);
+                            menu = Some(active);
+                        }
+                        KeyCode::Enter => match active.kind {
+                            MenuKind::Root => match active.selected {
+                                0 => {
+                                    menu = Some(Menu {
+                                        kind: MenuKind::Scenes,
+                                        selected: scene,
+                                    })
+                                }
+                                1 => {
+                                    menu = Some(Menu {
+                                        kind: MenuKind::Palettes,
+                                        selected: palette,
+                                    })
+                                }
+                                2 => analysis = true,
+                                _ => help = true,
+                            },
+                            MenuKind::Scenes => {
+                                scene = active.selected;
+                                renderer = visuals::Renderer::default();
+                            }
+                            MenuKind::Palettes => palette = active.selected,
+                        },
+                        _ => menu = Some(active),
+                    }
+                    continue;
+                }
+                if analysis {
+                    match key.code {
+                        KeyCode::Esc => analysis = false,
+                        KeyCode::Char('q') => break,
+                        _ => {}
+                    }
+                    continue;
+                }
+                if help {
+                    match key.code {
+                        KeyCode::Esc => {
+                            help = false;
+                            continue;
                         }
                         KeyCode::Char('q') => break,
-                        KeyCode::Char('m') => {
-                            menu = Some(Menu {
-                                kind: MenuKind::Root,
-                                selected: 0,
-                            })
+                        _ => continue,
+                    }
+                }
+                match key.code {
+                    KeyCode::Left | KeyCode::Right => {
+                        scene = if key.code == KeyCode::Left {
+                            (scene + visuals::SCENES.len() - 1) % visuals::SCENES.len()
+                        } else {
+                            (scene + 1) % visuals::SCENES.len()
+                        };
+                        renderer = visuals::Renderer::default();
+                    }
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('m') => {
+                        menu = Some(Menu {
+                            kind: MenuKind::Root,
+                            selected: 0,
+                        })
+                    }
+                    KeyCode::Char('p') => {
+                        menu = Some(Menu {
+                            kind: MenuKind::Palettes,
+                            selected: palette,
+                        })
+                    }
+                    KeyCode::Char('?') => help = true,
+                    KeyCode::Char('+') | KeyCode::Char('=') => gain = (gain + 0.1).min(3.0),
+                    KeyCode::Char('-') => gain = (gain - 0.1).max(0.25),
+                    KeyCode::Char('r') => {
+                        drop(capture.take());
+                        shared = None;
+                        demo = false;
+                        match audio::Capture::start(target.clone()) {
+                            Ok((handle, state)) => {
+                                capture = Some(handle);
+                                shared = Some(state);
+                                capture_error = None;
+                            }
+                            Err(err) => capture_error = Some(err.to_string()),
                         }
-                        KeyCode::Char('p') => {
-                            menu = Some(Menu {
-                                kind: MenuKind::Palettes,
-                                selected: palette,
-                            })
-                        }
-                        KeyCode::Char('?') => help = true,
-                        KeyCode::Char('+') | KeyCode::Char('=') => gain = (gain + 0.1).min(3.0),
-                        KeyCode::Char('-') => gain = (gain - 0.1).max(0.25),
-                        KeyCode::Char('r') => {
+                    }
+                    KeyCode::Char('d') => {
+                        demo = !demo;
+                        if demo {
                             drop(capture.take());
                             shared = None;
-                            demo = false;
+                        } else {
                             match audio::Capture::start(target.clone()) {
                                 Ok((handle, state)) => {
                                     capture = Some(handle);
@@ -385,24 +408,8 @@ fn main() -> io::Result<()> {
                                 Err(err) => capture_error = Some(err.to_string()),
                             }
                         }
-                        KeyCode::Char('d') => {
-                            demo = !demo;
-                            if demo {
-                                drop(capture.take());
-                                shared = None;
-                            } else {
-                                match audio::Capture::start(target.clone()) {
-                                    Ok((handle, state)) => {
-                                        capture = Some(handle);
-                                        shared = Some(state);
-                                        capture_error = None;
-                                    }
-                                    Err(err) => capture_error = Some(err.to_string()),
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
             }
         }
