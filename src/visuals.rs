@@ -2,6 +2,8 @@ use std::f32::consts::TAU;
 
 use ratatui::{buffer::Buffer, layout::Rect, style::Color};
 
+pub const SCENES: &[&str] = &["Noise Field", "Spectral Flower", "Waveform Scope", "Radial"];
+
 /// Normalized live audio. Transients carry independent low-to-high attacks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reactivity {
@@ -73,7 +75,6 @@ fn distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
 struct Pixel {
     color: Color,
     mark: Option<char>,
-    waveform: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -167,6 +168,7 @@ impl Renderer {
         buf: &mut Buffer,
         area: Rect,
         time: f32,
+        scene: usize,
         palette: usize,
         bands: &[f32; 32],
         audio: &Reactivity,
@@ -187,7 +189,9 @@ impl Renderer {
                 + audio.bass * 0.055
                 + audio.beat * 0.025
                 + (angle * 7.0 - audio.beat_phase * TAU).cos() * audio.beat * 0.008
-                + bands[petal * 4].clamp(0.0, 1.0) * 0.10;
+                + bands[petal * 4].clamp(0.0, 1.0) * 0.10
+                + if i % 2 == 0 { 0.055 } else { -0.045 }
+                + bands[i * 31 / 41].clamp(0.0, 1.0) * 0.08;
             for impact in &self.impacts {
                 let alignment = (angle.cos() * impact.normal[0] + angle.sin() * impact.normal[1])
                     .max(0.0)
@@ -215,20 +219,29 @@ impl Renderer {
                 let x =
                     ((col - area.x) as f32 + 0.5 - area.width as f32 * 0.5) / area.height as f32;
                 let y = ((row - area.y) as f32 + 0.25 - area.height as f32 * 0.5) * scale;
-                let top = self.pixel([x, y], &vertices, palette, audio, theme, scale);
-                let bottom = self.pixel(
-                    [x, y + scale * 0.5],
+                let top = self.pixel(
+                    [x, y],
                     &vertices,
+                    scene,
                     palette,
                     audio,
                     theme,
                     scale,
+                    area.width as f32 / area.height as f32 * 0.5,
+                );
+                let bottom = self.pixel(
+                    [x, y + scale * 0.5],
+                    &vertices,
+                    scene,
+                    palette,
+                    audio,
+                    theme,
+                    scale,
+                    area.width as f32 / area.height as f32 * 0.5,
                 );
                 let cell = &mut buf[(col, row)];
                 cell.reset();
-                if top.waveform || bottom.waveform {
-                    cell.set_char('▀').set_fg(top.color).set_bg(bottom.color);
-                } else if let Some(mark) = top.mark.or(bottom.mark) {
+                if let Some(mark) = top.mark.or(bottom.mark) {
                     let color = if top.mark.is_some() {
                         top.color
                     } else {
@@ -244,43 +257,26 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pixel(
         &self,
         p: [f32; 2],
         vertices: &[[f32; 2]; 42],
+        scene: usize,
         palette: usize,
         audio: &Reactivity,
         theme: &crate::palette::Theme,
         scale: f32,
+        half_width: f32,
     ) -> Pixel {
-        // The live PCM trace crosses the composition without being swallowed by
-        // the polygon mask. Only neighboring sample segments need testing.
-        let span = 1.15;
-        if p[0].abs() <= span {
-            let position = ((p[0] / span + 1.0) * 0.5 * 31.0).clamp(0.0, 31.0);
-            let index = (position.floor() as usize).min(30);
-            let mut wave_distance = f32::MAX;
-            for i in index.saturating_sub(1)..=(index + 1).min(30) {
-                let a = [
-                    ((i as f32 / 31.0) * 2.0 - 1.0) * span,
-                    audio.waveform[i].clamp(-1.0, 1.0) * 0.52,
-                ];
-                let b = [
-                    (((i + 1) as f32 / 31.0) * 2.0 - 1.0) * span,
-                    audio.waveform[i + 1].clamp(-1.0, 1.0) * 0.52,
-                ];
-                wave_distance = wave_distance.min(distance(p, a, b));
-            }
-            if wave_distance < (scale * 0.24).max(0.008) {
-                return Pixel {
-                    color: theme.sample(palette, 0.32, 1.0),
-                    mark: None,
-                    waveform: true,
-                };
-            }
+        // Dispatch before sampling: a scene cannot inherit another scene's layers.
+        match scene {
+            1 => return self.flower(p, vertices, palette, audio, theme, scale),
+            2 => return self.scope(p, palette, audio, theme, scale, half_width),
+            3 => return self.radial(p, palette, audio, theme, scale),
+            _ => {}
         }
         let mut shift = [0.0, 0.0];
-        let mut fracture = 0.0_f32;
         let mut percussion = 0.0_f32;
         for impact in &self.impacts {
             let dx = p[0] - impact.center[0];
@@ -296,9 +292,6 @@ impl Renderer {
             shift[0] += impact.normal[1] * local * 0.3;
             shift[1] -= impact.normal[0] * local * 0.3;
             percussion = percussion.max(local);
-            if impact.channel >= 2 {
-                fracture = fracture.max(local);
-            }
         }
         let wx = noise(p[0] * 1.8 + self.warp[0], p[1] * 1.8 + self.warp[1]);
         let wy = noise(p[0] * 1.8 - self.warp[1] + 7.1, p[1] * 1.8 + self.warp[0]);
@@ -309,50 +302,13 @@ impl Renderer {
             + noise(nx * 2.1 + self.warp[1], ny * 2.1) * 0.26
             + noise(nx * 4.2, ny * 4.2 + self.warp[0]) * 0.12;
         let heat = ((field * 7.0).floor() / 7.0).clamp(0.0, 1.0);
-        let mut edge = f32::MAX;
-        let mut edge_glyph = '─';
-        let mut inside = false;
-        let q = [p[0] + shift[0] * 0.25, p[1] + shift[1] * 0.25];
-        let line_width = (scale * 0.24).max(0.007);
-        for i in 0..vertices.len() {
-            let a = vertices[i];
-            let b = vertices[(i + 1) % vertices.len()];
-            if q[0] >= a[0].min(b[0]) - line_width
-                && q[0] <= a[0].max(b[0]) + line_width
-                && q[1] >= a[1].min(b[1]) - line_width
-                && q[1] <= a[1].max(b[1]) + line_width
-            {
-                let d = distance(q, a, b);
-                if d < edge {
-                    edge = d;
-                    edge_glyph = line_glyph([b[0] - a[0], b[1] - a[1]]);
-                }
-            }
-            if (a[1] > q[1]) != (b[1] > q[1])
-                && q[0] < (b[0] - a[0]) * (q[1] - a[1]) / (b[1] - a[1]) + a[0]
-            {
-                inside = !inside;
-            }
-        }
-        // High-frequency impacts cut local gaps, never blink the whole contour.
-        if edge < line_width && fracture < 0.22 {
-            return Pixel {
-                color: theme.sample(palette, 0.82 + audio.treble * 0.15, 0.96),
-                mark: Some(edge_glyph),
-                waveform: false,
-            };
-        }
         let contour = (field * 11.0).fract();
         let ink = if contour < 0.13 {
             0.48
         } else {
             0.08 + heat * 0.16
         };
-        let intensity = if inside {
-            ink * 0.28
-        } else {
-            ink * (0.85 + audio.energy * 0.25)
-        };
+        let intensity = ink * (0.85 + audio.energy * 0.25);
         // The raster retains color bands, while selected contour cells become
         // printed marks. Their placement belongs to the field, not random text.
         let cell_x = (p[0] / (scale * 0.5)).floor() as i32;
@@ -368,10 +324,10 @@ impl Renderer {
             } else {
                 '·'
             })
-        } else if !inside && contour < 0.13 && paper < 0.64 {
+        } else if contour < 0.13 && paper < 0.64 {
             // Follow the contour tangent, rather than sprinkling unrelated text.
             Some(line_glyph([-gradient[1], gradient[0]]))
-        } else if !inside && paper < 0.14 && contour > 0.18 && contour < 0.38 {
+        } else if paper < 0.14 && contour > 0.18 && contour < 0.38 {
             Some(if heat > 0.57 {
                 '▒'
             } else if heat > 0.4 {
@@ -393,7 +349,119 @@ impl Renderer {
                 },
             ),
             mark,
-            waveform: false,
+        }
+    }
+
+    fn flower(
+        &self,
+        p: [f32; 2],
+        vertices: &[[f32; 2]; 42],
+        palette: usize,
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+        scale: f32,
+    ) -> Pixel {
+        let mut edge = f32::MAX;
+        let mut tangent = [1.0, 0.0];
+        for i in 0..vertices.len() {
+            let a = vertices[i];
+            let b = vertices[(i + 1) % vertices.len()];
+            let d = distance(p, a, b);
+            if d < edge {
+                edge = d;
+                tangent = [b[0] - a[0], b[1] - a[1]];
+            }
+        }
+        let ink = edge < (scale * 0.32).max(0.009);
+        Pixel {
+            color: theme.sample(
+                palette,
+                0.82 + audio.treble * 0.15,
+                if ink { 0.96 } else { 0.035 },
+            ),
+            mark: ink.then(|| line_glyph(tangent)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scope(
+        &self,
+        p: [f32; 2],
+        palette: usize,
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+        scale: f32,
+        half_width: f32,
+    ) -> Pixel {
+        // Pixel centers of the first and last canvas columns are the endpoints.
+        let span = (half_width - scale * 0.25).max(scale * 0.25);
+        let position = ((p[0] / span + 1.0) * 0.5 * 31.0).clamp(0.0, 31.0);
+        let index = (position.floor() as usize).min(30);
+        let mut edge = f32::MAX;
+        let mut tangent = [1.0, 0.0];
+        for i in index.saturating_sub(1)..=(index + 1).min(30) {
+            // Only real PCM determines the path; no synthetic oscillation.
+            let a = [
+                ((i as f32 / 31.0) * 2.0 - 1.0) * span,
+                audio.waveform[i].clamp(-1.0, 1.0) * 0.88,
+            ];
+            let b = [
+                (((i + 1) as f32 / 31.0) * 2.0 - 1.0) * span,
+                audio.waveform[i + 1].clamp(-1.0, 1.0) * 0.88,
+            ];
+            let d = distance(p, a, b);
+            if d < edge {
+                edge = d;
+                tangent = [b[0] - a[0], b[1] - a[1]];
+            }
+        }
+        let ink = edge < (scale * 0.32).max(0.008);
+        Pixel {
+            color: theme.sample(
+                palette,
+                0.32 + p[0] / span * 0.12,
+                if ink { 1.0 } else { 0.035 },
+            ),
+            mark: ink.then(|| line_glyph(tangent)),
+        }
+    }
+
+    fn radial(
+        &self,
+        p: [f32; 2],
+        palette: usize,
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+        scale: f32,
+    ) -> Pixel {
+        // Elliptically stretched rays, with no horizon, rings or cross-grid.
+        let q = [p[0] * 0.62, p[1]];
+        let radius = q[0].hypot(q[1]);
+        let angle = q[1].atan2(q[0]) - self.rotation;
+        let ray_count = 28.0;
+        let ray = angle / TAU * ray_count;
+        let index = ray.round() as i32;
+        let angular_distance = (ray - ray.round()).abs() * TAU / ray_count;
+        let edge = radius * angular_distance;
+        let attack = self
+            .impacts
+            .iter()
+            .map(|hit| hit.strength * (1.0 - hit.age / 0.18).max(0.0))
+            .fold(0.0_f32, f32::max);
+        let width = scale * (0.12 + audio.bass * 0.2 + attack * 0.32);
+        let ink = edge < width && radius > 0.045;
+        let grain = hash(index, (radius * 65.0 - self.offset[0] * 35.0) as i32);
+        Pixel {
+            color: theme.sample(
+                palette,
+                hash(index, 7),
+                if ink {
+                    0.48 + grain * 0.32 + attack * 0.2
+                } else {
+                    0.035
+                },
+            ),
+            mark: ink.then(|| if grain < 0.18 { '·' } else { line_glyph(p) }),
         }
     }
 }
@@ -418,6 +486,7 @@ mod tests {
             area,
             0.0,
             0,
+            0,
             &[0.5; 32],
             &audio,
             &crate::palette::Theme::default(),
@@ -441,8 +510,8 @@ mod tests {
             waveform: std::array::from_fn(|i| (i as f32 * 1.3).sin()),
             ..audio
         };
-        Renderer::default().draw(&mut flat, area, 0.0, 0, &[0.0; 32], &audio, &theme);
-        Renderer::default().draw(&mut wriggly, area, 0.0, 0, &[0.0; 32], &wave, &theme);
+        Renderer::default().draw(&mut flat, area, 0.0, 2, 0, &[0.0; 32], &audio, &theme);
+        Renderer::default().draw(&mut wriggly, area, 0.0, 2, 0, &[0.0; 32], &wave, &theme);
         let changed = flat
             .content
             .iter()
@@ -453,6 +522,78 @@ mod tests {
             changed > 100,
             "PCM must change visible geometry, not a hidden input"
         );
+    }
+
+    #[test]
+    fn scenes_are_distinct_and_pcm_belongs_only_to_scope() {
+        assert_eq!(SCENES.len(), 4);
+        let area = Rect::new(0, 0, 100, 36);
+        let theme = crate::palette::Theme::default();
+        let quiet = Reactivity::default();
+        let wave = Reactivity {
+            waveform: std::array::from_fn(|i| (i as f32 * 1.3).sin()),
+            ..quiet
+        };
+        let mut scenes = Vec::new();
+        for (scene, name) in SCENES.iter().enumerate() {
+            let mut plain = Buffer::empty(area);
+            let mut pcm = Buffer::empty(area);
+            Renderer::default().draw(&mut plain, area, 0.0, scene, 0, &[0.0; 32], &quiet, &theme);
+            Renderer::default().draw(&mut pcm, area, 0.0, scene, 0, &[0.0; 32], &wave, &theme);
+            if scene == 2 {
+                assert_ne!(plain, pcm);
+            } else {
+                assert_eq!(plain, pcm, "PCM must not leak into {name}");
+            }
+            scenes.push(plain);
+        }
+        for a in 0..scenes.len() {
+            for b in a + 1..scenes.len() {
+                assert_ne!(scenes[a], scenes[b], "scenes must not be duplicate layers");
+            }
+        }
+    }
+
+    #[test]
+    fn flower_and_scope_leave_the_corners_empty() {
+        let area = Rect::new(0, 0, 120, 40);
+        let theme = crate::palette::Theme::default();
+        for scene in [1, 2] {
+            let mut buf = Buffer::empty(area);
+            Renderer::default().draw(
+                &mut buf,
+                area,
+                0.0,
+                scene,
+                0,
+                &[0.5; 32],
+                &Reactivity::default(),
+                &theme,
+            );
+            let corner = &buf[(0, 0)];
+            assert_eq!(corner.symbol(), "▀");
+            assert_eq!(corner.fg, corner.bg, "no field underneath the geometry");
+        }
+    }
+
+    #[test]
+    fn scope_pcm_endpoints_reach_both_canvas_edges() {
+        let theme = crate::palette::Theme::default();
+        for (width, height) in [(120, 40), (80, 24), (160, 50)] {
+            let area = Rect::new(3, 2, width, height);
+            let mut buf = Buffer::empty(area);
+            let audio = Reactivity {
+                waveform: std::array::from_fn(|i| if i % 2 == 0 { 0.75 } else { -0.75 }),
+                ..Reactivity::default()
+            };
+            Renderer::default().draw(&mut buf, area, 0.0, 2, 0, &[0.0; 32], &audio, &theme);
+            for x in [area.x, area.right() - 1] {
+                assert!(
+                    (area.y..area.bottom()).any(|y| buf[(x, y)].symbol() != "▀"),
+                    "live PCM must reach column {x} at {width}x{height}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -506,12 +647,13 @@ mod tests {
         let mut renderer = Renderer::default();
         let mut before = Buffer::empty(area);
         let mut after = Buffer::empty(area);
-        renderer.draw(&mut before, area, 0.0, 0, &[0.0; 32], &audio, &theme);
+        renderer.draw(&mut before, area, 0.0, 0, 0, &[0.0; 32], &audio, &theme);
         for i in 1..=6 {
             renderer.draw(
                 &mut after,
                 area,
                 i as f32 / 60.0,
+                0,
                 0,
                 &[0.0; 32],
                 &audio,
@@ -544,8 +686,8 @@ mod tests {
         let mut plain = Buffer::empty(area);
         renderer.advance(0.0, &quiet);
         idle.advance(0.0, &quiet);
-        renderer.draw(&mut struck, area, 0.016, 0, &[0.0; 32], &hit, &theme);
-        idle.draw(&mut plain, area, 0.016, 0, &[0.0; 32], &quiet, &theme);
+        renderer.draw(&mut struck, area, 0.016, 0, 0, &[0.0; 32], &hit, &theme);
+        idle.draw(&mut plain, area, 0.016, 0, 0, &[0.0; 32], &quiet, &theme);
         assert!(renderer.expansion > 0.02);
         assert!(
             struck
@@ -586,6 +728,7 @@ mod tests {
                     &mut buffer,
                     area,
                     i as f32 / 60.0,
+                    0,
                     0,
                     &[0.6; 32],
                     &audio,

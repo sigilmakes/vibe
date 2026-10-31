@@ -70,6 +70,7 @@ enum ColorMode {
 #[derive(Clone, Copy)]
 enum MenuKind {
     Root,
+    Scenes,
     Palettes,
 }
 struct Menu {
@@ -79,13 +80,15 @@ struct Menu {
 impl Menu {
     fn items(&self) -> &'static [&'static str] {
         match self.kind {
-            MenuKind::Root => &["Palette", "Analysis", "Controls"],
+            MenuKind::Root => &["Visualisation", "Palette", "Analysis", "Controls"],
+            MenuKind::Scenes => visuals::SCENES,
             MenuKind::Palettes => palette::PALETTES,
         }
     }
     fn title(&self) -> &'static str {
         match self.kind {
             MenuKind::Root => "Chromavibe",
+            MenuKind::Scenes => "Visualisation",
             MenuKind::Palettes => "Palette",
         }
     }
@@ -110,7 +113,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -122,13 +125,16 @@ struct Args {
     /// PipeWire output node name or serial
     #[arg(long, value_name = "NODE")]
     target: Option<String>,
+    /// Starting visualisation (see --list)
+    #[arg(long, value_name = "NAME")]
+    scene: Option<String>,
     /// Starting colour palette (see --list)
     #[arg(long, value_name = "NAME")]
     palette: Option<String>,
     /// Visual response strength; does not alter the tempo estimator
     #[arg(long, default_value = "1", value_parser = gain_arg)]
     sensitivity: f32,
-    /// List terminal-derived palettes
+    /// List visualisations and terminal-derived palettes
     #[arg(long)]
     list: bool,
     /// Analyze live audio for 1–60 seconds, then print features (default: 12)
@@ -174,9 +180,11 @@ fn main() -> io::Result<()> {
     use clap::Parser;
     let args = Args::parse();
     if args.list {
+        println!("Visualisations: {}", visuals::SCENES.join(", "));
         println!("Palettes: {}", palette::PALETTES.join(", "));
         return Ok(());
     }
+    let initial_scene = choice(args.scene.as_deref(), visuals::SCENES, "visualisation")?;
     let initial_palette = choice(args.palette.as_deref(), palette::PALETTES, "palette")?;
     let mut demo = args.demo;
     let target = args.target;
@@ -217,6 +225,7 @@ fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     let result = (|| -> io::Result<()> {
         let start = Instant::now();
+        let mut scene = initial_scene;
         let mut palette = initial_palette;
         let mut analysis = false;
         let mut help = false;
@@ -238,6 +247,7 @@ fn main() -> io::Result<()> {
                     frame.buffer_mut(),
                     area,
                     t,
+                    scene,
                     palette,
                     &bands,
                     &reactive,
@@ -296,13 +306,23 @@ fn main() -> io::Result<()> {
                                 MenuKind::Root => match active.selected {
                                     0 => {
                                         menu = Some(Menu {
+                                            kind: MenuKind::Scenes,
+                                            selected: scene,
+                                        })
+                                    }
+                                    1 => {
+                                        menu = Some(Menu {
                                             kind: MenuKind::Palettes,
                                             selected: palette,
                                         })
                                     }
-                                    1 => analysis = true,
+                                    2 => analysis = true,
                                     _ => help = true,
                                 },
+                                MenuKind::Scenes => {
+                                    scene = active.selected;
+                                    renderer = visuals::Renderer::default();
+                                }
                                 MenuKind::Palettes => palette = active.selected,
                             },
                             _ => menu = Some(active),
@@ -328,6 +348,14 @@ fn main() -> io::Result<()> {
                         }
                     }
                     match key.code {
+                        KeyCode::Left | KeyCode::Right => {
+                            scene = if key.code == KeyCode::Left {
+                                (scene + visuals::SCENES.len() - 1) % visuals::SCENES.len()
+                            } else {
+                                (scene + 1) % visuals::SCENES.len()
+                            };
+                            renderer = visuals::Renderer::default();
+                        }
                         KeyCode::Char('q') => break,
                         KeyCode::Char('m') => {
                             menu = Some(Menu {
@@ -398,6 +426,7 @@ mod tests {
                 &mut buffer,
                 area,
                 4.2,
+                0,
                 0,
                 &[0.4; 32],
                 &state,

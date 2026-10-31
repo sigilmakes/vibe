@@ -119,7 +119,7 @@ fn help_popup(frame: &mut Frame, theme: &Theme) {
         Line::raw(" m     opens menu"),
         Line::raw(" Esc   closes menu / popup"),
         Line::raw(" ↑/↓ Enter navigate / select menus"),
-        Line::raw(" p     palette menu"),
+        Line::raw(" ←/→   visualisation   p  palette"),
         Line::raw(" +/-   sensitivity"),
         Line::raw(" d     demo"),
         Line::raw(" r     reconnect"),
@@ -361,7 +361,7 @@ mod tests {
             "m     opens menu",
             "Esc   closes",
             "↑/↓ Enter",
-            "p     palette menu",
+            "←/→   visualisation",
             "+/-",
             "d     demo",
             "r     reconnect",
@@ -370,7 +370,7 @@ mod tests {
             assert!(text.contains(control));
         }
         for obsolete in [
-            "show", "hide", "toggle", "s/p/v", "space", "?", "LIVE", "←/→", "Scene",
+            "show", "hide", "toggle", "s/p/v", "space", "?", "LIVE", "Scene",
         ] {
             assert!(!text.contains(obsolete));
         }
