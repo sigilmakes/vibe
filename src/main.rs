@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FRAME_TIME: Duration = Duration::from_millis(33);
+const FRAME_TIME: Duration = Duration::from_millis(16);
 const SCENE_SECONDS: f32 = 20.0;
 const TRANSITION_SECONDS: f32 = 2.5;
 
@@ -33,6 +33,10 @@ fn demo_audio(t: f32) -> audio::AudioState {
     state.treble = hat * 0.7;
     state.onset = kick.max(hat * 0.4);
     state.kick = kick;
+    state.beat = kick;
+    state.beat_phase = phase;
+    state.waveform =
+        std::array::from_fn(|i| (i as f32 * 0.4 + t * 12.0).sin() * (0.3 + kick * 0.6));
     state.bpm = Some(120.0);
     state.tempo_confidence = 1.0;
     state.connected = true;
@@ -48,6 +52,9 @@ fn sensitivity(state: &audio::AudioState, gain: f32) -> visuals::Reactivity {
         treble: scale(state.treble),
         onset: scale(state.onset),
         kick: scale(state.kick),
+        beat: scale(state.beat),
+        beat_phase: state.beat_phase,
+        waveform: state.waveform.map(|x| (x * gain).clamp(-1.0, 1.0)),
     }
 }
 
@@ -57,28 +64,11 @@ enum ColorMode {
     Always,
     Never,
 }
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum ViewMode {
-    Minimal,
-    Canvas,
-    Analysis,
-}
-impl From<ViewMode> for ui::View {
-    fn from(value: ViewMode) -> Self {
-        match value {
-            ViewMode::Minimal => Self::Minimal,
-            ViewMode::Canvas => Self::Canvas,
-            ViewMode::Analysis => Self::Analysis,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum MenuKind {
     Root,
     Scenes,
     Palettes,
-    Views,
 }
 struct Menu {
     kind: MenuKind,
@@ -87,10 +77,9 @@ struct Menu {
 impl Menu {
     fn items(&self) -> &'static [&'static str] {
         match self.kind {
-            MenuKind::Root => &["Scene", "Palette", "View"],
+            MenuKind::Root => &["Scene", "Palette", "Analysis", "Controls"],
             MenuKind::Scenes => visuals::SCENES,
             MenuKind::Palettes => visuals::PALETTES,
-            MenuKind::Views => &["Minimal", "Canvas", "Analysis"],
         }
     }
     fn title(&self) -> &'static str {
@@ -98,7 +87,6 @@ impl Menu {
             MenuKind::Root => "Chromavibe",
             MenuKind::Scenes => "Scene",
             MenuKind::Palettes => "Palette",
-            MenuKind::Views => "View",
         }
     }
     fn step(&mut self, delta: isize) {
@@ -122,7 +110,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  ←/→ or Space  Next scene  a  Auto scenes  h  Hide/show UI\n  m             Menu        s  Scenes       p  Palettes\n  v             View menu   ?  Help\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q / Esc       Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ←/→ or Space  Next scene  a    Auto scenes\n  s             Scenes      p    Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -143,12 +131,6 @@ struct Args {
     /// Keep the selected scene instead of cycling
     #[arg(long)]
     manual: bool,
-    /// Interface layout
-    #[arg(long, value_enum, default_value = "minimal")]
-    view: ViewMode,
-    /// Start with an unobstructed canvas
-    #[arg(long)]
-    no_hud: bool,
     /// Visual response strength; does not alter the tempo estimator
     #[arg(long, default_value = "1", value_parser = gain_arg)]
     sensitivity: f32,
@@ -248,11 +230,7 @@ fn main() -> io::Result<()> {
         let mut transition_start = None;
         let (mut scene, mut palette) = (initial_scene, initial_palette);
         let mut auto = !args.manual;
-        let mut view = if args.no_hud {
-            ui::View::Canvas
-        } else {
-            args.view.into()
-        };
+        let mut analysis = false;
         let mut help = false;
         let mut menu: Option<Menu> = None;
         let mut gain = args.sensitivity;
@@ -301,18 +279,16 @@ fn main() -> io::Result<()> {
                 );
                 ui::draw(
                     frame,
-                    view,
+                    analysis,
                     help,
                     &ui::Status {
-                        scene: visuals::SCENES[scene],
-                        palette: visuals::PALETTES[palette],
                         sensitivity: gain,
-                        energy: state.energy,
                         bass: state.bass,
                         mid: state.mid,
                         treble: state.treble,
                         onset: state.onset,
                         kick: state.kick,
+                        beat: state.beat,
                         bpm: state.bpm,
                         tempo_confidence: state.tempo_confidence,
                         bands: &state.bands,
@@ -339,7 +315,7 @@ fn main() -> io::Result<()> {
                     }
                     if let Some(mut active) = menu.take() {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('m') => {}
+                            KeyCode::Esc => {}
                             KeyCode::Char('q') => break,
                             KeyCode::Up | KeyCode::Char('k') => {
                                 active.step(-1);
@@ -350,44 +326,44 @@ fn main() -> io::Result<()> {
                                 menu = Some(active);
                             }
                             KeyCode::Enter => match active.kind {
-                                MenuKind::Root => {
-                                    let kind = match active.selected {
-                                        0 => MenuKind::Scenes,
-                                        1 => MenuKind::Palettes,
-                                        _ => MenuKind::Views,
-                                    };
-                                    let selected = match kind {
-                                        MenuKind::Scenes => scene,
-                                        MenuKind::Palettes => palette,
-                                        _ => match view {
-                                            ui::View::Minimal => 0,
-                                            ui::View::Canvas => 1,
-                                            ui::View::Analysis => 2,
-                                        },
-                                    };
-                                    menu = Some(Menu { kind, selected });
-                                }
+                                MenuKind::Root => match active.selected {
+                                    0 => {
+                                        menu = Some(Menu {
+                                            kind: MenuKind::Scenes,
+                                            selected: scene,
+                                        })
+                                    }
+                                    1 => {
+                                        menu = Some(Menu {
+                                            kind: MenuKind::Palettes,
+                                            selected: palette,
+                                        })
+                                    }
+                                    2 => analysis = true,
+                                    _ => help = true,
+                                },
                                 MenuKind::Scenes => {
                                     scene = active.selected;
                                     scene_start = t;
                                     transition_start = None;
                                 }
                                 MenuKind::Palettes => palette = active.selected,
-                                MenuKind::Views => {
-                                    view = match active.selected {
-                                        0 => ui::View::Minimal,
-                                        1 => ui::View::Canvas,
-                                        _ => ui::View::Analysis,
-                                    }
-                                }
                             },
                             _ => menu = Some(active),
                         }
                         continue;
                     }
+                    if analysis {
+                        match key.code {
+                            KeyCode::Esc => analysis = false,
+                            KeyCode::Char('q') => break,
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if help {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Char('?') => {
+                            KeyCode::Esc => {
                                 help = false;
                                 continue;
                             }
@@ -396,7 +372,7 @@ fn main() -> io::Result<()> {
                         }
                     }
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('q') => break,
                         KeyCode::Right | KeyCode::Char(' ') => {
                             scene = (scene + 1) % visuals::SCENES.len();
                             scene_start = t;
@@ -429,23 +405,6 @@ fn main() -> io::Result<()> {
                             auto = !auto;
                             scene_start = t;
                             transition_start = None;
-                        }
-                        KeyCode::Char('v') => {
-                            menu = Some(Menu {
-                                kind: MenuKind::Views,
-                                selected: match view {
-                                    ui::View::Minimal => 0,
-                                    ui::View::Canvas => 1,
-                                    ui::View::Analysis => 2,
-                                },
-                            })
-                        }
-                        KeyCode::Char('h') => {
-                            view = if view == ui::View::Canvas {
-                                ui::View::Minimal
-                            } else {
-                                ui::View::Canvas
-                            }
                         }
                         KeyCode::Char('?') => help = true,
                         KeyCode::Char('+') | KeyCode::Char('=') => gain = (gain + 0.1).min(3.0),

@@ -13,6 +13,7 @@ pub const SCENES: &[&str] = &[
     "Lissajous Ribbons",
     "Particle Constellation",
     "Frequency Terrain",
+    "Waveform Scope",
 ];
 
 pub const PALETTES: &[&str] = &["Cyber Candy", "Solar Flare", "Ocean Glass", "Ultraviolet"];
@@ -49,7 +50,7 @@ const COLORS: [[[f32; 3]; 5]; 4] = [
     ],
 ];
 
-/// Smoothed, normalized visual controls; these are envelopes, not PCM samples.
+/// Live normalized envelopes, a tempo-grid pulse, and a simplified recent PCM trace.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reactivity {
     pub energy: f32,
@@ -58,6 +59,12 @@ pub struct Reactivity {
     pub treble: f32,
     pub onset: f32,
     pub kick: f32,
+    /// Tempo-derived pulse, distinct from detected kicks and broadband onsets.
+    pub beat: f32,
+    /// Position within the current tempo-grid beat, in [0, 1).
+    pub beat_phase: f32,
+    /// 32 signed, amplitude-normalized samples from the recent audio trace.
+    pub waveform: [f32; 32],
 }
 
 type Rgb = [f32; 3];
@@ -95,11 +102,14 @@ fn glow(distance: f32, width: f32) -> f32 {
     1.0 / (1.0 + d * d)
 }
 
-fn band(bands: &[f32; 32], position: f32) -> f32 {
+fn trace(samples: &[f32; 32], position: f32) -> f32 {
     let p = position.clamp(0.0, 1.0) * 31.0;
     let i = p as usize;
-    let value = bands[i] + (bands[(i + 1).min(31)] - bands[i]) * p.fract();
-    value.clamp(0.0, 1.0)
+    samples[i] + (samples[(i + 1).min(31)] - samples[i]) * p.fract()
+}
+
+fn band(bands: &[f32; 32], position: f32) -> f32 {
+    trace(bands, position).clamp(0.0, 1.0)
 }
 
 struct Field<'a> {
@@ -108,6 +118,7 @@ struct Field<'a> {
     bands: &'a [f32; 32],
     audio: &'a Reactivity,
     ribbons: [[[f32; 2]; 33]; 2],
+    scope: [[f32; 2]; 32],
 }
 
 impl Field<'_> {
@@ -119,6 +130,8 @@ impl Field<'_> {
         let treble = self.audio.treble.clamp(0.0, 1.0);
         let onset = self.audio.onset.clamp(0.0, 1.0);
         let kick = self.audio.kick.clamp(0.0, 1.0);
+        let beat = self.audio.beat.clamp(0.0, 1.0);
+        let beat_phase = self.audio.beat_phase.rem_euclid(1.0);
         let r = x.hypot(y);
         let a = y.atan2(x);
         let audio = band(self.bands, (a / TAU + 0.5).rem_euclid(1.0));
@@ -153,8 +166,11 @@ impl Field<'_> {
             }
             2 => {
                 let wobble = (a * 5.0 + t * 0.5).sin() * 0.07 + (a * 3.0 - t * 0.3).cos() * 0.055;
-                let radius = r + wobble * (0.4 + r + mid * 0.4) - audio * 0.1 - onset * 0.06;
-                let wave = (radius * (14.0 + e * 2.0) - t * 1.2).sin();
+                // The grid pulse expands all rings together; transient hits add local detail.
+                let radius = r / (1.0 + beat * 0.16) + wobble * (0.4 + r + mid * 0.4)
+                    - audio * 0.1
+                    - onset * 0.06;
+                let wave = (radius * (14.0 + e * 2.0) - beat_phase * TAU).sin();
                 let rings = glow(wave, 0.085 + e * 0.06);
                 let petals = (a * 8.0 + r * 3.0 - t * 0.3).cos() * 0.5 + 0.5;
                 let core = glow(r, 0.13 + e * 0.05);
@@ -219,10 +235,13 @@ impl Field<'_> {
                 let petals = (angle * 7.0 + (t * 0.27).sin() * mid).cos();
                 let radius = 0.35
                     + bass * 0.2
-                    + kick * 0.12
+                    + beat * 0.20
+                    + kick * 0.22
                     + onset * 0.03
                     + (0.12 + mid * 0.12) * petals
-                    + spectrum * 0.18;
+                    + spectrum * 0.18
+                    + trace(&self.audio.waveform, (angle / TAU).rem_euclid(1.0)).clamp(-1.0, 1.0)
+                        * 0.045;
                 let edge = glow(r - radius, 0.014 + treble * 0.012);
                 let inner = glow(r - radius * 0.57, 0.009) * 0.45;
                 let veins = glow((angle * 7.0 + r * 4.0).sin(), 0.07)
@@ -274,11 +293,13 @@ impl Field<'_> {
                         let py = (cy + 0.2 + hash(cy, cx + 3.0) * 0.6) * spacing
                             + (t * 0.24 + seed * 9.0).cos() * (0.02 + mid * 0.07);
                         let tail = [
-                            px - 0.025 - envelope * 0.12 - onset * 0.04,
+                            px - 0.025 - envelope * 0.12 - onset * 0.12 - kick * 0.08,
                             py + 0.018 + treble * 0.055,
                         ];
-                        let star =
-                            glow((drift_x - px).hypot(drift_y - py), 0.005 + envelope * 0.009);
+                        let star = glow(
+                            (drift_x - px).hypot(drift_y - py),
+                            0.005 + envelope * 0.009 + onset * 0.012 + kick * 0.008,
+                        );
                         let trail =
                             glow(segment_distance(drift_x, drift_y, tail, [px, py]), 0.004) * 0.25;
                         let value = star + trail;
@@ -290,7 +311,7 @@ impl Field<'_> {
                 }
                 (phase, light * 0.85, light.powi(3) * 0.55)
             }
-            _ => {
+            9 => {
                 let horizon = -0.28 - bass * 0.08 - kick * 0.04;
                 let below = y - horizon;
                 if below <= 0.0 {
@@ -313,6 +334,39 @@ impl Field<'_> {
                         across * along * fade * 0.35,
                     )
                 }
+            }
+            _ => {
+                // Straight interpolation preserves the actual 32-point recent trace.
+                // This is a simplified waveform, not a stereo or spectral display.
+                let mut distance = f32::MAX;
+                for pair in self.scope.windows(2) {
+                    distance = distance.min(segment_distance(x, y, pair[0], pair[1]));
+                }
+                let line = glow(distance, 0.009 + treble * 0.006);
+                let halo = glow(distance, 0.035) * 0.12;
+                let baseline = glow(y, 0.003) * 0.025;
+                // A spectrum-shaped frame sits behind the real waveform, with dark space
+                // between thin neon lines. The beat moves its radius, never its clock.
+                let angle = (a / TAU + 0.5).rem_euclid(1.0);
+                let spectrum = band(self.bands, angle);
+                let orbit_radius = 0.52 + spectrum * 0.16 + beat * 0.10;
+                let orbit = glow(r - orbit_radius, 0.006 + treble * 0.003);
+                let beat_ring = glow(r - 0.78 - beat * 0.13, 0.007) * beat;
+                let spokes = glow((a * 29.0 - beat_phase * TAU).sin(), 0.055);
+                let sparks = spokes
+                    * glow(r - orbit_radius - 0.045 - onset * 0.10, 0.012)
+                    * (onset * 0.7 + kick * 0.3);
+                (
+                    x * 0.18 + orbit * 0.22 + t * 0.025,
+                    0.003
+                        + baseline
+                        + halo
+                        + line * 0.9
+                        + orbit * 0.28
+                        + beat_ring * 0.35
+                        + sparks * 0.8,
+                    line.powi(3) * 0.55 + sparks * 0.45 + beat_ring * 0.15,
+                )
             }
         };
         let color = gradient(phase, self.palette);
@@ -345,6 +399,12 @@ pub fn draw(
         palette,
         bands,
         audio,
+        scope: std::array::from_fn(|i| {
+            [
+                (i as f32 / 31.0 * 2.0 - 1.0) * 1.15,
+                audio.waveform[i].clamp(-1.0, 1.0) * 0.65,
+            ]
+        }),
         // Precompute the parametric paths once per frame, not once per pixel.
         ribbons: std::array::from_fn(|side| {
             std::array::from_fn(|i| {
@@ -442,6 +502,7 @@ mod tests {
             treble: 0.8,
             onset: 0.8,
             kick: 1.0,
+            ..Reactivity::default()
         };
         let bands = std::array::from_fn(|i| 0.2 + i as f32 / 40.0);
         let mut silent_frames = Vec::new();
@@ -473,6 +534,51 @@ mod tests {
                 render(scene, &[0.0; 32], &kick)
             );
         }
+    }
+
+    #[test]
+    fn actual_waveform_changes_scope_geometry_at_equal_energy() {
+        let flat = Reactivity {
+            energy: 0.5,
+            ..Reactivity::default()
+        };
+        let trace = Reactivity {
+            waveform: std::array::from_fn(|i| (i as f32 * 0.7).sin()),
+            ..flat
+        };
+        let scope = SCENES
+            .iter()
+            .position(|name| *name == "Waveform Scope")
+            .unwrap();
+        assert_ne!(
+            render(scope, &[0.0; 32], &flat),
+            render(scope, &[0.0; 32], &trace)
+        );
+    }
+
+    #[test]
+    fn beat_pulse_changes_ring_and_flower_geometry_without_transients() {
+        let quiet = Reactivity::default();
+        let beat = Reactivity { beat: 1.0, ..quiet };
+        for scene in [2, 6] {
+            assert_ne!(
+                render(scene, &[0.0; 32], &quiet),
+                render(scene, &[0.0; 32], &beat)
+            );
+        }
+    }
+
+    #[test]
+    fn beat_phase_advances_orbital_rings_at_fixed_wall_time() {
+        let start = Reactivity::default();
+        let advancing = Reactivity {
+            beat_phase: 0.25,
+            ..start
+        };
+        assert_ne!(
+            render(2, &[0.0; 32], &start),
+            render(2, &[0.0; 32], &advancing)
+        );
     }
 
     #[test]

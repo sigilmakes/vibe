@@ -6,22 +6,13 @@ use ratatui::{
     Frame,
 };
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum View {
-    Minimal,
-    Canvas,
-    Analysis,
-}
-
 pub struct Status<'a> {
-    pub scene: &'a str,
-    pub palette: &'a str,
-    pub energy: f32,
     pub bass: f32,
     pub mid: f32,
     pub treble: f32,
     pub onset: f32,
     pub kick: f32,
+    pub beat: f32,
     pub bpm: Option<f32>,
     pub tempo_confidence: f32,
     pub sensitivity: f32,
@@ -43,27 +34,8 @@ fn overlay(frame: &mut Frame, area: Rect, lines: Vec<Line<'_>>) {
     frame.render_widget(Paragraph::new(lines).style(base()), area);
 }
 
-fn status_line(status: &Status<'_>, width: u16) -> Line<'static> {
-    let mut spans = vec![Span::styled(
-        format!(" {}", status.scene),
-        Style::default().fg(Color::White),
-    )];
-    let mut used = status.scene.chars().count() + 1;
-    let palette = format!(" · {}", status.palette);
-    if used + palette.chars().count() < width as usize {
-        used += palette.chars().count();
-        spans.push(Span::styled(palette, Style::default().fg(PINK)));
-    }
-    if used + 9 <= width as usize {
-        spans.push(Span::raw("   m menu"));
-    }
-    Line::from(spans)
-}
-
 fn confident_bpm(status: &Status<'_>) -> Option<f32> {
-    status
-        .bpm
-        .filter(|bpm| bpm.is_finite() && *bpm > 0.0 && status.tempo_confidence >= 0.45)
+    status.bpm.filter(|bpm| bpm.is_finite() && *bpm > 0.0)
 }
 
 fn tempo(status: &Status<'_>) -> String {
@@ -121,41 +93,61 @@ fn spectrum(status: &Status<'_>, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn help_popup(frame: &mut Frame, status: &Status<'_>) {
-    let screen = frame.area();
-    let width = screen.width.min(38);
-    let height = screen.height.min(13);
-    let area = Rect::new(
+fn centered(screen: Rect, width: u16, height: u16) -> Rect {
+    let width = screen.width.min(width);
+    let height = screen.height.min(height);
+    Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + (screen.height - height) / 2,
         width,
         height,
-    );
+    )
+}
+
+fn help_popup(frame: &mut Frame) {
+    let area = centered(frame.area(), 38, 9);
     let lines = vec![
         Line::styled(
             " Controls",
             Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
         ),
-        Line::raw(" m       menu"),
-        Line::raw(" s/p/v   scene / palette / view menus"),
-        Line::raw(" ↑/↓ j/k select · Enter confirm"),
-        Line::raw(" Esc     dismiss menu"),
-        Line::raw(" ←/→ space  next scene"),
-        Line::raw(" a       auto scenes"),
-        Line::raw(" d       demo"),
-        Line::raw(" r       reconnect"),
-        Line::raw(" +/-     sensitivity"),
-        Line::raw(" q       quit"),
-        Line::raw(" ?       close help"),
-        Line::styled(
-            format!(" Sensitivity {:.1}×", status.sensitivity),
-            Style::default().fg(PINK),
-        ),
+        Line::raw(" m     opens menu"),
+        Line::raw(" Esc   closes menu / popup"),
+        Line::raw(" ↑/↓ Enter navigate / select menus"),
+        Line::raw(" ←/→   quick scene"),
+        Line::raw(" +/-   sensitivity"),
+        Line::raw(" d     demo"),
+        Line::raw(" r     reconnect"),
+        Line::raw(" q     quit"),
     ];
     overlay(frame, area, lines);
 }
 
-/// Draw a compact, opaque menu above the canvas and any status overlay.
+fn analysis_popup(frame: &mut Frame, status: &Status<'_>) {
+    let area = centered(frame.area(), 44, 10);
+    let lines = vec![
+        Line::styled(
+            " Analysis",
+            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+        ),
+        spectrum(status, area.width),
+        envelope("bass", status.bass, area.width, CYAN),
+        envelope("mid", status.mid, area.width, Color::Rgb(168, 167, 244)),
+        envelope("high", status.treble, area.width, PINK),
+        envelope("onset", status.onset, area.width, PINK),
+        envelope("kick", status.kick, area.width, CYAN),
+        envelope("beat", status.beat, area.width, CYAN),
+        Line::raw(format!(" {}", tempo(status))),
+        Line::raw(format!(
+            " Confidence {:.2} · response {:.1}×",
+            level(status.tempo_confidence),
+            status.sensitivity
+        )),
+    ];
+    overlay(frame, area, lines);
+}
+
+/// Draw a compact, opaque menu above the canvas.
 pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
@@ -198,79 +190,16 @@ pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize) {
     overlay(frame, area, lines);
 }
 
-pub fn draw(frame: &mut Frame, view: View, help: bool, status: &Status<'_>) {
+/// Leave the canvas untouched unless an explicit popup or error is present.
+pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
         return;
     }
-    let panel_height = match view {
-        View::Canvas => 0,
-        View::Minimal => 1,
-        View::Analysis => screen.height.min(6),
-    };
-    if panel_height > 0 {
-        let area = Rect::new(
-            screen.x,
-            screen.bottom() - panel_height,
-            screen.width,
-            panel_height,
-        );
-        let mut lines = Vec::new();
-        if view == View::Analysis {
-            // Preserve the status line when there is not room for every meter.
-            let detail = vec![
-                spectrum(status, screen.width),
-                envelope("low", status.bass, screen.width, CYAN),
-                envelope("mid", status.mid, screen.width, Color::Rgb(168, 167, 244)),
-                envelope("high", status.treble, screen.width, PINK),
-                Line::from(vec![
-                    Span::styled(
-                        if level(status.kick) > 0.25 {
-                            " ● "
-                        } else {
-                            " · "
-                        },
-                        Style::default().fg(CYAN),
-                    ),
-                    Span::raw("kick "),
-                    Span::styled(
-                        if level(status.onset) > 0.25 {
-                            "● "
-                        } else {
-                            "· "
-                        },
-                        Style::default().fg(PINK),
-                    ),
-                    Span::raw("onset  "),
-                    Span::styled(tempo(status), Style::default().fg(CYAN)),
-                    Span::raw(if level(status.energy) > 0.02 {
-                        "  signal"
-                    } else {
-                        "  listening"
-                    }),
-                    Span::raw(format!("  gain {:.1}×", status.sensitivity)),
-                    Span::raw(format!(
-                        "  confidence {:.0}%",
-                        level(status.tempo_confidence) * 100.0
-                    )),
-                ]),
-            ];
-            lines.extend(
-                detail
-                    .into_iter()
-                    .take(panel_height.saturating_sub(1) as usize),
-            );
-        }
-        lines.push(status_line(status, screen.width));
-        overlay(frame, area, lines);
-    }
     if let Some(error) = status.error {
-        let y = screen
-            .bottom()
-            .saturating_sub(panel_height + 1)
-            .max(screen.y);
-        let area = Rect::new(screen.x, y, screen.width, 1);
         let message = error.lines().next().unwrap_or("Audio unavailable");
+        let width = message.chars().count().saturating_add(8).min(60) as u16;
+        let area = centered(screen, width, 1);
         overlay(
             frame,
             area,
@@ -280,150 +209,162 @@ pub fn draw(frame: &mut Frame, view: View, help: bool, status: &Status<'_>) {
             )],
         );
     }
+    if analysis {
+        analysis_popup(frame, status);
+    }
     if help {
-        help_popup(frame, status);
+        help_popup(frame);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
 
-    fn render(
-        width: u16,
-        height: u16,
-        view: View,
-        help: bool,
-        error: Option<&str>,
-    ) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let bands = [0.5; 32];
-        let status = Status {
-            scene: "Aurora",
-            palette: "Lagoon",
-            energy: 0.6,
+    fn status(bands: &[f32; 32]) -> Status<'_> {
+        Status {
             bass: 0.7,
             mid: 0.4,
             treble: 0.2,
             onset: 0.8,
             kick: 0.7,
+            beat: 0.6,
             bpm: Some(120.0),
             tempo_confidence: 0.8,
             sensitivity: 1.0,
-            bands: &bands,
-            error,
-        };
+            bands,
+            error: None,
+        }
+    }
+
+    fn render(width: u16, height: u16, analysis: bool, help: bool, error: Option<&str>) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let bands = [0.5; 32];
+        let mut status = status(&bands);
+        status.error = error;
         terminal
             .draw(|frame| {
-                for y in 0..height {
-                    for x in 0..width {
-                        frame.buffer_mut()[(x, y)].set_symbol("▀");
-                    }
+                for cell in &mut frame.buffer_mut().content {
+                    cell.set_symbol("▀");
                 }
-                draw(frame, view, help, &status);
+                draw(frame, analysis, help, &status);
             })
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
-    fn row(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    fn row(buffer: &Buffer, y: u16) -> String {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol())
             .collect()
     }
 
-    #[test]
-    fn minimal_is_one_clean_status_line() {
-        let buffer = render(100, 30, View::Minimal, false, None);
-        let status = row(&buffer, 29);
-        assert!(status.contains("Aurora"));
-        assert!(status.contains("Lagoon"));
-        assert!(status.contains("m menu"));
-        for unwanted in ["LIVE", "auto", "manual", "BPM", "━", "─", "▁", "█"] {
-            assert!(!status.contains(unwanted));
-        }
-        assert!(!row(&buffer, 29).contains('▀'));
-        assert!(row(&buffer, 0).chars().all(|c| c == '▀'));
+    fn text(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| row(buffer, y))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
-    #[test]
-    fn analysis_has_meters_and_clears_every_panel_cell() {
-        let buffer = render(100, 30, View::Analysis, false, None);
-        for y in 24..30 {
-            assert!(!row(&buffer, y).contains('▀'));
-        }
-        assert!(row(&buffer, 25).contains("low"));
-        assert!(row(&buffer, 28).contains("onset"));
-        assert!(row(&buffer, 28).contains("kick"));
-        assert!(row(&buffer, 28).contains("120 BPM"));
-        assert!(row(&buffer, 29).contains("Aurora"));
-    }
-
-    #[test]
-    fn canvas_is_untouched_except_for_error() {
-        let buffer = render(80, 24, View::Canvas, false, None);
-        assert!(buffer.content.iter().all(|cell| cell.symbol() == "▀"));
-        let buffer = render(80, 24, View::Canvas, false, Some("Disconnected"));
-        assert!(row(&buffer, 23).contains("Disconnected"));
-        assert!(!row(&buffer, 23).contains('▀'));
-    }
-
-    #[test]
-    fn help_is_opaque_and_lists_controls() {
-        let buffer = render(80, 25, View::Canvas, true, None);
-        for y in 6..19 {
-            for x in 21..59 {
-                assert_ne!(buffer[(x, y)].symbol(), "▀");
+    fn assert_popup_only(buffer: &Buffer, area: Rect) {
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if area.contains((x, y).into()) {
+                    assert_ne!(cell.symbol(), "▀");
+                    assert_ne!(cell.bg, Color::Reset);
+                } else {
+                    assert_eq!(cell.symbol(), "▀");
+                }
             }
         }
-        let text = (0..25)
-            .map(|y| row(&buffer, y))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for control in ["←/→ space", "palette", "sensitivity", "reconnect", "quit"] {
+    }
+
+    #[test]
+    fn default_leaves_the_full_canvas_untouched() {
+        for (width, height) in [(1, 1), (20, 7), (80, 24), (160, 50)] {
+            let buffer = render(width, height, false, false, None);
+            assert!(buffer.content.iter().all(|cell| cell.symbol() == "▀"));
+        }
+    }
+
+    #[test]
+    fn analysis_is_a_centered_opaque_popup_only_when_requested() {
+        let buffer = render(100, 30, true, false, None);
+        assert_popup_only(&buffer, Rect::new(28, 10, 44, 10));
+        let text = text(&buffer);
+        for measurement in [
+            "bass",
+            "mid",
+            "high",
+            "onset",
+            "kick",
+            "beat",
+            "120 BPM",
+            "Confidence 0.80",
+        ] {
+            assert!(text.contains(measurement));
+        }
+        for unwanted in ["Aurora", "Lagoon", "LIVE", "m menu"] {
+            assert!(!text.contains(unwanted));
+        }
+    }
+
+    #[test]
+    fn errors_do_not_create_a_persistent_status_line() {
+        let buffer = render(80, 24, false, false, Some("Disconnected"));
+        assert_popup_only(&buffer, Rect::new(30, 11, 20, 1));
+        assert!(text(&buffer).contains("Audio: Disconnected"));
+    }
+
+    #[test]
+    fn help_is_opaque_and_describes_only_current_controls() {
+        let buffer = render(80, 25, false, true, None);
+        assert_popup_only(&buffer, Rect::new(21, 8, 38, 9));
+        let text = text(&buffer);
+        for control in [
+            "m     opens menu",
+            "Esc   closes",
+            "↑/↓ Enter",
+            "←/→",
+            "+/-",
+            "d     demo",
+            "r     reconnect",
+            "q     quit",
+        ] {
             assert!(text.contains(control));
         }
+        for obsolete in ["show", "hide", "toggle", "s/p/v", "space", "?", "LIVE"] {
+            assert!(!text.contains(obsolete));
+        }
     }
 
     #[test]
-    fn small_and_empty_terminals_do_not_panic() {
+    fn small_and_empty_terminals_clip_popups_without_touching_other_cells() {
         for (width, height) in [(0, 0), (1, 1), (8, 2), (20, 7), (160, 50)] {
-            for view in [View::Minimal, View::Canvas, View::Analysis] {
-                render(width, height, view, true, Some("Disconnected"));
+            for (analysis, help, w, h) in [(true, false, 44, 10), (false, true, 38, 9)] {
+                let buffer = render(width, height, analysis, help, None);
+                assert_popup_only(&buffer, centered(buffer.area, w, h));
             }
         }
-        let buffer = render(14, 2, View::Minimal, false, None);
-        assert!(row(&buffer, 1).contains("Aurora"));
-        assert!(!row(&buffer, 1).contains("help"));
+        let buffer = render(20, 7, false, true, None);
+        assert!(row(&buffer, 1).contains("opens menu"));
+        assert!(row(&buffer, 2).contains("closes"));
     }
 
     #[test]
-    fn unconfident_tempo_is_not_presented_as_a_measurement() {
+    fn tempo_display_uses_the_tracker_decision() {
         let bands = [0.0; 32];
-        let mut status = Status {
-            scene: "Aurora",
-            palette: "Lagoon",
-            energy: 0.0,
-            bass: 0.0,
-            mid: 0.0,
-            treble: 0.0,
-            onset: 0.0,
-            kick: 0.0,
-            bpm: Some(120.0),
-            tempo_confidence: 0.1,
-            sensitivity: 1.0,
-            bands: &bands,
-            error: None,
-        };
-        assert_eq!(tempo(&status), "tempo · learning");
+        let mut status = status(&bands);
+        status.tempo_confidence = 0.35;
+        assert_eq!(tempo(&status), "120 BPM");
         status.bpm = None;
-        status.tempo_confidence = 1.0;
         assert_eq!(tempo(&status), "tempo · learning");
     }
 
     #[test]
-    fn menu_is_opaque_and_scrolls_to_selection() {
+    fn menu_is_opaque_borderless_and_scrolls_to_selection() {
         for (width, height) in [(0, 0), (1, 1), (8, 3), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
@@ -431,21 +372,25 @@ mod tests {
                     for cell in &mut frame.buffer_mut().content {
                         cell.set_symbol("▀");
                     }
-                    menu(frame, "View", &["Minimal", "Canvas", "Analysis"], 2);
+                    menu(
+                        frame,
+                        "Menu",
+                        &["Scene", "Palette", "Analysis", "Controls"],
+                        3,
+                    );
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
+            assert_popup_only(buffer, centered(buffer.area, 34, 6));
             if width == 80 {
-                for y in 9..14 {
-                    for x in 23..57 {
-                        assert_ne!(buffer[(x, y)].symbol(), "▀");
-                    }
-                }
-                assert!(row(buffer, 12).contains("› Analysis"));
-                assert_eq!(buffer[(24, 12)].bg, CYAN);
+                assert!(row(buffer, 13).contains("› Controls"));
+                assert_eq!(buffer[(24, 13)].bg, CYAN);
+                let text = text(buffer);
+                assert!(!text.contains('─'));
+                assert!(!text.contains('│'));
             }
             if width == 8 {
-                assert!(row(buffer, 1).contains("› Ana"));
+                assert!(row(buffer, 1).contains("› Con"));
             }
         }
     }
