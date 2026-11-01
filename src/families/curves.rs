@@ -35,6 +35,7 @@ struct Dot {
 pub struct Renderer {
     last_time: Option<f32>,
     motion: f32,
+    pendulum_phase: f32,
     controls: [f32; 8],
     spectrum: [f32; 32],
     chroma: [f32; 12],
@@ -171,7 +172,10 @@ impl Renderer {
         for (v, t) in self.chroma.iter_mut().zip(audio.chroma) {
             *v += (unit(t) - *v) * blend;
         }
-        self.motion += dt * (0.16 + self.controls[2] * 0.45);
+        let speed = 0.16 + self.controls[2] * 0.45;
+        self.motion += dt * speed;
+        self.pendulum_phase =
+            (self.pendulum_phase + dt * speed * (2.07 + self.controls[2] * 0.15)).rem_euclid(TAU);
         let [energy, bass, mid, treble, kick, novelty, centroid, flatness] = self.controls;
         let t = self.motion;
         let pitch: f32 = self
@@ -184,7 +188,7 @@ impl Renderer {
         let mode = style % NAMES.len();
         let pendulum = |s: f32| {
             let a = 0.7 * (s * 1.3).sin();
-            let b = 0.65 * (s * (2.07 + mid * 0.15) + bass).sin();
+            let b = 0.65 * (self.pendulum_phase + (s - t) * (2.07 + mid * 0.15) + bass).sin();
             [
                 0.44 * a.sin() + 0.40 * b.sin(),
                 0.72 - 0.44 * a.cos() - 0.40 * b.cos(),
@@ -437,6 +441,36 @@ mod tests {
         let marks = buf.content.iter().map(|c| c.symbol()).collect::<String>();
         (marks, renderer)
     }
+    #[test]
+    fn pendulum_pitch_changes_do_not_scale_with_uptime() {
+        let area = Rect::new(0, 0, 8, 4);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::default();
+        let mut renderer = Renderer {
+            motion: 10_000.0,
+            last_time: Some(0.0),
+            ..Default::default()
+        };
+        renderer.draw(
+            &mut buffer,
+            area,
+            0.016,
+            6,
+            0,
+            &[0.0; 32],
+            &Reactivity::default(),
+            &theme,
+        );
+        let before = *renderer.trail.back().unwrap();
+        let audio = Reactivity {
+            mid: 1.0,
+            ..Default::default()
+        };
+        renderer.draw(&mut buffer, area, 0.032, 6, 0, &[0.0; 32], &audio, &theme);
+        let after = *renderer.trail.back().unwrap();
+        assert!((after[0] - before[0]).hypot(after[1] - before[1]) < 0.05);
+    }
+
     #[test]
     fn all_modes_clip_and_keep_finite_bounded_state() {
         let mut a = audio();

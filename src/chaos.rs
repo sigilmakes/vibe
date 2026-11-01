@@ -72,7 +72,8 @@ impl Storm {
         if dt <= 0.0 {
             return;
         }
-        self.camera = (self.camera + dt * (0.17 + sound[1] * 0.28)).rem_euclid(TAU);
+        // The camera tilt uses 0.61 turns per orbit; both close after 100 orbits.
+        self.camera = (self.camera + dt * (0.17 + sound[1] * 0.28)).rem_euclid(100.0 * TAU);
         self.breath += (sound[0] - self.breath) * (1.0 - (-dt * 5.0).exp());
         if hit > 0.0 {
             for (i, trail) in self.trails.iter_mut().enumerate() {
@@ -386,6 +387,17 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storm_tilt_is_continuous_across_camera_turns() {
+        let mut storm = Storm {
+            camera: TAU - 0.0001,
+            ..Default::default()
+        };
+        let before = (storm.camera * 0.61).sin();
+        storm.advance(0.001, [0.0; 3], 0.0);
+        assert!(((storm.camera * 0.61).sin() - before).abs() < 0.001);
+    }
 
     #[test]
     fn integrated_worlds_evolve_stay_bounded_and_respond_to_music() {

@@ -51,7 +51,8 @@ impl Renderer {
         for (envelope, level) in self.envelopes.iter_mut().zip(levels) {
             *envelope += (unit(level) - *envelope) * smoothing;
         }
-        self.phase = (self.phase + dt * (0.65 + 0.9 * self.envelopes[1])) % (2.0 * PI);
+        // Fractional 0.8/1.3/1.7 oscillators close after ten turns.
+        self.phase = (self.phase + dt * (0.65 + 0.9 * self.envelopes[1])) % (20.0 * PI);
         for mark in &mut self.marks {
             mark.age += dt;
         }
@@ -344,6 +345,48 @@ mod tests {
 
     fn symbols(buf: &Buffer) -> String {
         buf.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn lace_fractional_oscillators_do_not_jump_after_one_turn() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let mut renderer = Renderer {
+            phase: 2.0 * PI - 0.0001,
+            last_time: Some(0.0),
+            ..Default::default()
+        };
+        renderer.draw(
+            &mut buffer,
+            area,
+            0.0,
+            1,
+            0,
+            &[0.0; 32],
+            &Reactivity::default(),
+            &Theme::default(),
+        );
+        let before = buffer.clone();
+        renderer.draw(
+            &mut buffer,
+            area,
+            0.001,
+            1,
+            0,
+            &[0.0; 32],
+            &Reactivity::default(),
+            &Theme::default(),
+        );
+        let changed = before
+            .content
+            .iter()
+            .zip(&buffer.content)
+            .filter(|(a, b)| a.symbol() != b.symbol())
+            .count();
+        assert!(
+            changed < area.area() as usize / 10,
+            "one-turn wrap changed {changed} cells"
+        );
     }
 
     #[test]
