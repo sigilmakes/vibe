@@ -1,5 +1,13 @@
 mod audio;
+mod chaos;
+mod families;
+mod flocks;
+mod fractals;
+mod glyphs;
 mod palette;
+mod preferences;
+mod sculptures;
+mod spectrum;
 mod ui;
 mod visuals;
 
@@ -10,6 +18,7 @@ use std::{
 };
 
 const FRAME_TIME: Duration = Duration::from_millis(16);
+const DEFAULT_SCENE: &str = "Liquid Topography";
 
 fn demo_audio(t: f32) -> audio::AudioState {
     let phase = (t * 2.0).fract();
@@ -33,6 +42,22 @@ fn demo_audio(t: f32) -> audio::AudioState {
     state.onset = kick.max(hat * 0.4);
     state.transients = [kick, hat * 0.6, hat, hat * 0.8];
     state.novelty = kick.max(hat);
+    state.chroma = [
+        1.0 / 3.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0 / 3.0,
+        0.0,
+        0.0,
+        1.0 / 3.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    state.centroid = 0.25 + hat * 0.45;
+    state.flatness = hat * 0.5;
     state.kick = kick;
     state.beat = kick;
     state.beat_phase = phase;
@@ -54,6 +79,9 @@ fn sensitivity(state: &audio::AudioState, gain: f32) -> visuals::Reactivity {
         onset: scale(state.onset),
         transients: state.transients.map(scale),
         novelty: scale(state.novelty),
+        chroma: state.chroma,
+        centroid: state.centroid,
+        flatness: state.flatness,
         kick: scale(state.kick),
         beat: scale(state.beat),
         beat_phase: state.beat_phase,
@@ -125,7 +153,7 @@ struct Args {
     /// PipeWire output node name or serial
     #[arg(long, value_name = "NODE")]
     target: Option<String>,
-    /// Starting visualisation (see --list)
+    /// Starting visualisation; otherwise resume the last one (see --list)
     #[arg(long, value_name = "NAME")]
     scene: Option<String>,
     /// Starting colour palette (see --list)
@@ -157,6 +185,20 @@ fn choice(name: Option<&str>, choices: &[&str], kind: &str) -> io::Result<usize>
     }
 }
 
+fn starting_scene(explicit: Option<&str>, saved: Option<&str>) -> io::Result<usize> {
+    if explicit.is_some() {
+        return choice(explicit, visuals::SCENES, "visualisation");
+    }
+    if let Some(index) = saved.and_then(|name| {
+        visuals::SCENES
+            .iter()
+            .position(|scene| scene.eq_ignore_ascii_case(name))
+    }) {
+        return Ok(index);
+    }
+    choice(Some(DEFAULT_SCENE), visuals::SCENES, "visualisation")
+}
+
 fn snapshot(
     shared: &Option<std::sync::Arc<std::sync::Mutex<audio::AudioState>>>,
 ) -> audio::AudioState {
@@ -184,7 +226,20 @@ fn main() -> io::Result<()> {
         println!("Palettes: {}", palette::PALETTES.join(", "));
         return Ok(());
     }
-    let initial_scene = choice(args.scene.as_deref(), visuals::SCENES, "visualisation")?;
+    let state_path = if args.check_audio.is_none() {
+        preferences::state_path(
+            std::env::var_os("XDG_STATE_HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+            std::env::var_os("HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+        )
+    } else {
+        None
+    };
+    let saved_scene = state_path.as_deref().and_then(preferences::load);
+    let initial_scene = starting_scene(args.scene.as_deref(), saved_scene.as_deref())?;
     let initial_palette = choice(args.palette.as_deref(), palette::PALETTES, "palette")?;
     let mut demo = args.demo;
     let target = args.target;
@@ -223,7 +278,7 @@ fn main() -> io::Result<()> {
 
     let mut renderer = visuals::Renderer::default();
     let mut terminal = ratatui::init();
-    let result = (|| -> io::Result<()> {
+    let result = (|| -> io::Result<usize> {
         let mut input = palette::TerminalInput::open()?;
         let start = Instant::now();
         let mut scene = initial_scene;
@@ -232,7 +287,7 @@ fn main() -> io::Result<()> {
         let mut help = false;
         let mut menu: Option<Menu> = None;
         let mut gain = args.sensitivity;
-        loop {
+        'frames: loop {
             let frame_start = Instant::now();
             let t = start.elapsed().as_secs_f32();
             let state = if demo {
@@ -287,21 +342,23 @@ fn main() -> io::Result<()> {
                     );
                 }
             })?;
-            if let Some(Event::Key(key)) =
-                input.read(FRAME_TIME.saturating_sub(frame_start.elapsed()))?
-            {
+            // Handle queued keys in order without rendering intermediate scenes.
+            let mut timeout = FRAME_TIME.saturating_sub(frame_start.elapsed());
+            while let Some(event) = input.read(timeout)? {
+                timeout = Duration::ZERO;
+                let Event::Key(key) = event else { continue };
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
                 if key.code == KeyCode::Char('c')
                     && key.modifiers.contains(event::KeyModifiers::CONTROL)
                 {
-                    break;
+                    break 'frames;
                 }
                 if let Some(mut active) = menu.take() {
                     match key.code {
                         KeyCode::Esc => {}
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => break 'frames,
                         KeyCode::Up | KeyCode::Char('k') => {
                             active.step(-1);
                             menu = Some(active);
@@ -329,7 +386,6 @@ fn main() -> io::Result<()> {
                             },
                             MenuKind::Scenes => {
                                 scene = active.selected;
-                                renderer = visuals::Renderer::default();
                             }
                             MenuKind::Palettes => palette = active.selected,
                         },
@@ -340,7 +396,7 @@ fn main() -> io::Result<()> {
                 if analysis {
                     match key.code {
                         KeyCode::Esc => analysis = false,
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => break 'frames,
                         _ => {}
                     }
                     continue;
@@ -351,7 +407,7 @@ fn main() -> io::Result<()> {
                             help = false;
                             continue;
                         }
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => break 'frames,
                         _ => continue,
                     }
                 }
@@ -362,9 +418,8 @@ fn main() -> io::Result<()> {
                         } else {
                             (scene + 1) % visuals::SCENES.len()
                         };
-                        renderer = visuals::Renderer::default();
                     }
-                    KeyCode::Char('q') => break,
+                    KeyCode::Char('q') => break 'frames,
                     KeyCode::Char('m') => {
                         menu = Some(Menu {
                             kind: MenuKind::Root,
@@ -413,10 +468,19 @@ fn main() -> io::Result<()> {
                 }
             }
         }
-        Ok(())
+        Ok(scene)
     })();
     ratatui::restore();
-    result
+    let scene = result?;
+    if let Some(path) = state_path {
+        if let Err(error) = preferences::save(&path, visuals::SCENES[scene]) {
+            eprintln!(
+                "Could not save last visualisation to {}: {error}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -452,15 +516,15 @@ mod tests {
     }
     #[test]
     fn menu_navigation_wraps_at_both_ends() {
-        let mut menu = Menu {
-            kind: MenuKind::Root,
-            selected: 0,
-        };
-        menu.step(-1);
-        assert_eq!(menu.selected, menu.items().len() - 1);
-        menu.step(1);
-        assert_eq!(menu.selected, 0);
+        for kind in [MenuKind::Root, MenuKind::Scenes, MenuKind::Palettes] {
+            let mut menu = Menu { kind, selected: 0 };
+            menu.step(-1);
+            assert_eq!(menu.selected, menu.items().len() - 1);
+            menu.step(1);
+            assert_eq!(menu.selected, 0);
+        }
     }
+
     #[test]
     fn stale_audio_is_not_used_for_visuals_or_tempo() {
         let shared = Some(std::sync::Arc::new(std::sync::Mutex::new(
@@ -477,6 +541,23 @@ mod tests {
         assert!(state.bpm.is_none());
         assert!(state.error.is_some());
     }
+    #[test]
+    fn scene_cli_overrides_saved_name_and_missing_or_stale_state_uses_liquid() {
+        use clap::Parser;
+        let args = Args::try_parse_from(["chromavibe"]).unwrap();
+        assert!(args.scene.is_none());
+        for saved in [None, Some("retired visualisation"), Some("")] {
+            let index = starting_scene(None, saved).unwrap();
+            assert_eq!(visuals::SCENES[index], DEFAULT_SCENE);
+        }
+        let resumed = starting_scene(None, Some("Julia")).unwrap();
+        assert_eq!(visuals::SCENES[resumed], "Julia");
+        let args = Args::try_parse_from(["chromavibe", "--scene", "Waveform Scope"]).unwrap();
+        let override_scene = starting_scene(args.scene.as_deref(), Some("Julia")).unwrap();
+        assert_eq!(visuals::SCENES[override_scene], "Waveform Scope");
+        assert!(starting_scene(Some("missing scene"), Some("Julia")).is_err());
+    }
+
     #[test]
     fn invalid_sensitivity_is_rejected() {
         use clap::Parser;

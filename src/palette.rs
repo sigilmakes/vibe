@@ -65,7 +65,7 @@ impl Theme {
             // accents. Neighboring roles blend rather than forming hard bands.
             let roles = [1, 9, 3, 11, 2, 10, 6, 14, 4, 12, 5, 13];
             let position = phase * roles.len() as f32;
-            let index = position.floor() as usize;
+            let index = position.floor() as usize % roles.len();
             let fraction = position.fract();
             let blend = fraction * fraction * (3.0 - 2.0 * fraction);
             mix(
@@ -409,6 +409,13 @@ impl TerminalInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounded_negative_phase_wraps_to_first_terminal_role() {
+        let theme = Theme::default();
+        // rem_euclid can round a tiny negative phase to exactly 1.0.
+        assert_eq!(theme.rgb(0, -1e-9, 0.8), theme.rgb(0, 0.0, 0.8));
+    }
 
     fn pty() -> (std::fs::File, TerminalInput) {
         use std::os::fd::FromRawFd;
