@@ -761,9 +761,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CHROMAVIBE_REPLAY pointing to local f32le stereo 48kHz audio"]
+    #[ignore = "requires VIBE_REPLAY pointing to local f32le stereo 48kHz audio"]
     fn replay_music_diagnostic() {
-        let path = std::env::var("CHROMAVIBE_REPLAY").expect("set CHROMAVIBE_REPLAY");
+        let path = std::env::var("VIBE_REPLAY").expect("set VIBE_REPLAY");
         let bytes = std::fs::read(path).unwrap();
         let mut analyzer = Analyzer::new();
         let mut locks = 0;

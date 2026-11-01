@@ -1,5 +1,5 @@
 [package]
-name = "chromavibe"
+name = "vibe"
 version = "0.1.0"
 edition = "2021"
 description = "A colourful, audio-reactive terminal playground"

@@ -8,7 +8,7 @@ pub fn state_path(xdg_state_home: Option<&Path>, home: Option<&Path>) -> Option<
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .or_else(|| home.map(|home| home.join(".local/state")))
-        .map(|base| base.join("chromavibe/last-scene"))
+        .map(|base| base.join("vibe/last-scene"))
 }
 
 pub fn load(path: &Path) -> Option<String> {
@@ -32,12 +32,12 @@ mod tests {
     fn state_path_prefers_xdg_then_home() {
         assert_eq!(
             state_path(Some(Path::new("/state")), Some(Path::new("/home/willow"))),
-            Some(PathBuf::from("/state/chromavibe/last-scene"))
+            Some(PathBuf::from("/state/vibe/last-scene"))
         );
         assert_eq!(
             state_path(None, Some(Path::new("/home/willow"))),
             Some(PathBuf::from(
-                "/home/willow/.local/state/chromavibe/last-scene"
+                "/home/willow/.local/state/vibe/last-scene"
             ))
         );
         assert_eq!(
@@ -54,7 +54,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory =
-            std::env::temp_dir().join(format!("chromavibe-prefs-{}-{unique}", std::process::id()));
+            std::env::temp_dir().join(format!("vibe-prefs-{}-{unique}", std::process::id()));
         let path = state_path(Some(&directory), None).unwrap();
         assert_eq!(load(&path), None);
         save(&path, "Waveform Scope").unwrap();

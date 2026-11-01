@@ -109,7 +109,7 @@ impl Menu {
     }
     fn title(&self) -> &'static str {
         match self.kind {
-            MenuKind::Root => "Chromavibe",
+            MenuKind::Root => "Vibe",
             MenuKind::Scenes => "Visualisation",
             MenuKind::Palettes => "Palette",
         }
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn scene_cli_overrides_saved_name_and_missing_or_stale_state_uses_liquid() {
         use clap::Parser;
-        let args = Args::try_parse_from(["chromavibe"]).unwrap();
+        let args = Args::try_parse_from(["vibe"]).unwrap();
         assert!(args.scene.is_none());
         for saved in [None, Some("retired visualisation"), Some("")] {
             let index = starting_scene(None, saved).unwrap();
@@ -546,7 +546,7 @@ mod tests {
         }
         let resumed = starting_scene(None, Some("Julia")).unwrap();
         assert_eq!(visuals::SCENES[resumed], "Julia");
-        let args = Args::try_parse_from(["chromavibe", "--scene", "Waveform Scope"]).unwrap();
+        let args = Args::try_parse_from(["vibe", "--scene", "Waveform Scope"]).unwrap();
         let override_scene = starting_scene(args.scene.as_deref(), Some("Julia")).unwrap();
         assert_eq!(visuals::SCENES[override_scene], "Waveform Scope");
         assert!(starting_scene(Some("missing scene"), Some("Julia")).is_err());
@@ -556,7 +556,7 @@ mod tests {
     fn invalid_sensitivity_is_rejected() {
         use clap::Parser;
         for value in ["NaN", "-2", "0", "4"] {
-            assert!(Args::try_parse_from(["chromavibe", "--sensitivity", value]).is_err());
+            assert!(Args::try_parse_from(["vibe", "--sensitivity", value]).is_err());
         }
     }
 }
