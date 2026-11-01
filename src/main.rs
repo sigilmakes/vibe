@@ -1,13 +1,7 @@
 mod audio;
-mod chaos;
 mod families;
-mod flocks;
-mod fractals;
-mod glyphs;
 mod palette;
 mod preferences;
-mod sculptures;
-mod spectrum;
 mod ui;
 mod visuals;
 

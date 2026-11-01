@@ -1,8 +1,14 @@
 pub mod cells;
+pub mod chaos;
 pub mod curves;
+pub mod flocks;
 pub mod fractalmath;
+pub mod fractals;
 pub mod geometry;
+pub mod glyphs;
 pub mod organic;
 pub mod particles;
+pub mod sculptures;
+pub mod spectrum;
 pub mod typography;
 pub mod waves;
