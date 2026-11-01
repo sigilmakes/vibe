@@ -30,6 +30,16 @@ pub struct AudioState {
     pub bass: f32,
     pub mid: f32,
     pub treble: f32,
+    /// Octave-folded peak power, C through B (A440 tuning), from ~65–4000 Hz.
+    /// Sums to 1 when audible peaks are present; below-gate input is zero.
+    /// Approximate spectral pitch classes, not a key or chord estimate.
+    pub chroma: [f32; 12],
+    /// Power-weighted spectral centroid, log-scaled: 0 = 40 Hz, 1 = 16 kHz.
+    /// Typical bass tones are near 0.15, 1 kHz near 0.54; silence is 0.
+    pub centroid: f32,
+    /// Geometric/arithmetic power ratio over 40 Hz–16 kHz: tone ~0, noise ~0.56.
+    /// Bounded to [0, 1]; silence and below-gate input are 0.
+    pub flatness: f32,
     pub onset: f32,
     pub kick: f32,
     /// Independent low/bass, low-mid/snare, presence, and air attack envelopes.
@@ -195,6 +205,73 @@ impl Analyzer {
         }
     }
 
+    fn analyze_spectral_shape(&mut self, audible: bool) {
+        self.state.chroma = [0.0; 12];
+        self.state.centroid = 0.0;
+        self.state.flatness = 0.0;
+        if !audible {
+            return;
+        }
+        let bin_hz = SAMPLE_RATE as f32 / FRAMES as f32;
+        let start = (LOW_HZ / bin_hz).ceil() as usize;
+        let end = (HIGH_HZ / bin_hz).ceil() as usize;
+        let mut powers = [0.0_f32; FRAMES / 2];
+        let mut total = 0.0;
+        let mut weighted = 0.0;
+        let mut log_sum = 0.0;
+        let mut maximum = 0.0_f32;
+        for (i, power) in powers.iter_mut().enumerate().take(end).skip(start) {
+            *power = self.buffer[i].norm_sqr() * (2.0 / FRAMES as f32).powi(2);
+            total += *power;
+            weighted += *power * i as f32 * bin_hz;
+            maximum = maximum.max(*power);
+            log_sum += power.max(1e-20).ln();
+        }
+        // Fixed numerical floor, never an adaptive gain for quiet noise.
+        if total <= 1e-12 {
+            return;
+        }
+        self.state.centroid =
+            ((weighted / total / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln()).clamp(0.0, 1.0);
+        let count = (end - start) as f32;
+        self.state.flatness = ((log_sum / count).exp() / (total / count)).clamp(0.0, 1.0);
+        // Interpolate local peaks before octave folding: raw 23.4 Hz FFT bins
+        // would misclassify bass notes (110 Hz is between the A and A# bins).
+        // The Hann main-lobe's three-bin power preserves each peak's energy.
+        for i in start + 1..end - 1 {
+            let hz = i as f32 * bin_hz;
+            if !(65.0..=4000.0).contains(&hz)
+                || powers[i] < maximum * 1e-4
+                || powers[i] <= powers[i - 1]
+                || powers[i] <= powers[i + 1]
+            {
+                continue;
+            }
+            let left = powers[i - 1].max(1e-20).ln();
+            let center = powers[i].max(1e-20).ln();
+            let right = powers[i + 1].max(1e-20).ln();
+            let curvature = left - 2.0 * center + right;
+            let offset = if curvature < -1e-6 {
+                (0.5 * (left - right) / curvature).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            let frequency = (i as f32 + offset) * bin_hz;
+            let pitch = (69.0 + 12.0 * (frequency / 440.0).log2()).rem_euclid(12.0);
+            let lower = pitch.floor() as usize;
+            let fraction = pitch.fract();
+            let power = powers[i - 1] + powers[i] + powers[i + 1];
+            self.state.chroma[lower] += power * (1.0 - fraction);
+            self.state.chroma[(lower + 1) % 12] += power * fraction;
+        }
+        let chroma_total = self.state.chroma.iter().sum::<f32>();
+        if chroma_total > 1e-12 {
+            for value in &mut self.state.chroma {
+                *value /= chroma_total;
+            }
+        }
+    }
+
     fn analyze(&mut self, samples: &[f32; HOP]) -> AudioState {
         self.samples.copy_within(HOP.., 0);
         self.samples[FRAMES - HOP..].copy_from_slice(samples);
@@ -231,6 +308,7 @@ impl Analyzer {
         }
         self.fft
             .process_with_scratch(&mut self.buffer, &mut self.scratch);
+        self.analyze_spectral_shape(audible);
         let mut power = [0.0_f32; 3];
         for i in 1..FRAMES / 2 {
             let hz = i as f32 * SAMPLE_RATE as f32 / FRAMES as f32;
@@ -509,6 +587,85 @@ impl Rhythm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chroma_folds_octaves_and_uses_c_first_pitch_classes() {
+        for (hz, pitch) in [
+            (110.0, 9),
+            (220.0, 9),
+            (440.0, 9),
+            (130.8128, 0),
+            (261.6256, 0),
+            (523.2511, 0),
+        ] {
+            let mut analyzer = Analyzer::new();
+            let mut state = AudioState::default();
+            for frame in 0..12 {
+                state = analyzer.analyze(&frame_at(frame, hz, 0.2));
+            }
+            let strongest = (0..12)
+                .max_by(|&a, &b| state.chroma[a].total_cmp(&state.chroma[b]))
+                .unwrap();
+            assert_eq!(strongest, pitch, "{hz}Hz chroma: {:?}", state.chroma);
+            assert!(
+                state.chroma[pitch] > 0.7,
+                "{hz}Hz chroma: {:?}",
+                state.chroma
+            );
+            assert!((state.chroma.iter().sum::<f32>() - 1.0).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn spectral_shape_is_scale_invariant_and_brightness_tracks_frequency() {
+        let mut features = Vec::new();
+        for (hz, amplitude) in [(220.0, 0.03), (220.0, 0.3), (6000.0, 0.3)] {
+            let mut analyzer = Analyzer::new();
+            let mut state = AudioState::default();
+            for frame in 0..12 {
+                state = analyzer.analyze(&frame_at(frame, hz, amplitude));
+            }
+            assert!(state.flatness < 0.01, "tone flatness: {}", state.flatness);
+            features.push(state);
+        }
+        assert!((features[0].centroid - features[1].centroid).abs() < 0.001);
+        for (a, b) in features[0].chroma.iter().zip(features[1].chroma) {
+            assert!((a - b).abs() < 0.001);
+        }
+        assert!(features[2].centroid > features[1].centroid + 0.4);
+        let expected = (220.0_f32 / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln();
+        assert!((features[1].centroid - expected).abs() < 0.01);
+    }
+
+    #[test]
+    fn broadband_noise_has_high_flatness_and_silence_clears_spectral_features() {
+        let mut analyzer = Analyzer::new();
+        let mut seed = 1_u32;
+        let mut total = 0.0;
+        for frame in 0..40 {
+            let noise = std::array::from_fn(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed as f32 / u32::MAX as f32 - 0.5) * 0.5
+            });
+            let state = analyzer.analyze(&noise);
+            if frame >= 4 {
+                total += state.flatness;
+            }
+        }
+        assert!(total / 36.0 > 0.45, "noise flatness: {}", total / 36.0);
+        for _ in 0..8 {
+            let state = analyzer.analyze(&[0.0; HOP]);
+            assert_eq!(state.chroma, [0.0; 12]);
+            assert_eq!(state.centroid, 0.0);
+            assert_eq!(state.flatness, 0.0);
+        }
+        for frame in 0..8 {
+            let state = analyzer.analyze(&frame_at(frame, 440.0, NOISE_GATE * 0.1));
+            assert_eq!(state.chroma, [0.0; 12]);
+            assert_eq!(state.centroid, 0.0);
+            assert_eq!(state.flatness, 0.0);
+        }
+    }
 
     #[test]
     fn bass_and_snare_attacks_thirty_two_ms_apart_remain_independent() {
