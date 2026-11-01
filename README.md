@@ -2,6 +2,12 @@
 
 Fun lil rust CLI music visualiser for linux using ratatui :>
 
+Vibe has 100 visualisers so far, and it fits your terminal colours perfectly!
+
+![Lorentz Attractor](screenshots/4.png)
+![Field](screenshots/2.png)
+![Chaotic Strings](screenshots/3.png)
+
 ## Cargo
 
 ```sh
