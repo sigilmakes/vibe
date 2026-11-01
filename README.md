@@ -1,6 +1,7 @@
 # Vibe
 
-Requires a Linux PipeWire session. Captures playback, not the microphone.
+Linux x86_64 and ARM64 (`aarch64-linux`). Requires a PipeWire session.
+Captures playback, not the microphone.
 
 ## Run
 
