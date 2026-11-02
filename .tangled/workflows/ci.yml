@@ -1,0 +1,25 @@
+when:
+  - event: push
+    branch: ["**"]
+
+engine: microvm
+image: nixos
+
+environment:
+  NIX_CONFIG: "experimental-features = nix-command flakes"
+
+steps:
+  - name: "Flake check"
+    command: nix flake check --no-build
+
+  - name: "Nix build"
+    command: nix build .#default --no-link
+
+  - name: "Format"
+    command: nix develop --command cargo fmt --check
+
+  - name: "Clippy"
+    command: nix develop --command cargo clippy --all-targets -- -D warnings
+
+  - name: "Tests"
+    command: nix develop --command cargo test --all-targets
