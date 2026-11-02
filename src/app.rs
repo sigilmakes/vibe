@@ -444,24 +444,50 @@ impl App {
         self.config_touched = Some(Instant::now());
     }
 
-    /// Drop favourites and filter tags that no longer resolve to a known scene
-    /// or tag, so old or hand-edited configs become clean again.
+    /// Canonicalise scene selection stored in the config. Unknown scenes and
+    /// tags are dropped, duplicates are collapsed, and an unknown filter mode
+    /// falls back to All.
     fn prune_scenes(&mut self) {
-        let favourites = self.config.scenes.favourites.len();
-        self.config.scenes.favourites.retain(|name| {
-            visuals::SCENES
+        let before = self.config.scenes.clone();
+        let mut favourites = Vec::new();
+        for name in &before.favourites {
+            let Some(canonical) = visuals::SCENES
                 .iter()
-                .any(|scene| scene.eq_ignore_ascii_case(name))
-        });
-        let tags = self.config.scenes.filter_tags.len();
-        self.config.scenes.filter_tags.retain(|tag| {
-            visuals::TAGS
+                .find(|scene| scene.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if !favourites
                 .iter()
-                .any(|known| known.eq_ignore_ascii_case(tag))
-        });
-        if self.config.scenes.favourites.len() != favourites
-            || self.config.scenes.filter_tags.len() != tags
-        {
+                .any(|known: &String| known.eq_ignore_ascii_case(canonical))
+            {
+                favourites.push((*canonical).to_owned());
+            }
+        }
+        let mut tags = Vec::new();
+        for tag in &before.filter_tags {
+            let Some(canonical) = visuals::TAGS
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(tag))
+            else {
+                continue;
+            };
+            if !tags
+                .iter()
+                .any(|known: &String| known.eq_ignore_ascii_case(canonical))
+            {
+                tags.push((*canonical).to_owned());
+            }
+        }
+        self.config.scenes.favourites = favourites;
+        self.config.scenes.filter_tags = tags;
+        self.config.scenes.filter = match before.filter.as_str() {
+            "favourites" => "favourites",
+            "tags" => "tags",
+            _ => "all",
+        }
+        .to_owned();
+        if self.config.scenes != before {
             self.mark_config_dirty();
         }
     }
@@ -696,6 +722,56 @@ mod tests {
         app.handle_key(press(KeyCode::Enter));
         app.handle_key(press(KeyCode::Right));
         assert_eq!(app.config.appearance.palette, "Phosphor");
+    }
+
+    #[test]
+    fn favourites_and_search_are_driven_from_the_scene_picker() {
+        let mut app = demo_app();
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Enter));
+        let current = visuals::SCENES[app.scene].to_owned();
+        app.handle_key(press(KeyCode::Char('f')));
+        assert!(app
+            .config
+            .scenes
+            .favourites
+            .iter()
+            .any(|name| name == &current));
+
+        app.handle_key(press(KeyCode::Char('/')));
+        for ch in "jul".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        let search_selected = {
+            let view = app.view(0.0);
+            let menu = view.menu.as_ref().unwrap();
+            assert!(menu
+                .rows
+                .iter()
+                .any(|row| row.label == "Search" && row.value == "jul"));
+            menu.rows[menu.selected].label == "Search"
+        };
+        if search_selected {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(visuals::SCENES[app.scene], "Julia");
+    }
+
+    #[test]
+    fn invalid_scene_selection_is_canonicalised_on_startup() {
+        let mut options = demo_options();
+        options.config.scenes.filter = "nonsense".into();
+        options.config.scenes.favourites =
+            vec!["julia".into(), "JULIA".into(), "missing scene".into()];
+        options.config.scenes.filter_tags =
+            vec!["CALM".into(), "calm".into(), "missing tag".into()];
+        let app = App::new(options);
+        assert_eq!(app.config.scenes.filter, "all");
+        assert_eq!(app.config.scenes.favourites, vec!["Julia"]);
+        assert_eq!(app.config.scenes.filter_tags, vec!["calm"]);
     }
 
     #[test]
