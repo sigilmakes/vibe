@@ -1,8 +1,10 @@
 mod app;
 mod audio;
+mod config;
 mod families;
 mod palette;
 mod preferences;
+mod state;
 mod ui;
 mod visuals;
 
