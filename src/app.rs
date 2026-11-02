@@ -176,12 +176,16 @@ impl App {
                         self.mark_config_dirty();
                     }
                 }
-                menu::Effect::CreatePlaylist => {}
-                menu::Effect::DeletePlaylist(_) => {}
-                menu::Effect::AddCurrentScene => {}
-                menu::Effect::RemoveSelectedScene => {}
-                menu::Effect::MoveSelectedScene(_) => {}
-                menu::Effect::Back => {}
+                menu::Effect::CreatePlaylist => self.create_playlist(),
+                menu::Effect::DeletePlaylist(name) => self.delete_playlist(&name),
+                menu::Effect::AddCurrentScene => self.add_current_scene(),
+                menu::Effect::RemoveSelectedScene => self.remove_selected_scene(),
+                menu::Effect::MoveSelectedScene(delta) => self.move_selected_scene(delta),
+                menu::Effect::Back => {
+                    if let Some(menu) = &mut self.menu {
+                        menu.back();
+                    }
+                }
                 menu::Effect::Changed { id, value } => self.apply_change(id, &value),
                 menu::Effect::None => {}
             }
@@ -430,6 +434,8 @@ impl App {
                     menu.set_search(value.to_owned());
                 }
             }
+            ids::PLAYLIST_NAME => self.rename_playlist(value),
+            ids::PLAYLIST_ACTIVE => self.set_playlist_active(value),
             _ => {}
         }
     }
@@ -453,6 +459,179 @@ impl App {
     fn set_scene(&mut self, scene: usize) {
         self.scene = scene;
         self.save_state();
+    }
+
+    fn current_playlist_name(&self) -> Option<String> {
+        self.menu
+            .as_ref()
+            .and_then(menu::Menu::current_playlist)
+            .map(str::to_owned)
+    }
+
+    fn selected_playlist_scene(&self) -> Option<usize> {
+        self.menu
+            .as_ref()
+            .and_then(|menu| menu.selected_playlist_scene(&self.pages))
+    }
+
+    fn unique_playlist_name(&self) -> String {
+        let mut index = 1;
+        loop {
+            let candidate = format!("Playlist {index}");
+            if !self
+                .config
+                .playlists
+                .iter()
+                .any(|playlist| playlist.name.eq_ignore_ascii_case(&candidate))
+            {
+                return candidate;
+            }
+            index += 1;
+        }
+    }
+
+    fn create_playlist(&mut self) {
+        let name = self.unique_playlist_name();
+        self.config.playlists.push(config::Playlist {
+            name: name.clone(),
+            scenes: Vec::new(),
+        });
+        self.mark_config_dirty();
+        self.rebuild_pages();
+        if let Some(menu) = &mut self.menu {
+            menu.open_page(menu::PageId::Playlist(name));
+            menu.rebuild(&self.pages);
+        }
+    }
+
+    fn delete_playlist(&mut self, name: &str) {
+        self.config
+            .playlists
+            .retain(|playlist| playlist.name != name);
+        if self.active_playlist == name {
+            self.active_playlist.clear();
+        }
+        self.mark_config_dirty();
+        self.save_state();
+        self.rebuild_pages();
+        if let Some(menu) = &mut self.menu {
+            menu.back_to(menu::PageId::Playlists);
+        }
+    }
+
+    fn rename_playlist(&mut self, value: &str) {
+        let trimmed = value.trim();
+        let Some(old) = self.current_playlist_name() else {
+            return;
+        };
+        if trimmed.is_empty() {
+            return;
+        }
+        if self
+            .config
+            .playlists
+            .iter()
+            .any(|playlist| playlist.name != old && playlist.name.eq_ignore_ascii_case(trimmed))
+        {
+            return;
+        }
+        let Some(playlist) = self
+            .config
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.name == old)
+        else {
+            return;
+        };
+        if playlist.name == trimmed {
+            return;
+        }
+        playlist.name = trimmed.to_owned();
+        if self.active_playlist == old {
+            self.active_playlist = trimmed.to_owned();
+        }
+        if let Some(menu) = &mut self.menu {
+            menu.rename_page(
+                menu::PageId::Playlist(old.clone()),
+                menu::PageId::Playlist(trimmed.to_owned()),
+            );
+        }
+        self.mark_config_dirty();
+    }
+
+    fn set_playlist_active(&mut self, value: &str) {
+        let Some(name) = self.current_playlist_name() else {
+            return;
+        };
+        if value == "on" {
+            self.active_playlist = name;
+        } else if self.active_playlist == name {
+            self.active_playlist.clear();
+        }
+        self.save_state();
+    }
+
+    fn add_current_scene(&mut self) {
+        let scene_name = visuals::SCENES[self.scene].to_owned();
+        let Some(name) = self.current_playlist_name() else {
+            return;
+        };
+        let Some(playlist) = self
+            .config
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.name == name)
+        else {
+            return;
+        };
+        if !playlist.scenes.iter().any(|scene| scene == &scene_name) {
+            playlist.scenes.push(scene_name);
+            self.mark_config_dirty();
+        }
+    }
+
+    fn remove_selected_scene(&mut self) {
+        let Some(name) = self.current_playlist_name() else {
+            return;
+        };
+        let Some(index) = self.selected_playlist_scene() else {
+            return;
+        };
+        let Some(playlist) = self
+            .config
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.name == name)
+        else {
+            return;
+        };
+        if index < playlist.scenes.len() {
+            playlist.scenes.remove(index);
+            self.mark_config_dirty();
+        }
+    }
+
+    fn move_selected_scene(&mut self, delta: isize) {
+        let Some(name) = self.current_playlist_name() else {
+            return;
+        };
+        let Some(index) = self.selected_playlist_scene() else {
+            return;
+        };
+        let Some(playlist) = self
+            .config
+            .playlists
+            .iter_mut()
+            .find(|playlist| playlist.name == name)
+        else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= playlist.scenes.len() as isize {
+            return;
+        }
+        playlist.scenes.swap(index, target as usize);
+        self.mark_config_dirty();
     }
 
     fn mark_config_dirty(&mut self) {

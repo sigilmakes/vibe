@@ -296,6 +296,10 @@ pub struct Menu {
     stack: Vec<PageId>,
     selected: Vec<RowId>,
     last_index: Vec<usize>,
+    /// The playlist scene row the cursor is on (or was last on), so the
+    /// "Remove selected" / "Move up" / "Move down" actions keep operating on
+    /// the same scene even though the cursor has moved onto an action row.
+    last_scene: Option<RowId>,
     editing: Option<TextEdit>,
     search: String,
 }
@@ -306,6 +310,7 @@ impl Menu {
             stack: vec![PageId::Root],
             selected: vec![ids::SCENES],
             last_index: vec![0],
+            last_scene: None,
             editing: None,
             search: String::new(),
         }
@@ -318,6 +323,75 @@ impl Menu {
 
     pub fn set_search(&mut self, value: String) {
         self.search = value;
+    }
+
+    /// Open a page, starting selection at its first visible row.
+    pub fn open_page(&mut self, target: PageId) {
+        self.stack.push(target);
+        self.selected.push(RowId::new(0));
+        self.last_index.push(0);
+        self.last_scene = None;
+    }
+
+    /// Pop the top page, keeping the root page when already at it.
+    pub fn back(&mut self) {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+            self.selected.pop();
+            self.last_index.pop();
+        }
+        self.last_scene = None;
+    }
+
+    /// Pop pages until the given page is on top (or the root page is reached).
+    pub fn back_to(&mut self, target: PageId) {
+        while self.stack.len() > 1 && self.stack.last().is_some_and(|id| id != &target) {
+            self.stack.pop();
+            self.selected.pop();
+            self.last_index.pop();
+        }
+        self.last_scene = None;
+    }
+
+    /// Rename every matching page in the stack (used when a playlist is
+    /// renamed, since `PageId::Playlist` and `PageId::ConfirmDelete` embed the
+    /// name).
+    pub fn rename_page(&mut self, old: PageId, new: PageId) {
+        for id in &mut self.stack {
+            if *id == old {
+                *id = new.clone();
+            }
+        }
+    }
+
+    /// The name of the playlist page currently open, if any.
+    pub fn current_playlist(&self) -> Option<&str> {
+        match self.stack.last()? {
+            PageId::Playlist(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The position of the selected playlist scene, mapping the selected row's
+    /// stable id back through the playlist's scene names.
+    pub fn selected_playlist_scene(&self, pages: &[Page]) -> Option<usize> {
+        let name = self.current_playlist()?;
+        let page = find_page(pages, PageId::Playlist(name.to_owned()))?;
+        let selected = self.selected.last().copied()?;
+        let mut index = 0usize;
+        let mut remembered = None;
+        for row in page.visible_rows() {
+            if row.kind == RowKind::Action && !row.value.is_empty() {
+                if row.id == selected {
+                    return Some(index);
+                }
+                if Some(row.id) == self.last_scene {
+                    remembered = Some(index);
+                }
+                index += 1;
+            }
+        }
+        remembered
     }
 
     /// Re-clamp the selection after pages change, following stable row ids and
@@ -349,6 +423,28 @@ impl Menu {
             self.selected[depth] = visible[index].id;
             self.last_index[depth] = index;
         }
+        self.sync_last_scene(pages);
+    }
+
+    /// Track the playlist scene row the cursor is on so the remove/move
+    /// actions keep operating on that scene after the cursor moves off it.
+    fn sync_last_scene(&mut self, pages: &[Page]) {
+        let Some(name) = self.current_playlist().map(str::to_owned) else {
+            self.last_scene = None;
+            return;
+        };
+        let Some(page) = find_page(pages, PageId::Playlist(name)) else {
+            self.last_scene = None;
+            return;
+        };
+        let selected = self.selected.last().copied().unwrap_or(RowId::new(0));
+        for row in page.visible_rows() {
+            if row.kind == RowKind::Action && !row.value.is_empty() && row.id == selected {
+                self.last_scene = Some(row.id);
+                return;
+            }
+        }
+        // The cursor is on a non-scene row; keep the remembered scene.
     }
 
     pub fn view(&self, pages: &[Page]) -> MenuView {
@@ -422,9 +518,7 @@ impl Menu {
             match key.code {
                 KeyCode::Esc => {
                     if self.stack.len() > 1 {
-                        self.stack.pop();
-                        self.selected.pop();
-                        self.last_index.pop();
+                        self.back();
                         Effect::None
                     } else {
                         Effect::CloseMenu
@@ -472,9 +566,17 @@ impl Menu {
         }
         let depth = self.stack.len() - 1;
         let next = (self.last_index[depth] as isize + delta).rem_euclid(count as isize) as usize;
-        if let Some(row) = page.visible_rows().nth(next) {
-            self.selected[depth] = row.id;
-            self.last_index[depth] = next;
+        let Some(row) = page.visible_rows().nth(next) else {
+            return;
+        };
+        let id = row.id;
+        let is_playlist_scene = self.current_playlist().is_some()
+            && row.kind == RowKind::Action
+            && !row.value.is_empty();
+        self.selected[depth] = id;
+        self.last_index[depth] = next;
+        if is_playlist_scene {
+            self.last_scene = Some(id);
         }
     }
 
@@ -541,6 +643,12 @@ impl Menu {
         let Some(row) = self.selected_row(pages) else {
             return Effect::None;
         };
+        // On a playlist page, Left/Right reorder the selected scene in place;
+        // the row id is keyed by scene name so the cursor stays on the scene.
+        if self.current_playlist().is_some() && row.kind == RowKind::Action && !row.value.is_empty()
+        {
+            return Effect::MoveSelectedScene(direction);
+        }
         match row.kind {
             RowKind::Choice => {
                 if row.choices.is_empty() {
