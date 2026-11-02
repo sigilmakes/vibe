@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ const BANDS: usize = 32;
 const LOW_HZ: f32 = 40.0;
 const HIGH_HZ: f32 = 16_000.0;
 const STALL_AFTER: Duration = Duration::from_millis(600);
-const STALL_MESSAGE: &str = "Audio stalled · r to reconnect";
+const STALL_MESSAGE: &str = "Audio stalled";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SampleFormat {
@@ -106,8 +106,20 @@ pub enum Backend {
     Auto,
     PipeWire,
     Pulse,
+    Microphone,
     Command(String),
     File(PathBuf),
+}
+
+impl Backend {
+    /// Live sources can be restarted without surprising the listener. Files
+    /// and one-shot commands are left alone after they end.
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self,
+            Self::Auto | Self::PipeWire | Self::Pulse | Self::Microphone
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +127,7 @@ pub struct CaptureConfig {
     pub backend: Backend,
     pub target: Option<String>,
     pub format: PcmFormat,
+    pub loop_file: bool,
 }
 
 /// Build a capture config from typed audio settings. An empty command/file
@@ -126,6 +139,7 @@ pub fn capture_config(audio: &crate::config::AudioConfig) -> CaptureConfig {
     let backend = match audio.source.as_str() {
         "pipewire" => Backend::PipeWire,
         "pulse" => Backend::Pulse,
+        "microphone" => Backend::Microphone,
         "command" if !audio.command.is_empty() => Backend::Command(audio.command.clone()),
         "file" if !audio.file.is_empty() => Backend::File(PathBuf::from(&audio.file)),
         _ => Backend::Auto,
@@ -139,6 +153,7 @@ pub fn capture_config(audio: &crate::config::AudioConfig) -> CaptureConfig {
         backend,
         target: (!audio.target.is_empty()).then(|| audio.target.clone()),
         format,
+        loop_file: audio.loop_file,
     }
 }
 
@@ -208,7 +223,7 @@ pub struct AudioState {
     pub updated: Option<Instant>,
     pub connected: bool,
     pub error: Option<String>,
-    /// Where the samples came from, for diagnostics and the status overlay.
+    /// Where the samples came from, for diagnostics and `--check-audio`.
     pub source: SourceInfo,
     /// Time since the last block above the noise gate. A live pipe can be silent.
     pub silent_for: f32,
@@ -217,6 +232,7 @@ pub struct AudioState {
 pub struct Capture {
     child: Option<Child>,
     shared: Arc<Mutex<AudioState>>,
+    started: Instant,
 }
 
 struct OpenedSource {
@@ -269,7 +285,43 @@ fn spawn_stderr(mut stderr: std::process::ChildStderr) -> Arc<Mutex<String>> {
     text
 }
 
-fn default_sink_name() -> Option<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureKind {
+    Output,
+    Microphone,
+}
+
+impl CaptureKind {
+    fn device_kind(self) -> &'static str {
+        match self {
+            Self::Output => "sink",
+            Self::Microphone => "source",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output => "default sink monitor",
+            Self::Microphone => "default microphone",
+        }
+    }
+
+    fn source_kind(self) -> &'static str {
+        match self {
+            Self::Output => "PipeWire",
+            Self::Microphone => "PipeWire microphone",
+        }
+    }
+
+    fn pulse_device(self) -> &'static str {
+        match self {
+            Self::Output => "@DEFAULT_MONITOR@",
+            Self::Microphone => "@DEFAULT_SOURCE@",
+        }
+    }
+}
+
+fn default_device(kind: CaptureKind) -> Option<String> {
     let output = Command::new("pw-dump").output().ok()?;
     if !output.status.success() {
         return None;
@@ -277,11 +329,11 @@ fn default_sink_name() -> Option<String> {
     parse_pw_dump(&output.stdout)
         .ok()?
         .into_iter()
-        .find(|device| device.kind == "sink" && device.default)
+        .find(|device| device.kind == kind.device_kind() && device.default)
         .map(|device| device.name)
 }
 
-fn pipewire(config: &CaptureConfig) -> io::Result<OpenedSource> {
+fn pipewire(config: &CaptureConfig, kind: CaptureKind) -> io::Result<OpenedSource> {
     let format = config.format.validate()?;
     let mut command = Command::new("pw-record");
     command.args([
@@ -294,9 +346,10 @@ fn pipewire(config: &CaptureConfig) -> io::Result<OpenedSource> {
         &format.channels.to_string(),
         "--latency",
         "256",
-        "--properties",
-        "{ stream.capture.sink = true }",
     ]);
+    if kind == CaptureKind::Output {
+        command.args(["--properties", "{ stream.capture.sink = true }"]);
+    }
     if let Some(target) = &config.target {
         command.arg("--target").arg(target);
     }
@@ -313,12 +366,12 @@ fn pipewire(config: &CaptureConfig) -> io::Result<OpenedSource> {
         reader: Box::new(reader),
         stderr,
         info: SourceInfo {
-            kind: "PipeWire".into(),
+            kind: kind.source_kind().into(),
             target: config
                 .target
                 .clone()
-                .or_else(default_sink_name)
-                .or_else(|| Some("default sink monitor".into())),
+                .or_else(|| default_device(kind))
+                .or_else(|| Some(kind.label().into())),
             rate: format.rate,
             channels: format.channels,
             format: format.sample.name().into(),
@@ -326,12 +379,12 @@ fn pipewire(config: &CaptureConfig) -> io::Result<OpenedSource> {
     })
 }
 
-fn pulse(config: &CaptureConfig) -> io::Result<OpenedSource> {
+fn pulse(config: &CaptureConfig, kind: CaptureKind) -> io::Result<OpenedSource> {
     let format = config.format.validate()?;
     let device = config
         .target
         .clone()
-        .unwrap_or_else(|| "@DEFAULT_MONITOR@".into());
+        .unwrap_or_else(|| kind.pulse_device().into());
     let mut child = Command::new("parec")
         .arg(format!("--format={}", format.sample.pulse()))
         .arg(format!("--rate={}", format.rate))
@@ -348,13 +401,30 @@ fn pulse(config: &CaptureConfig) -> io::Result<OpenedSource> {
         reader: Box::new(reader),
         stderr,
         info: SourceInfo {
-            kind: "PulseAudio".into(),
+            kind: if kind == CaptureKind::Output {
+                "PulseAudio".into()
+            } else {
+                "PulseAudio microphone".into()
+            },
             target: Some(device),
             rate: format.rate,
             channels: format.channels,
             format: format.sample.name().into(),
         },
     })
+}
+
+fn microphone(config: &CaptureConfig) -> io::Result<OpenedSource> {
+    if which("pw-record") {
+        pipewire(config, CaptureKind::Microphone)
+    } else if which("parec") {
+        pulse(config, CaptureKind::Microphone)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no supported audio capture tool found; install PipeWire (pw-record) or PulseAudio (parec)",
+        ))
+    }
 }
 
 fn command_source(command: &str, format: PcmFormat) -> io::Result<OpenedSource> {
@@ -382,11 +452,41 @@ fn command_source(command: &str, format: PcmFormat) -> io::Result<OpenedSource> 
     })
 }
 
-fn file_source(path: &PathBuf, format: PcmFormat) -> io::Result<OpenedSource> {
+struct LoopingFile {
+    file: File,
+    len: u64,
+}
+
+impl LoopingFile {
+    fn open(path: &PathBuf) -> io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self { file, len })
+    }
+}
+
+impl Read for LoopingFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.file.read(buffer)?;
+        if read == 0 && self.len > 0 {
+            self.file.seek(SeekFrom::Start(0))?;
+            self.file.read(buffer)
+        } else {
+            Ok(read)
+        }
+    }
+}
+
+fn file_source(path: &PathBuf, format: PcmFormat, loop_file: bool) -> io::Result<OpenedSource> {
     let format = format.validate()?;
+    let reader: Box<dyn Read + Send> = if loop_file {
+        Box::new(LoopingFile::open(path)?)
+    } else {
+        Box::new(File::open(path)?)
+    };
     Ok(OpenedSource {
         child: None,
-        reader: Box::new(File::open(path)?),
+        reader,
         stderr: Arc::new(Mutex::new(String::new())),
         info: SourceInfo {
             kind: "file".into(),
@@ -400,15 +500,16 @@ fn file_source(path: &PathBuf, format: PcmFormat) -> io::Result<OpenedSource> {
 
 fn open_source(config: &CaptureConfig) -> io::Result<OpenedSource> {
     match &config.backend {
-        Backend::PipeWire => pipewire(config),
-        Backend::Pulse => pulse(config),
+        Backend::PipeWire => pipewire(config, CaptureKind::Output),
+        Backend::Pulse => pulse(config, CaptureKind::Output),
+        Backend::Microphone => microphone(config),
         Backend::Command(command) => command_source(command, config.format),
-        Backend::File(path) => file_source(path, config.format),
+        Backend::File(path) => file_source(path, config.format, config.loop_file),
         Backend::Auto => {
             if which("pw-record") {
-                pipewire(config)
+                pipewire(config, CaptureKind::Output)
             } else if which("parec") {
-                pulse(config)
+                pulse(config, CaptureKind::Output)
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -461,6 +562,7 @@ impl Capture {
             stderr,
             info,
         } = open_source(&config)?;
+        let started = Instant::now();
         let source = info;
         let state = Arc::new(Mutex::new(AudioState {
             source: source.clone(),
@@ -521,6 +623,7 @@ impl Capture {
         Ok(Self {
             child,
             shared: state,
+            started,
         })
     }
 
@@ -536,13 +639,18 @@ impl Capture {
             .ok()
             .map(|state| state.clone())
             .unwrap_or_default();
-        if state
+        let stale = state
             .updated
-            .is_some_and(|updated| updated.elapsed() > STALL_AFTER)
-        {
+            .is_some_and(|updated| updated.elapsed() > STALL_AFTER);
+        let empty = state.updated.is_none() && self.started.elapsed() > STALL_AFTER;
+        if stale || empty {
             state = AudioState {
                 source: state.source,
-                error: Some(STALL_MESSAGE.into()),
+                error: Some(if empty {
+                    "Audio capture produced no samples".into()
+                } else {
+                    STALL_MESSAGE.into()
+                }),
                 ..Default::default()
             };
         }
@@ -557,6 +665,100 @@ impl Drop for Capture {
             let _ = child.wait();
         }
         // Killing the writer releases the detached reader without joining it.
+    }
+}
+
+const RETRY_INITIAL: Duration = Duration::from_millis(250);
+const RETRY_MAX: Duration = Duration::from_secs(4);
+
+struct Retry {
+    next: Option<Instant>,
+    delay: Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        Self {
+            next: None,
+            delay: RETRY_INITIAL,
+        }
+    }
+}
+
+impl Retry {
+    fn due(&self, now: Instant) -> bool {
+        self.next.is_none_or(|next| now >= next)
+    }
+
+    fn fail(&mut self, now: Instant) {
+        self.next = Some(now + self.delay);
+        self.delay = (self.delay * 2).min(RETRY_MAX);
+    }
+
+    fn success(&mut self) {
+        self.next = None;
+        self.delay = RETRY_INITIAL;
+    }
+}
+
+/// Supervises a live capture and restarts dropped sources with a bounded
+/// backoff. Failures stay out of the UI; the analyser simply reports silence.
+pub struct AudioLink {
+    config: CaptureConfig,
+    capture: Option<Capture>,
+    retry: Retry,
+    started: bool,
+    retry_allowed: bool,
+}
+
+impl AudioLink {
+    pub fn new(config: CaptureConfig, auto_reconnect: bool) -> Self {
+        let retry_allowed = auto_reconnect && config.backend.is_live();
+        Self {
+            config,
+            capture: None,
+            retry: Retry::default(),
+            started: false,
+            retry_allowed,
+        }
+    }
+
+    pub fn snapshot(&mut self, now: Instant) -> AudioState {
+        if self.capture.is_none() {
+            if self.started && (!self.retry_allowed || !self.retry.due(now)) {
+                return AudioState::default();
+            }
+            self.started = true;
+            match Capture::start(self.config.clone()) {
+                Ok(capture) => {
+                    self.capture = Some(capture);
+                    self.retry.success();
+                }
+                Err(error) => {
+                    if self.retry_allowed {
+                        self.retry.fail(now);
+                    }
+                    return AudioState {
+                        error: Some(error.to_string()),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+        let state = self
+            .capture
+            .as_ref()
+            .map(Capture::snapshot)
+            .unwrap_or_default();
+        if state.error.is_some() {
+            self.capture = None;
+            if self.retry_allowed {
+                self.retry.fail(now);
+            }
+        } else if state.connected {
+            self.retry.success();
+        }
+        state
     }
 }
 
@@ -1211,6 +1413,7 @@ mod tests {
         Capture {
             child: None,
             shared: Arc::new(Mutex::new(state)),
+            started: Instant::now(),
         }
     }
 
@@ -1235,6 +1438,79 @@ mod tests {
         ));
         audio.source = "pipewire".into();
         assert!(matches!(capture_config(&audio).backend, Backend::PipeWire));
+        audio.source = "microphone".into();
+        assert!(matches!(
+            capture_config(&audio).backend,
+            Backend::Microphone
+        ));
+    }
+
+    #[test]
+    fn looping_file_wraps_at_eof_and_does_not_spin_on_empty_files() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-loop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("pcm.raw");
+        std::fs::write(&path, [1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let mut reader = LoopingFile::open(&path).unwrap();
+        let mut bytes = [0_u8; 12];
+        reader.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4]);
+
+        let empty = directory.join("empty.raw");
+        std::fs::write(&empty, []).unwrap();
+        let mut reader = LoopingFile::open(&empty).unwrap();
+        let mut byte = [0_u8; 1];
+        assert_eq!(reader.read(&mut byte).unwrap(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn retry_backoff_grows_caps_and_resets() {
+        let mut retry = Retry::default();
+        let now = Instant::now();
+        assert!(retry.due(now));
+        retry.fail(now);
+        assert!(!retry.due(now + Duration::from_millis(100)));
+        assert!(retry.due(now + RETRY_INITIAL));
+        retry.fail(now + RETRY_INITIAL);
+        assert!(!retry.due(now + Duration::from_millis(600)));
+        assert!(retry.due(now + RETRY_INITIAL + Duration::from_millis(500)));
+        for _ in 0..8 {
+            retry.fail(now);
+        }
+        assert!(retry.due(now + RETRY_MAX));
+        retry.success();
+        retry.fail(now);
+        assert!(retry.due(now + RETRY_INITIAL));
+    }
+
+    #[test]
+    fn only_live_sources_are_retried() {
+        assert!(Backend::Auto.is_live());
+        assert!(Backend::PipeWire.is_live());
+        assert!(Backend::Pulse.is_live());
+        assert!(Backend::Microphone.is_live());
+        assert!(!Backend::File(PathBuf::from("x")).is_live());
+        assert!(!Backend::Command("x".into()).is_live());
+    }
+
+    #[test]
+    fn a_capture_with_no_samples_reports_an_error_after_the_grace_period() {
+        let capture = Capture {
+            child: None,
+            shared: Arc::new(Mutex::new(AudioState::default())),
+            started: Instant::now() - Duration::from_secs(1),
+        };
+        let state = capture.snapshot();
+        assert!(state.error.is_some());
+        assert!(!state.connected);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::{audio, config, flow, menu, palette, state, ui, visuals};
+use crate::{audio, config, flow, menu, now_playing, palette, state, ui, visuals};
 
 /// Starting state for an interactive session. The CLI loads and seeds the
 /// config and resolves the scene before constructing an `App`.
@@ -74,8 +74,12 @@ pub struct App {
     analysis: bool,
     menu: Option<menu::Menu>,
     demo: bool,
-    capture: Option<audio::Capture>,
+    link: Option<audio::AudioLink>,
     audio: audio::AudioState,
+    devices: Vec<audio::AudioDevice>,
+    devices_at: Option<Instant>,
+    now_playing: Option<now_playing::NowPlaying>,
+    now_playing_at: Option<Instant>,
     bands: [f32; 32],
     reactivity: visuals::Reactivity,
     pages: Vec<menu::Page>,
@@ -96,8 +100,12 @@ impl App {
             analysis: false,
             menu: None,
             demo: options.demo,
-            capture: None,
+            link: None,
             audio: audio::AudioState::default(),
+            devices: Vec::new(),
+            devices_at: None,
+            now_playing: None,
+            now_playing_at: None,
             bands: [0.0; 32],
             reactivity: visuals::Reactivity::default(),
             pages: Vec::new(),
@@ -115,12 +123,15 @@ impl App {
 
     /// Sample audio and derive the values for one rendered frame.
     pub fn view(&mut self, time: f32) -> View<'_> {
+        if self.audio_page_open() {
+            self.poll_now_playing();
+        }
         self.audio = if self.demo {
             demo_audio(time)
         } else {
-            self.capture
-                .as_ref()
-                .map(audio::Capture::snapshot)
+            self.link
+                .as_mut()
+                .map(|link| link.snapshot(Instant::now()))
                 .unwrap_or_default()
         };
         let gain = self.config.appearance.sensitivity;
@@ -168,6 +179,52 @@ impl App {
             .tick(settings, now, self.scene, &candidates, signal)
         {
             self.set_scene(next);
+        }
+    }
+
+    fn audio_page_open(&self) -> bool {
+        !self.demo
+            && self
+                .menu
+                .as_ref()
+                .and_then(menu::Menu::current_page_id)
+                .is_some_and(|page| *page == menu::PageId::Audio)
+    }
+
+    fn poll_now_playing(&mut self) {
+        let now = Instant::now();
+        if self
+            .now_playing_at
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return;
+        }
+        let current = now_playing::read();
+        self.now_playing_at = Some(now);
+        if current != self.now_playing {
+            self.now_playing = current;
+            self.rebuild_pages();
+        }
+    }
+
+    fn refresh_devices(&mut self, force: bool) {
+        if !force && self.devices_at.is_some() {
+            return;
+        }
+        self.devices = audio::list_audio().unwrap_or_default();
+        self.devices_at = Some(Instant::now());
+    }
+
+    fn sync_audio_menu(&mut self) {
+        if !self.demo
+            && menu::target_kind(&self.config.audio.source).is_some()
+            && self
+                .menu
+                .as_ref()
+                .and_then(menu::Menu::current_page_id)
+                .is_some_and(|page| *page == menu::PageId::Audio)
+        {
+            self.refresh_devices(false);
         }
     }
 
@@ -253,9 +310,11 @@ impl App {
                         menu.back();
                     }
                 }
+                menu::Effect::RefreshDevices => self.refresh_devices(true),
                 menu::Effect::Changed { id, value } => self.apply_change(id, &value),
                 menu::Effect::None => {}
             }
+            self.sync_audio_menu();
             self.rebuild_pages();
             return Flow::Continue;
         }
@@ -320,12 +379,18 @@ impl App {
             .as_ref()
             .map(menu::Menu::search)
             .unwrap_or_default();
-        self.pages = menu::build_pages(
+        let now_playing = self
+            .now_playing
+            .as_ref()
+            .map(now_playing::NowPlaying::display);
+        self.pages = menu::build_pages_with_audio(
             &self.config,
             self.scene,
             self.demo,
             &self.active_playlist,
             search,
+            &self.devices,
+            now_playing.as_deref(),
         );
         if let Some(menu) = &mut self.menu {
             menu.rebuild(&self.pages);
@@ -379,23 +444,23 @@ impl App {
                 let on = value == "on";
                 if on != self.demo {
                     self.demo = on;
-                    if on {
-                        self.capture = None;
-                    } else {
-                        self.connect();
-                    }
+                    self.connect();
                 }
             }
             ids::SOURCE => {
                 if self.config.audio.source != value {
+                    if menu::target_kind(&self.config.audio.source) != menu::target_kind(value) {
+                        self.config.audio.target.clear();
+                    }
                     self.config.audio.source = value.to_owned();
                     self.mark_config_dirty();
                     self.connect();
                 }
             }
             ids::TARGET => {
-                if self.config.audio.target != value {
-                    self.config.audio.target = value.to_owned();
+                let target = if value == "System default" { "" } else { value };
+                if self.config.audio.target != target {
+                    self.config.audio.target = target.to_owned();
                     self.mark_config_dirty();
                     self.connect();
                 }
@@ -444,6 +509,15 @@ impl App {
                 if self.config.audio.loop_file != on {
                     self.config.audio.loop_file = on;
                     self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::AUTO_RECONNECT => {
+                let on = value == "on";
+                if self.config.audio.auto_reconnect != on {
+                    self.config.audio.auto_reconnect = on;
+                    self.mark_config_dirty();
+                    self.connect();
                 }
             }
             ids::PALETTE => {
@@ -908,10 +982,12 @@ impl App {
     }
 
     fn connect(&mut self) {
-        self.capture = None;
-        if let Ok(capture) = audio::Capture::start(audio::capture_config(&self.config.audio)) {
-            self.capture = Some(capture);
-        }
+        self.link = (!self.demo).then(|| {
+            audio::AudioLink::new(
+                audio::capture_config(&self.config.audio),
+                self.config.audio.auto_reconnect,
+            )
+        });
     }
 }
 
@@ -1563,5 +1639,31 @@ mod tests {
         assert_eq!(app.config.auto_advance.transition_secs, 5.0);
         app.apply_change(menu::ids::AUTO_TRANSITION, "NaN");
         assert_eq!(app.config.auto_advance.transition_secs, 5.0);
+    }
+
+    #[test]
+    fn changing_source_kind_clears_the_target() {
+        let mut app = demo_app();
+        app.config.audio.target = "sink.analog".into();
+        app.apply_change(menu::ids::SOURCE, "pipewire");
+        assert_eq!(app.config.audio.target, "sink.analog");
+        app.apply_change(menu::ids::SOURCE, "microphone");
+        assert_eq!(app.config.audio.target, "");
+        app.apply_change(menu::ids::TARGET, "source.mic");
+        assert_eq!(app.config.audio.target, "source.mic");
+        app.apply_change(menu::ids::SOURCE, "pulse");
+        assert_eq!(app.config.audio.target, "");
+        app.apply_change(menu::ids::TARGET, "System default");
+        assert_eq!(app.config.audio.target, "");
+    }
+
+    #[test]
+    fn auto_reconnect_toggle_is_config_backed() {
+        let mut app = demo_app();
+        assert!(app.config.audio.auto_reconnect);
+        app.apply_change(menu::ids::AUTO_RECONNECT, "off");
+        assert!(!app.config.audio.auto_reconnect);
+        app.apply_change(menu::ids::AUTO_RECONNECT, "on");
+        assert!(app.config.audio.auto_reconnect);
     }
 }

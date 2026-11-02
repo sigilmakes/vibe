@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use crate::{config, palette, visuals};
+use crate::{audio, config, palette, visuals};
 
 /// A stable identifier for a menu row. The page builder assigns these so
 /// selection can survive page rebuilds even when rows change visibility.
@@ -49,6 +49,9 @@ pub mod ids {
     pub const COMMAND: RowId = RowId::new(26);
     pub const FILE: RowId = RowId::new(27);
     pub const LOOP_FILE: RowId = RowId::new(28);
+    pub const AUTO_RECONNECT: RowId = RowId::new(29);
+    pub const NOW_PLAYING: RowId = RowId::new(18);
+    pub const DEVICES_REFRESH: RowId = RowId::new(19);
 
     pub const PALETTE: RowId = RowId::new(30);
     pub const FOLLOW_THEME: RowId = RowId::new(31);
@@ -299,6 +302,7 @@ pub enum Effect {
     RemoveSelectedScene,
     MoveSelectedScene(isize),
     Back,
+    RefreshDevices,
     Changed { id: RowId, value: String },
 }
 
@@ -358,6 +362,11 @@ impl Menu {
 
     pub fn set_search(&mut self, value: String) {
         self.search = value;
+    }
+
+    /// The page currently on top of the menu stack.
+    pub fn current_page_id(&self) -> Option<&PageId> {
+        self.stack.last()
     }
 
     /// Open a page, starting selection at its first visible row.
@@ -749,6 +758,8 @@ impl Menu {
             RowKind::Action => {
                 if id == ids::ANALYSIS {
                     Effect::OpenAnalysis
+                } else if id == ids::DEVICES_REFRESH {
+                    Effect::RefreshDevices
                 } else if id == ids::TAGS_CLEAR {
                     Effect::ClearTags
                 } else if let Some(index) = scene_index(id) {
@@ -887,7 +898,7 @@ pub fn filter_mode_display(config_value: &str) -> &'static str {
     }
 }
 
-const SOURCES: &[&str] = &["auto", "pipewire", "pulse", "command", "file"];
+const SOURCES: &[&str] = &["auto", "pipewire", "pulse", "microphone", "command", "file"];
 const FORMATS: &[&str] = &["f32le", "s16le", "s32le"];
 const COLOR_DEPTHS: &[&str] = &["auto", "truecolor", "ansi256", "ansi16", "mono"];
 const GLYPHS: &[&str] = &["auto", "unicode", "ascii"];
@@ -917,17 +928,28 @@ const SENSITIVITY_SPEC: NumSpec = NumSpec {
     decimals: 2,
 };
 
-fn is_pipewire_or_pulse_or_auto(source: &str) -> bool {
-    matches!(source, "auto" | "pipewire" | "pulse")
-}
-
 /// Build all pages from the current config, scene, and session state.
+#[cfg(test)]
 pub fn build_pages(
     config: &config::Config,
     scene: usize,
     demo: bool,
     active_playlist: &str,
     search: &str,
+) -> Vec<Page> {
+    build_pages_with_audio(config, scene, demo, active_playlist, search, &[], None)
+}
+
+/// Build all pages with the cached audio devices and now-playing text used by
+/// the Audio page.
+pub fn build_pages_with_audio(
+    config: &config::Config,
+    scene: usize,
+    demo: bool,
+    active_playlist: &str,
+    search: &str,
+    devices: &[audio::AudioDevice],
+    now_playing: Option<&str>,
 ) -> Vec<Page> {
     let scene_name = visuals::SCENES.get(scene).copied().unwrap_or_default();
     let mut pages = vec![
@@ -942,7 +964,7 @@ pub fn build_pages(
         build_scene_picker(&config.scenes, scene, search),
         build_filter(&config.scenes),
         build_tags(&config.scenes),
-        build_audio(&config.audio, demo),
+        build_audio(&config.audio, demo, devices, now_playing),
         build_appearance(&config.appearance),
         build_controls(),
     ];
@@ -1287,12 +1309,46 @@ fn build_tags(scenes: &config::ScenesConfig) -> Page {
     }
 }
 
-fn build_audio(audio: &config::AudioConfig, demo: bool) -> Page {
+/// The kind of device a source targets: a sink for output monitors, a source
+/// for the microphone, and nothing for command/file inputs.
+pub fn target_kind(source: &str) -> Option<&'static str> {
+    match source {
+        "auto" | "pipewire" | "pulse" => Some("sink"),
+        "microphone" => Some("source"),
+        _ => None,
+    }
+}
+
+fn build_audio(
+    audio: &config::AudioConfig,
+    demo: bool,
+    devices: &[audio::AudioDevice],
+    now_playing: Option<&str>,
+) -> Page {
     let mut rows = vec![Row::toggle(ids::DEMO, "Demo mode", demo)];
     if !demo {
+        if let Some(now_playing) = now_playing.filter(|text| !text.is_empty()) {
+            rows.push(Row::readonly(ids::NOW_PLAYING, "Now playing", now_playing));
+        }
         rows.push(Row::choice(ids::SOURCE, "Source", SOURCES, &audio.source));
-        if is_pipewire_or_pulse_or_auto(&audio.source) {
-            rows.push(Row::text(ids::TARGET, "Target", &audio.target));
+        if let Some(kind) = target_kind(&audio.source) {
+            let mut targets = vec!["System default"];
+            for device in devices.iter().filter(|device| device.kind == kind) {
+                let name = device.name.as_str();
+                if !targets.contains(&name) {
+                    targets.push(name);
+                }
+            }
+            let target = if audio.target.is_empty() {
+                "System default"
+            } else {
+                audio.target.as_str()
+            };
+            if target != "System default" && !targets.contains(&target) {
+                targets.push(target);
+            }
+            rows.push(Row::choice(ids::TARGET, "Target", &targets, target));
+            rows.push(Row::action(ids::DEVICES_REFRESH, "Refresh devices"));
         }
         rows.push(Row::choice(ids::FORMAT, "Format", FORMATS, &audio.format));
         rows.push(Row::number(ids::RATE, "Rate", audio.rate as f32, RATE_SPEC));
@@ -1302,6 +1358,13 @@ fn build_audio(audio: &config::AudioConfig, demo: bool) -> Page {
             audio.channels as f32,
             CHANNELS_SPEC,
         ));
+        if target_kind(&audio.source).is_some() {
+            rows.push(Row::toggle(
+                ids::AUTO_RECONNECT,
+                "Reconnect",
+                audio.auto_reconnect,
+            ));
+        }
         if audio.source == "command" {
             rows.push(Row::text(ids::COMMAND, "Command", &audio.command));
         }
@@ -1978,5 +2041,87 @@ mod tests {
                 value: "Favourites".into()
             }
         );
+    }
+
+    fn audio_device(kind: &'static str, name: &str) -> audio::AudioDevice {
+        audio::AudioDevice {
+            kind,
+            name: name.into(),
+            description: name.into(),
+            serial: None,
+            channels: None,
+            rate: None,
+            default: false,
+        }
+    }
+
+    #[test]
+    fn audio_page_offers_microphone_targets_and_now_playing() {
+        let devices = vec![
+            audio_device("sink", "sink.analog"),
+            audio_device("source", "source.mic"),
+        ];
+        let mut config = config::Config::default();
+        config.audio.target = "sink.analog".into();
+        let pages = build_pages_with_audio(&config, 0, false, "", "", &devices, Some("A - B"));
+        let audio = find_page(&pages, PageId::Audio).unwrap();
+        let source = audio
+            .visible_rows()
+            .find(|row| row.id == ids::SOURCE)
+            .unwrap();
+        assert!(source.choices.iter().any(|choice| choice == "microphone"));
+        let target = audio
+            .visible_rows()
+            .find(|row| row.id == ids::TARGET)
+            .unwrap();
+        assert_eq!(target.kind, RowKind::Choice);
+        assert_eq!(target.choices, ["System default", "sink.analog"]);
+        assert_eq!(target.value, "sink.analog");
+        assert_eq!(
+            audio
+                .visible_rows()
+                .find(|row| row.id == ids::NOW_PLAYING)
+                .unwrap()
+                .value,
+            "A - B"
+        );
+        assert!(audio
+            .visible_rows()
+            .any(|row| row.id == ids::DEVICES_REFRESH));
+        assert_eq!(
+            audio
+                .visible_rows()
+                .find(|row| row.id == ids::AUTO_RECONNECT)
+                .unwrap()
+                .value,
+            "on"
+        );
+
+        config.audio.target.clear();
+        config.audio.source = "microphone".into();
+        let pages = build_pages_with_audio(&config, 0, false, "", "", &devices, None);
+        let audio = find_page(&pages, PageId::Audio).unwrap();
+        let target = audio
+            .visible_rows()
+            .find(|row| row.id == ids::TARGET)
+            .unwrap();
+        assert_eq!(target.choices, ["System default", "source.mic"]);
+        assert_eq!(target.value, "System default");
+        assert!(!audio.visible_rows().any(|row| row.id == ids::NOW_PLAYING));
+    }
+
+    #[test]
+    fn command_and_file_sources_hide_reconnect_and_targets() {
+        for source in ["command", "file"] {
+            let mut config = config::Config::default();
+            config.audio.source = source.into();
+            let pages = build_pages_with_audio(&config, 0, false, "", "", &[], None);
+            let audio = find_page(&pages, PageId::Audio).unwrap();
+            let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
+            assert!(!visible.contains(&ids::TARGET));
+            assert!(!visible.contains(&ids::DEVICES_REFRESH));
+            assert!(!visible.contains(&ids::AUTO_RECONNECT));
+            assert!(!visible.contains(&ids::NOW_PLAYING));
+        }
     }
 }

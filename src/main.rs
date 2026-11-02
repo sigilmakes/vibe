@@ -4,6 +4,7 @@ mod config;
 mod families;
 mod flow;
 mod menu;
+mod now_playing;
 mod palette;
 mod state;
 mod ui;
@@ -31,6 +32,7 @@ enum AudioSourceArg {
     Auto,
     Pipewire,
     Pulse,
+    Microphone,
     Command,
     File,
 }
@@ -50,7 +52,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  q             Quit\n\nCaptures the configured output monitor, never your microphone.\nUse --list-audio to discover sinks; --audio-source command/file for other backends.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  q             Quit\n\nCaptures the configured output monitor by default; microphone capture is opt-in.\nUse --list-audio to discover sinks and sources; --audio-source command/file for other backends.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -183,6 +185,7 @@ fn source_name(source: AudioSourceArg) -> &'static str {
         AudioSourceArg::Auto => "auto",
         AudioSourceArg::Pipewire => "pipewire",
         AudioSourceArg::Pulse => "pulse",
+        AudioSourceArg::Microphone => "microphone",
         AudioSourceArg::Command => "command",
         AudioSourceArg::File => "file",
     }
@@ -274,12 +277,12 @@ fn check_audio(capture: &audio::Capture, timeout: Duration) -> io::Result<()> {
     }
     if !state.connected {
         return Err(io::Error::other(format!(
-            "No samples received from {source}; check --list-audio and the selected sink"
+            "No samples received from {source}; check --list-audio and the selected device"
         )));
     }
     if state.rms <= 0.001 {
         return Err(io::Error::other(format!(
-            "Capture from {source} is connected but silent; run --list-audio and choose a real output sink"
+            "Capture from {source} is connected but silent; check the selected device and whether it is playing"
         )));
     }
     Ok(())
@@ -350,7 +353,9 @@ fn main() -> io::Result<()> {
                         .unwrap_or_default(),
                 );
             }
-            println!("  Use --audio-target with a sink name or serial. Sources are inputs, not output monitors.");
+            println!(
+                "  Use --audio-target with a sink or source name or serial; microphone capture is opt-in with --audio-source microphone."
+            );
         }
         return Ok(());
     }

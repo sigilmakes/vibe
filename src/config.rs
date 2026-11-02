@@ -48,9 +48,9 @@ impl Default for AutoAdvanceConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    /// "auto", "pipewire", "pulse", "command", or "file".
+    /// "auto", "pipewire", "pulse", "microphone", "command", or "file".
     pub source: String,
-    /// Sink node name or serial; empty means the default monitor.
+    /// Sink or source node name or serial; empty means the system default.
     pub target: String,
     /// Raw PCM command, used when `source` is "command".
     pub command: String,
@@ -60,9 +60,9 @@ pub struct AudioConfig {
     pub format: String,
     pub rate: u32,
     pub channels: u16,
-    /// Placeholder: restart a dropped capture automatically.
+    /// Restart a dropped live capture automatically.
     pub auto_reconnect: bool,
-    /// Placeholder: loop a file source after EOF.
+    /// Loop a file source after EOF.
     pub loop_file: bool,
 }
 
@@ -76,7 +76,7 @@ impl Default for AudioConfig {
             format: "f32le".into(),
             rate: 48_000,
             channels: 2,
-            auto_reconnect: false,
+            auto_reconnect: true,
             loop_file: false,
         }
     }
@@ -252,6 +252,7 @@ mod tests {
 
     #[test]
     fn auto_advance_defaults_and_partial_values_fill_in() {
+        assert!(AudioConfig::default().auto_reconnect);
         let auto = AutoAdvanceConfig::default();
         assert_eq!(auto.mode, "off");
         assert_eq!(auto.transition_secs, 20.0);
@@ -264,10 +265,15 @@ mod tests {
         ));
         let path = directory.join("vibe/config.toml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "[auto_advance]\nmode = \"timer\"\n").unwrap();
+        fs::write(
+            &path,
+            "[auto_advance]\nmode = \"timer\"\ntransition_secs = 20\n",
+        )
+        .unwrap();
         let (loaded, warnings) = load(&path);
         assert!(warnings.is_empty());
         assert_eq!(loaded.auto_advance.mode, "timer");
+        assert_eq!(loaded.auto_advance.transition_secs, 20.0);
         assert_eq!(loaded.auto_advance.transition_secs, 20.0);
         assert_eq!(loaded.auto_advance.within, "all");
         fs::remove_dir_all(directory).unwrap();
