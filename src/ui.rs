@@ -229,9 +229,12 @@ fn row_value(row: &MenuRowView) -> String {
                 format!("{} ›", row.value)
             }
         }
-        RowKind::Text if row.editing => format!("{}▌", row.value),
+        RowKind::Text | RowKind::Number if row.editing => format!("{}▌", row.value),
         RowKind::Action => String::new(),
-        _ => row.value.clone(),
+        _ => match row.unit {
+            Some(unit) if !row.value.is_empty() => format!("{} {unit}", row.value),
+            _ => row.value.clone(),
+        },
     }
 }
 
@@ -361,29 +364,54 @@ mod tests {
     }
 
     #[test]
+    fn menu_number_rows_render_their_unit() {
+        let view = MenuView {
+            path: vec!["Scenes".into()],
+            rows: vec![MenuRowView {
+                label: "Transition time".into(),
+                value: "20".into(),
+                unit: Some("s"),
+                kind: RowKind::Number,
+                editing: false,
+            }],
+            selected: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| menu(frame, &view, &Theme::default()))
+            .unwrap();
+        assert!(text(terminal.backend().buffer()).contains("Transition time"));
+        assert!(text(terminal.backend().buffer()).contains("20 s"));
+    }
+
+    #[test]
     fn menu_is_opaque_borderless_and_scrolls_to_selection() {
         let rows = vec![
             MenuRowView {
                 label: "First".into(),
                 value: "a".into(),
+                unit: None,
                 kind: RowKind::Choice,
                 editing: false,
             },
             MenuRowView {
                 label: "Second".into(),
                 value: "b".into(),
+                unit: None,
                 kind: RowKind::Choice,
                 editing: false,
             },
             MenuRowView {
                 label: "Third".into(),
                 value: "c".into(),
+                unit: None,
                 kind: RowKind::Choice,
                 editing: false,
             },
             MenuRowView {
                 label: "Controls".into(),
                 value: "d".into(),
+                unit: None,
                 kind: RowKind::Submenu,
                 editing: false,
             },

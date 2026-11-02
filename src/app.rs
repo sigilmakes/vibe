@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::{audio, config, menu, palette, state, ui, visuals};
+use crate::{audio, config, flow, menu, palette, state, ui, visuals};
 
 /// Starting state for an interactive session. The CLI loads and seeds the
 /// config and resolves the scene before constructing an `App`.
@@ -79,6 +79,7 @@ pub struct App {
     bands: [f32; 32],
     reactivity: visuals::Reactivity,
     pages: Vec<menu::Page>,
+    auto: flow::Flow,
 }
 
 impl App {
@@ -100,9 +101,11 @@ impl App {
             bands: [0.0; 32],
             reactivity: visuals::Reactivity::default(),
             pages: Vec::new(),
+            auto: flow::Flow::new(),
         };
         app.prune_scenes();
         app.prune_playlists();
+        app.prune_auto_advance();
         app.rebuild_pages();
         if !app.demo {
             app.connect();
@@ -137,6 +140,70 @@ impl App {
             follow_theme: self.config.appearance.follow_theme,
             audio: &self.audio,
             sensitivity: gain,
+        }
+    }
+
+    /// Advance the auto-advance policy. Call once per frame after `view` so the
+    /// policy sees the latest audio snapshot. Menu and Analysis views pause it.
+    pub fn tick(&mut self, now: f32) {
+        let signal = flow::Signal {
+            energy: self.audio.energy,
+            novelty: self.audio.novelty,
+            onset: self.audio.onset,
+            connected: self.audio.connected,
+            silent_for: self.audio.silent_for,
+        };
+        if self.menu.is_some() || self.analysis || self.config.auto_advance.mode == "off" {
+            self.auto.hold(now, signal);
+            return;
+        }
+        let settings = flow::Settings {
+            mode: flow::Mode::from_config(&self.config.auto_advance.mode),
+            transition_secs: self.config.auto_advance.transition_secs,
+            scope: flow::Scope::from_config(&self.config.auto_advance.within),
+        };
+        let candidates = self.auto_candidates(settings.scope);
+        if let Some(next) = self
+            .auto
+            .tick(settings, now, self.scene, &candidates, signal)
+        {
+            self.set_scene(next);
+        }
+    }
+
+    fn auto_candidates(&self, scope: flow::Scope) -> Vec<usize> {
+        match scope {
+            flow::Scope::All => (0..visuals::SCENES.len()).collect(),
+            flow::Scope::Favourites => self
+                .config
+                .scenes
+                .favourites
+                .iter()
+                .filter_map(|name| {
+                    visuals::SCENES
+                        .iter()
+                        .position(|scene| scene.eq_ignore_ascii_case(name))
+                })
+                .collect(),
+            flow::Scope::Playlist => {
+                let Some(playlist) = self
+                    .config
+                    .playlists
+                    .iter()
+                    .find(|playlist| playlist.name == self.active_playlist)
+                else {
+                    return Vec::new();
+                };
+                playlist
+                    .scenes
+                    .iter()
+                    .filter_map(|name| {
+                        visuals::SCENES
+                            .iter()
+                            .position(|scene| scene.eq_ignore_ascii_case(name))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -429,6 +496,31 @@ impl App {
                     self.mark_config_dirty();
                 }
             }
+            ids::AUTO_MODE => {
+                let mode = menu::auto_mode_to_config(value);
+                if self.config.auto_advance.mode != mode {
+                    self.config.auto_advance.mode = mode.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
+            ids::AUTO_TRANSITION => {
+                if let Ok(secs) = value.trim().parse::<f32>() {
+                    if secs.is_finite() {
+                        let secs = secs.clamp(5.0, 300.0).round();
+                        if secs != self.config.auto_advance.transition_secs {
+                            self.config.auto_advance.transition_secs = secs;
+                            self.mark_config_dirty();
+                        }
+                    }
+                }
+            }
+            ids::AUTO_WITHIN => {
+                let within = menu::within_to_config(value);
+                if self.config.auto_advance.within != within {
+                    self.config.auto_advance.within = within.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
             ids::SEARCH => {
                 if let Some(menu) = &mut self.menu {
                     menu.set_search(value.to_owned());
@@ -454,6 +546,7 @@ impl App {
             self.config.scenes.favourites.push(name.to_owned());
         }
         self.mark_config_dirty();
+        self.prune_auto_advance();
     }
 
     fn set_scene(&mut self, scene: usize) {
@@ -511,6 +604,7 @@ impl App {
         if self.active_playlist == name {
             self.active_playlist.clear();
         }
+        self.prune_auto_advance();
         self.mark_config_dirty();
         self.save_state();
         self.rebuild_pages();
@@ -549,6 +643,7 @@ impl App {
         playlist.name = trimmed.to_owned();
         if self.active_playlist == old {
             self.active_playlist = trimmed.to_owned();
+            self.save_state();
         }
         if let Some(menu) = &mut self.menu {
             menu.rename_page(
@@ -568,6 +663,7 @@ impl App {
         } else if self.active_playlist == name {
             self.active_playlist.clear();
         }
+        self.prune_auto_advance();
         self.save_state();
     }
 
@@ -752,9 +848,36 @@ impl App {
         }
     }
 
+    /// Canonicalise auto-advance settings and drop scopes that are no longer
+    /// available (for example Playlist without an active playlist).
+    fn prune_auto_advance(&mut self) {
+        let before = self.config.auto_advance.clone();
+        self.config.auto_advance.mode = match before.mode.as_str() {
+            "phrases" => "phrases",
+            "timer" => "timer",
+            _ => "off",
+        }
+        .to_owned();
+        self.config.auto_advance.transition_secs = if before.transition_secs.is_finite() {
+            before.transition_secs.clamp(5.0, 300.0).round()
+        } else {
+            20.0
+        };
+        self.config.auto_advance.within = match before.within.as_str() {
+            "favourites" if !self.config.scenes.favourites.is_empty() => "favourites",
+            "playlist" if !self.active_playlist.is_empty() => "playlist",
+            _ => "all",
+        }
+        .to_owned();
+        if self.config.auto_advance != before {
+            self.mark_config_dirty();
+        }
+    }
+
     fn flush_config(&mut self) {
         self.prune_scenes();
         self.prune_playlists();
+        self.prune_auto_advance();
         if !self.config_dirty {
             return;
         }
@@ -1298,5 +1421,146 @@ mod tests {
         options.active_playlist = "Missing".into();
         let app = App::new(options);
         assert_eq!(app.active_playlist, "");
+    }
+
+    fn frame(app: &mut App, now: f32) {
+        let _ = app.view(now);
+        app.tick(now);
+    }
+
+    fn timer(transition_secs: f32, within: &str) -> config::AutoAdvanceConfig {
+        config::AutoAdvanceConfig {
+            mode: "timer".into(),
+            transition_secs,
+            within: within.into(),
+        }
+    }
+
+    #[test]
+    fn timer_auto_advance_switches_scene_after_the_transition() {
+        let mut options = demo_options();
+        options.config.auto_advance = timer(5.0, "all");
+        let mut app = App::new(options);
+        frame(&mut app, 0.0);
+        assert_eq!(app.scene, 0);
+        frame(&mut app, 4.9);
+        assert_eq!(app.scene, 0);
+        frame(&mut app, 5.0);
+        assert_eq!(app.scene, 1);
+    }
+
+    #[test]
+    fn menu_and_analysis_pause_auto_advance() {
+        for analysis in [false, true] {
+            let mut options = demo_options();
+            options.config.auto_advance = timer(5.0, "all");
+            let mut app = App::new(options);
+            frame(&mut app, 0.0);
+            app.handle_key(press(KeyCode::Char('m')));
+            if analysis {
+                for _ in 0..3 {
+                    app.handle_key(press(KeyCode::Down));
+                }
+                app.handle_key(press(KeyCode::Enter));
+            }
+            frame(&mut app, 20.0);
+            assert_eq!(app.scene, 0);
+            app.handle_key(press(KeyCode::Esc));
+            frame(&mut app, 20.0);
+            assert_eq!(app.scene, 0);
+            frame(&mut app, 24.9);
+            assert_eq!(app.scene, 0);
+            frame(&mut app, 25.0);
+            assert_eq!(app.scene, 1);
+        }
+    }
+
+    #[test]
+    fn auto_advance_uses_the_active_playlist_order() {
+        let first = visuals::SCENES[1].to_owned();
+        let second = visuals::SCENES[2].to_owned();
+        let mut options = demo_options();
+        options.config.auto_advance = timer(5.0, "playlist");
+        options.config.playlists = vec![config::Playlist {
+            name: "A".into(),
+            scenes: vec![first, second],
+        }];
+        options.active_playlist = "A".into();
+        let mut app = App::new(options);
+        frame(&mut app, 0.0);
+        frame(&mut app, 5.0);
+        assert_eq!(app.scene, 1);
+        frame(&mut app, 10.0);
+        assert_eq!(app.scene, 2);
+        frame(&mut app, 15.0);
+        assert_eq!(app.scene, 1);
+    }
+
+    #[test]
+    fn auto_advance_settings_are_normalised_on_startup() {
+        let mut options = demo_options();
+        options.config.auto_advance = config::AutoAdvanceConfig {
+            mode: "nonsense".into(),
+            transition_secs: 1.0,
+            within: "playlist".into(),
+        };
+        let app = App::new(options);
+        assert_eq!(app.config.auto_advance.mode, "off");
+        assert_eq!(app.config.auto_advance.transition_secs, 5.0);
+        assert_eq!(app.config.auto_advance.within, "all");
+
+        let mut options = demo_options();
+        options.config.auto_advance = config::AutoAdvanceConfig {
+            mode: "phrases".into(),
+            transition_secs: 999.0,
+            within: "favourites".into(),
+        };
+        let app = App::new(options);
+        assert_eq!(app.config.auto_advance.mode, "phrases");
+        assert_eq!(app.config.auto_advance.transition_secs, 300.0);
+        assert_eq!(app.config.auto_advance.within, "all");
+    }
+
+    #[test]
+    fn auto_advance_menu_rows_appear_and_hide_with_the_mode() {
+        let mut app = demo_app();
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Enter));
+        let labels = |app: &mut App| -> Vec<String> {
+            app.view(0.0)
+                .menu
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect()
+        };
+        assert!(labels(&mut app).contains(&"Auto-advance".to_owned()));
+        assert!(!labels(&mut app).contains(&"Transition time".to_owned()));
+        for _ in 0..3 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(app.config.auto_advance.mode, "phrases");
+        assert!(labels(&mut app).contains(&"Transition time".to_owned()));
+        assert!(labels(&mut app).contains(&"Advance within".to_owned()));
+        app.handle_key(press(KeyCode::Right));
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(app.config.auto_advance.mode, "off");
+        assert!(!labels(&mut app).contains(&"Transition time".to_owned()));
+    }
+
+    #[test]
+    fn transition_time_is_clamped_and_ignores_non_finite_edits() {
+        let mut app = demo_app();
+        app.apply_change(menu::ids::AUTO_TRANSITION, "21");
+        assert_eq!(app.config.auto_advance.transition_secs, 21.0);
+        app.apply_change(menu::ids::AUTO_TRANSITION, "999");
+        assert_eq!(app.config.auto_advance.transition_secs, 300.0);
+        app.apply_change(menu::ids::AUTO_TRANSITION, "1");
+        assert_eq!(app.config.auto_advance.transition_secs, 5.0);
+        app.apply_change(menu::ids::AUTO_TRANSITION, "NaN");
+        assert_eq!(app.config.auto_advance.transition_secs, 5.0);
     }
 }

@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod config;
 mod families;
+mod flow;
 mod menu;
 mod palette;
 mod state;
@@ -467,6 +468,7 @@ fn main() -> io::Result<()> {
                 })?;
                 frame_time
             };
+            app.tick(t);
             // Handle queued keys in order without rendering intermediate scenes.
             let elapsed = frame_start.elapsed();
             let mut timeout = if elapsed < frame_time {

@@ -100,6 +100,10 @@ pub mod ids {
     pub const CONFIRM_CANCEL: RowId = RowId::new(68);
     pub const CONFIRM_PROMPT: RowId = RowId::new(69);
 
+    pub const AUTO_MODE: RowId = RowId::new(70);
+    pub const AUTO_TRANSITION: RowId = RowId::new(71);
+    pub const AUTO_WITHIN: RowId = RowId::new(72);
+
     pub fn playlist(name: &str) -> RowId {
         RowId::named("playlist", name)
     }
@@ -150,6 +154,8 @@ pub struct Row {
     pub label: String,
     pub kind: RowKind,
     pub value: String,
+    /// Optional unit appended to the value in the menu (for example "s").
+    pub unit: Option<&'static str>,
     pub visible: bool,
     /// Headers are visible but cannot receive the cursor.
     pub selectable: bool,
@@ -165,6 +171,7 @@ impl Row {
             label: label.to_owned(),
             kind,
             value,
+            unit: None,
             visible: true,
             selectable: true,
             choices: Vec::new(),
@@ -198,6 +205,19 @@ impl Row {
         Self {
             num: Some(spec),
             ..Self::new(id, label, RowKind::Number, value)
+        }
+    }
+
+    fn number_with_unit(
+        id: RowId,
+        label: &str,
+        value: f32,
+        spec: NumSpec,
+        unit: &'static str,
+    ) -> Self {
+        Self {
+            unit: Some(unit),
+            ..Self::number(id, label, value, spec)
         }
     }
 
@@ -294,6 +314,7 @@ pub struct MenuView {
 pub struct MenuRowView {
     pub label: String,
     pub value: String,
+    pub unit: Option<&'static str>,
     pub kind: RowKind,
     pub editing: bool,
 }
@@ -485,6 +506,7 @@ impl Menu {
                 MenuRowView {
                     label: row.label.clone(),
                     value,
+                    unit: row.unit,
                     kind: row.kind,
                     editing,
                 }
@@ -802,6 +824,50 @@ pub fn tag_index(id: RowId) -> Option<usize> {
 }
 
 const FILTER_MODES: &[&str] = &["All", "Favourites", "Tags"];
+const AUTO_MODES: &[&str] = &["Off", "Phrases", "Timer"];
+
+const TRANSITION_SPEC: NumSpec = NumSpec {
+    min: 5.0,
+    max: 300.0,
+    step: 1.0,
+    decimals: 0,
+};
+
+/// Maps an auto-advance choice's display text to the persisted config string.
+pub fn auto_mode_to_config(display: &str) -> &'static str {
+    match display {
+        "Phrases" => "phrases",
+        "Timer" => "timer",
+        _ => "off",
+    }
+}
+
+/// Maps the persisted auto-advance mode to its choice display text.
+pub fn auto_mode_display(config_value: &str) -> &'static str {
+    match config_value {
+        "phrases" => "Phrases",
+        "timer" => "Timer",
+        _ => "Off",
+    }
+}
+
+/// Maps an "Advance within" choice's display text to the persisted value.
+pub fn within_to_config(display: &str) -> &'static str {
+    match display {
+        "Favourites" => "favourites",
+        "Playlist" => "playlist",
+        _ => "all",
+    }
+}
+
+/// Maps the persisted "Advance within" value to its choice display text.
+pub fn within_display(config_value: &str) -> &'static str {
+    match config_value {
+        "favourites" => "Favourites",
+        "playlist" => "Playlist",
+        _ => "All",
+    }
+}
 
 /// Maps a filter choice's display text to the persisted config string.
 pub fn filter_mode_to_config(display: &str) -> &'static str {
@@ -867,6 +933,7 @@ pub fn build_pages(
     let mut pages = vec![
         build_root(),
         build_scenes(
+            &config.auto_advance,
             &config.scenes,
             scene_name,
             &config.playlists,
@@ -917,40 +984,71 @@ fn playlist_summary(playlists: &[config::Playlist], active: &str) -> String {
     }
     match playlists.len() {
         0 => "none".to_owned(),
+        1 => "1 playlist".to_owned(),
         count => format!("{count} playlists"),
     }
 }
 
 fn build_scenes(
+    auto: &config::AutoAdvanceConfig,
     scenes: &config::ScenesConfig,
     scene_name: &str,
     playlists: &[config::Playlist],
     active: &str,
 ) -> Page {
+    let mut rows = vec![
+        Row::submenu(
+            ids::CURRENT_SCENE,
+            "Visualisation",
+            scene_name,
+            PageId::ScenePicker,
+        ),
+        Row::submenu(
+            ids::FILTER,
+            "Filter…",
+            &filter_summary(scenes),
+            PageId::Filter,
+        ),
+        Row::submenu(
+            ids::PLAYLISTS,
+            "Playlists…",
+            &playlist_summary(playlists, active),
+            PageId::Playlists,
+        ),
+        Row::choice(
+            ids::AUTO_MODE,
+            "Auto-advance",
+            AUTO_MODES,
+            auto_mode_display(&auto.mode),
+        ),
+    ];
+    if auto.mode != "off" {
+        rows.push(Row::number_with_unit(
+            ids::AUTO_TRANSITION,
+            "Transition time",
+            auto.transition_secs,
+            TRANSITION_SPEC,
+            "s",
+        ));
+        let mut scopes = vec!["All"];
+        if !scenes.favourites.is_empty() {
+            scopes.push("Favourites");
+        }
+        if !active.is_empty() {
+            scopes.push("Playlist");
+        }
+        rows.push(Row::choice(
+            ids::AUTO_WITHIN,
+            "Advance within",
+            &scopes,
+            within_display(&auto.within),
+        ));
+    }
     Page {
         id: PageId::Scenes,
         title: "Scenes".into(),
         path: vec!["Vibe".into(), "Scenes".into()],
-        rows: vec![
-            Row::submenu(
-                ids::CURRENT_SCENE,
-                "Visualisation",
-                scene_name,
-                PageId::ScenePicker,
-            ),
-            Row::submenu(
-                ids::FILTER,
-                "Filter…",
-                &filter_summary(scenes),
-                PageId::Filter,
-            ),
-            Row::submenu(
-                ids::PLAYLISTS,
-                "Playlists…",
-                &playlist_summary(playlists, active),
-                PageId::Playlists,
-            ),
-        ],
+        rows,
         initial: None,
     }
 }
@@ -1755,5 +1853,97 @@ mod tests {
             menu.stack.last().cloned(),
             Some(PageId::Playlist("Empty".into()))
         );
+    }
+
+    #[test]
+    fn auto_advance_details_are_hidden_while_off_and_use_seconds() {
+        let config = config::Config::default();
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let labels: Vec<&str> = scenes
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Visualisation", "Filter…", "Playlists…", "Auto-advance"]
+        );
+        assert_eq!(
+            scenes
+                .visible_rows()
+                .find(|row| row.id == ids::AUTO_MODE)
+                .unwrap()
+                .value,
+            "Off"
+        );
+
+        let mut config = config::Config::default();
+        config.auto_advance.mode = "timer".into();
+        config.auto_advance.transition_secs = 20.0;
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let labels: Vec<&str> = scenes
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "Visualisation",
+                "Filter…",
+                "Playlists…",
+                "Auto-advance",
+                "Transition time",
+                "Advance within",
+            ]
+        );
+        let transition = scenes
+            .visible_rows()
+            .find(|row| row.id == ids::AUTO_TRANSITION)
+            .unwrap();
+        assert_eq!(transition.value, "20");
+        assert_eq!(transition.unit, Some("s"));
+        assert_eq!(
+            scenes
+                .visible_rows()
+                .find(|row| row.id == ids::AUTO_WITHIN)
+                .unwrap()
+                .value,
+            "All"
+        );
+    }
+
+    #[test]
+    fn auto_advance_scopes_only_offer_available_targets() {
+        let mut config = config::Config::default();
+        config.auto_advance.mode = "timer".into();
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let within = scenes
+            .visible_rows()
+            .find(|row| row.id == ids::AUTO_WITHIN)
+            .unwrap();
+        assert_eq!(within.choices, ["All"]);
+
+        config.scenes.favourites = vec!["Julia".into()];
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let within = scenes
+            .visible_rows()
+            .find(|row| row.id == ids::AUTO_WITHIN)
+            .unwrap();
+        assert_eq!(within.choices, ["All", "Favourites"]);
+
+        config.playlists = vec![config::Playlist {
+            name: "Chill".into(),
+            scenes: vec![],
+        }];
+        let pages = build_pages(&config, 0, false, "Chill", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let within = scenes
+            .visible_rows()
+            .find(|row| row.id == ids::AUTO_WITHIN)
+            .unwrap();
+        assert_eq!(within.choices, ["All", "Favourites", "Playlist"]);
     }
 }

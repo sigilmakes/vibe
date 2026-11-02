@@ -27,10 +27,11 @@ impl Default for ScenesConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoAdvanceConfig {
-    /// Placeholder: "off", "manual", or "timed".
+    /// "off", "phrases", or "timer".
     pub mode: String,
+    /// Seconds before the next scene; clamped to 5–300.
     pub transition_secs: f32,
-    /// Placeholder: scope for auto-advance ("playlist", "favourites", ...).
+    /// "all", "favourites", or "playlist".
     pub within: String,
 }
 
@@ -38,8 +39,8 @@ impl Default for AutoAdvanceConfig {
     fn default() -> Self {
         Self {
             mode: "off".into(),
-            transition_secs: 30.0,
-            within: String::new(),
+            transition_secs: 20.0,
+            within: "all".into(),
         }
     }
 }
@@ -246,6 +247,29 @@ mod tests {
         assert_eq!(loaded, Config::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("config:"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn auto_advance_defaults_and_partial_values_fill_in() {
+        let auto = AutoAdvanceConfig::default();
+        assert_eq!(auto.mode, "off");
+        assert_eq!(auto.transition_secs, 20.0);
+        assert_eq!(auto.within, "all");
+
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-config-auto-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        let path = directory.join("vibe/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "[auto_advance]\nmode = \"timer\"\n").unwrap();
+        let (loaded, warnings) = load(&path);
+        assert!(warnings.is_empty());
+        assert_eq!(loaded.auto_advance.mode, "timer");
+        assert_eq!(loaded.auto_advance.transition_secs, 20.0);
+        assert_eq!(loaded.auto_advance.within, "all");
         fs::remove_dir_all(directory).unwrap();
     }
 
