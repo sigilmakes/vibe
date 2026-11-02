@@ -1,3 +1,4 @@
+use crate::menu::{MenuRowView, MenuView, RowKind};
 use crate::palette::Theme;
 
 use ratatui::{
@@ -156,49 +157,86 @@ fn analysis_popup(frame: &mut Frame, status: &Status<'_>, theme: &Theme) {
     overlay(frame, area, lines, theme);
 }
 
-/// Draw a compact, opaque menu above the canvas.
-pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize, theme: &Theme) {
+/// Draw an opaque, centered menu with a title path, label/value rows, and
+/// scrolling. The selected row is inverted; submenu and editing rows carry
+/// trailing markers. No footer hint line is drawn.
+pub fn menu(frame: &mut Frame, menu: &MenuView, theme: &Theme) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
         return;
     }
-    let width = screen.width.min(34);
+    let width = screen.width.min(44);
     let height = screen
         .height
-        .min(items.len().saturating_add(2).min(u16::MAX as usize) as u16);
+        .min(menu.rows.len().saturating_add(1).min(u16::MAX as usize) as u16);
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + (screen.height - height) / 2,
         width,
         height,
     );
-    let capacity = height.saturating_sub(2) as usize;
-    let selected = selected.min(items.len().saturating_sub(1));
+    let capacity = height.saturating_sub(1) as usize;
+    let selected = menu.selected.min(menu.rows.len().saturating_sub(1));
     let first = selected.saturating_sub(capacity.saturating_sub(1));
     let mut lines = vec![Line::styled(
-        format!(" {title}"),
+        clip(format!(" {}", menu.path.join(" / ")), width as usize),
         Style::default()
             .fg(color(theme.ansi[12]))
             .add_modifier(Modifier::BOLD),
     )];
-    for (index, item) in items.iter().enumerate().skip(first).take(capacity) {
-        let active = index == selected;
-        let marker = if active { "›" } else { " " };
-        let text = format!(
-            " {marker} {item:<padding$}",
-            padding = width.saturating_sub(3) as usize
-        );
-        let style = if active {
-            Style::default()
-                .fg(color(theme.background))
-                .bg(color(theme.foreground))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            base(theme)
-        };
-        lines.push(Line::styled(text, style));
+    for (index, row) in menu.rows.iter().enumerate().skip(first).take(capacity) {
+        lines.push(row_line(row, index == selected, width, theme));
     }
     overlay(frame, area, lines, theme);
+}
+
+fn row_line(row: &MenuRowView, active: bool, width: u16, theme: &Theme) -> Line<'static> {
+    let marker = if active { "›" } else { " " };
+    let mut text = format!(" {marker} {}", row.label);
+    let value = row_value(row);
+    if !value.is_empty() {
+        let used = text.chars().count();
+        let pad = (width as usize).saturating_sub(used + 1 + value.chars().count());
+        text.push_str(&" ".repeat(pad));
+        text.push(' ');
+        text.push_str(&value);
+    }
+    let text = clip(text, width as usize);
+    let style = if active {
+        Style::default()
+            .fg(color(theme.background))
+            .bg(color(theme.foreground))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        base(theme)
+    };
+    Line::styled(text, style)
+}
+
+fn row_value(row: &MenuRowView) -> String {
+    match row.kind {
+        RowKind::Checkbox => {
+            if row.value == "on" {
+                "[x]".to_owned()
+            } else {
+                "[ ]".to_owned()
+            }
+        }
+        RowKind::Submenu => {
+            if row.value.is_empty() {
+                "›".to_owned()
+            } else {
+                format!("{} ›", row.value)
+            }
+        }
+        RowKind::Text if row.editing => format!("{}▌", row.value),
+        RowKind::Action => String::new(),
+        _ => row.value.clone(),
+    }
+}
+
+fn clip(text: String, width: usize) -> String {
+    text.chars().take(width).collect()
 }
 
 /// Leave the canvas untouched unless the analysis popup is open.
@@ -324,24 +362,49 @@ mod tests {
 
     #[test]
     fn menu_is_opaque_borderless_and_scrolls_to_selection() {
+        let rows = vec![
+            MenuRowView {
+                label: "First".into(),
+                value: "a".into(),
+                kind: RowKind::Choice,
+                editing: false,
+            },
+            MenuRowView {
+                label: "Second".into(),
+                value: "b".into(),
+                kind: RowKind::Choice,
+                editing: false,
+            },
+            MenuRowView {
+                label: "Third".into(),
+                value: "c".into(),
+                kind: RowKind::Choice,
+                editing: false,
+            },
+            MenuRowView {
+                label: "Controls".into(),
+                value: "d".into(),
+                kind: RowKind::Submenu,
+                editing: false,
+            },
+        ];
         for (width, height) in [(0, 0), (1, 1), (8, 3), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let view = MenuView {
+                path: vec!["Menu".into()],
+                rows: rows.clone(),
+                selected: 3,
+            };
             terminal
                 .draw(|frame| {
                     for cell in &mut frame.buffer_mut().content {
                         cell.set_symbol("▀");
                     }
-                    menu(
-                        frame,
-                        "Menu",
-                        &["First", "Second", "Third", "Controls"],
-                        3,
-                        &Theme::default(),
-                    );
+                    menu(frame, &view, &Theme::default());
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            assert_popup_only(buffer, centered(buffer.area, 34, 6));
+            assert_popup_only(buffer, centered(buffer.area, 44, 5));
             if width == 80 {
                 assert!(row(buffer, 13).contains("› Controls"));
                 assert_eq!(buffer[(24, 13)].bg, color(Theme::default().foreground));
@@ -351,7 +414,7 @@ mod tests {
                 assert!(!text.contains('│'));
             }
             if width == 8 {
-                assert!(row(buffer, 1).contains("› Con"));
+                assert!(row(buffer, 2).contains('›'));
             }
         }
     }

@@ -117,6 +117,38 @@ pub struct CaptureConfig {
     pub format: PcmFormat,
 }
 
+/// Build a capture config from typed audio settings. An empty command/file
+/// with an explicit "command"/"file" source degrades to `auto` rather than
+/// spawning an empty shell or opening an empty path.
+pub fn capture_config(audio: &crate::config::AudioConfig) -> CaptureConfig {
+    use clap::ValueEnum;
+    let backend = match audio.source.as_str() {
+        "pipewire" => Backend::PipeWire,
+        "pulse" => Backend::Pulse,
+        "command" if !audio.command.is_empty() => Backend::Command(audio.command.clone()),
+        "file" if !audio.file.is_empty() => Backend::File(PathBuf::from(&audio.file)),
+        _ => {
+            if !audio.command.is_empty() {
+                Backend::Command(audio.command.clone())
+            } else if !audio.file.is_empty() {
+                Backend::File(PathBuf::from(&audio.file))
+            } else {
+                Backend::Auto
+            }
+        }
+    };
+    let format = PcmFormat {
+        rate: audio.rate,
+        channels: audio.channels,
+        sample: SampleFormat::from_str(&audio.format, true).unwrap_or(SampleFormat::F32),
+    };
+    CaptureConfig {
+        backend,
+        target: (!audio.target.is_empty()).then(|| audio.target.clone()),
+        format,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SourceInfo {
     pub kind: String,

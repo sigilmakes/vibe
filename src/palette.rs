@@ -518,6 +518,15 @@ impl TerminalInput {
         }
     }
 
+    /// Change whether theme queries recur. Enabling schedules an immediate
+    /// re-query; disabling leaves the last palette in place.
+    pub fn set_follow_theme(&mut self, follow_theme: bool) {
+        if follow_theme && !self.follow_theme {
+            self.next_refresh = Some(std::time::Instant::now());
+        }
+        self.follow_theme = follow_theme;
+    }
+
     fn refresh(&mut self, now: std::time::Instant) -> std::io::Result<()> {
         use std::io::Write;
         if self.next_refresh.is_some_and(|next| now >= next) {

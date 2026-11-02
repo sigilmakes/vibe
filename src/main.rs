@@ -4,7 +4,6 @@ mod config;
 mod families;
 mod menu;
 mod palette;
-mod preferences;
 mod state;
 mod ui;
 mod visuals;
@@ -13,6 +12,7 @@ use app::{App, Flow, Options};
 use crossterm::event::Event;
 use std::{
     io,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -25,7 +25,7 @@ enum ColorMode {
     Never,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum AudioSourceArg {
     Auto,
     Pipewire,
@@ -33,6 +33,7 @@ enum AudioSourceArg {
     Command,
     File,
 }
+
 fn gain_arg(input: &str) -> Result<f32, String> {
     let value: f32 = input
         .parse()
@@ -58,23 +59,23 @@ struct Args {
     #[arg(long)]
     demo: bool,
     /// Audio capture backend
-    #[arg(long, value_enum, default_value = "auto", value_name = "SOURCE")]
-    audio_source: AudioSourceArg,
+    #[arg(long, value_enum, value_name = "SOURCE")]
+    audio_source: Option<AudioSourceArg>,
     /// Command that writes raw PCM to stdout (used with --audio-source command)
     #[arg(long, value_name = "COMMAND")]
     audio_command: Option<String>,
     /// Raw PCM file (used with --audio-source file)
     #[arg(long, value_name = "PATH")]
-    audio_file: Option<std::path::PathBuf>,
+    audio_file: Option<PathBuf>,
     /// Raw PCM sample format
-    #[arg(long, value_enum, default_value = "f32le", value_name = "FORMAT")]
-    audio_format: audio::SampleFormat,
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    audio_format: Option<audio::SampleFormat>,
     /// Raw PCM sample rate
-    #[arg(long, default_value_t = 48000, value_parser = clap::value_parser!(u32).range(8_000..=192_000))]
-    audio_rate: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(8_000..=192_000))]
+    audio_rate: Option<u32>,
     /// Raw PCM channel count
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=32))]
-    audio_channels: u16,
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=32))]
+    audio_channels: Option<u16>,
     /// PipeWire/PulseAudio sink node name or serial
     #[arg(long = "audio-target", visible_alias = "target", value_name = "NODE")]
     audio_target: Option<String>,
@@ -82,17 +83,17 @@ struct Args {
     #[arg(long)]
     list_audio: bool,
     /// Render frame-rate cap
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
-    fps: u32,
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=240))]
+    fps: Option<u32>,
     /// Terminal colour depth (auto detects truecolour/256/16 colours)
-    #[arg(long, value_enum, default_value = "auto")]
-    color_depth: palette::ColorDepth,
+    #[arg(long, value_enum)]
+    color_depth: Option<palette::ColorDepth>,
     /// Glyph set; ascii replaces non-ASCII symbols after rendering
-    #[arg(long, value_enum, default_value = "auto")]
-    glyphs: palette::GlyphMode,
+    #[arg(long, value_enum)]
+    glyphs: Option<palette::GlyphMode>,
     /// Re-query terminal colours every second instead of only at startup
-    #[arg(long)]
-    follow_theme: bool,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    follow_theme: Option<bool>,
     /// Starting visualisation; otherwise resume the last one (see --list)
     #[arg(long, value_name = "NAME")]
     scene: Option<String>,
@@ -100,14 +101,33 @@ struct Args {
     #[arg(long, value_name = "NAME")]
     palette: Option<String>,
     /// Visual response strength; does not alter the tempo estimator
-    #[arg(long, default_value = "1", value_parser = gain_arg)]
-    sensitivity: f32,
+    #[arg(long, value_parser = gain_arg)]
+    sensitivity: Option<f32>,
+    /// Path to a config file (defaults to $XDG_CONFIG_HOME/vibe/config.toml)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
     /// List visualisations and terminal-derived palettes
     #[arg(long)]
     list: bool,
     /// Analyze live audio for 1–60 seconds, then print features (default: 12)
     #[arg(long, num_args=0..=1, default_missing_value="12", value_name="SECONDS", value_parser=clap::value_parser!(u64).range(1..=60))]
     check_audio: Option<u64>,
+}
+
+fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn config_path(args: &Args) -> PathBuf {
+    args.config.clone().unwrap_or_else(|| {
+        config::config_path(
+            env_path("XDG_CONFIG_HOME").as_deref(),
+            env_path("HOME").as_deref(),
+        )
+        .unwrap_or_else(|| PathBuf::from(".config/vibe/config.toml"))
+    })
 }
 
 fn choice(name: Option<&str>, choices: &[&str], kind: &str) -> io::Result<usize> {
@@ -137,6 +157,78 @@ fn starting_scene(explicit: Option<&str>, saved: Option<&str>) -> io::Result<usi
         return Ok(index);
     }
     choice(Some(DEFAULT_SCENE), visuals::SCENES, "visualisation")
+}
+
+fn color_depth_name(depth: palette::ColorDepth) -> &'static str {
+    match depth {
+        palette::ColorDepth::Auto => "auto",
+        palette::ColorDepth::Truecolor => "truecolor",
+        palette::ColorDepth::Ansi256 => "ansi256",
+        palette::ColorDepth::Ansi16 => "ansi16",
+        palette::ColorDepth::Mono => "mono",
+    }
+}
+
+fn glyphs_name(glyphs: palette::GlyphMode) -> &'static str {
+    match glyphs {
+        palette::GlyphMode::Auto => "auto",
+        palette::GlyphMode::Unicode => "unicode",
+        palette::GlyphMode::Ascii => "ascii",
+    }
+}
+
+fn source_name(source: AudioSourceArg) -> &'static str {
+    match source {
+        AudioSourceArg::Auto => "auto",
+        AudioSourceArg::Pipewire => "pipewire",
+        AudioSourceArg::Pulse => "pulse",
+        AudioSourceArg::Command => "command",
+        AudioSourceArg::File => "file",
+    }
+}
+
+/// Seed the in-memory config from explicit CLI flags. These are session
+/// overrides: they replace the file value but are never written back.
+fn apply_cli(config: &mut config::Config, args: &Args) {
+    if let Some(palette) = &args.palette {
+        config.appearance.palette = palette.clone();
+    }
+    if let Some(fps) = args.fps {
+        config.appearance.fps = fps;
+    }
+    if let Some(depth) = args.color_depth {
+        config.appearance.color_depth = color_depth_name(depth).to_owned();
+    }
+    if let Some(glyphs) = args.glyphs {
+        config.appearance.glyphs = glyphs_name(glyphs).to_owned();
+    }
+    if args.follow_theme == Some(true) {
+        config.appearance.follow_theme = true;
+    }
+    if let Some(sensitivity) = args.sensitivity {
+        config.appearance.sensitivity = sensitivity;
+    }
+    if let Some(source) = args.audio_source {
+        config.audio.source = source_name(source).to_owned();
+    }
+    if let Some(command) = &args.audio_command {
+        config.audio.command = command.clone();
+    }
+    if let Some(file) = &args.audio_file {
+        config.audio.file = file.display().to_string();
+    }
+    if let Some(format) = args.audio_format {
+        config.audio.format = format.name().to_owned();
+    }
+    if let Some(rate) = args.audio_rate {
+        config.audio.rate = rate;
+    }
+    if let Some(channels) = args.audio_channels {
+        config.audio.channels = channels;
+    }
+    if let Some(target) = &args.audio_target {
+        config.audio.target = target.clone();
+    }
 }
 
 fn check_audio(capture: &audio::Capture, timeout: Duration) -> io::Result<()> {
@@ -254,68 +346,74 @@ fn main() -> io::Result<()> {
         }
         return Ok(());
     }
-    let state_path = if args.check_audio.is_none() {
-        preferences::state_path(
-            std::env::var_os("XDG_STATE_HOME")
-                .as_deref()
-                .map(std::path::Path::new),
-            std::env::var_os("HOME")
-                .as_deref()
-                .map(std::path::Path::new),
-        )
-    } else {
-        None
-    };
-    let saved_scene = state_path.as_deref().and_then(preferences::load);
-    let initial_scene = starting_scene(args.scene.as_deref(), saved_scene.as_deref())?;
-    let initial_palette = choice(args.palette.as_deref(), palette::PALETTES, "palette")?;
-    let backend = match args.audio_source {
-        AudioSourceArg::Auto if args.audio_command.is_some() => {
-            audio::Backend::Command(args.audio_command.clone().expect("checked command"))
-        }
-        AudioSourceArg::Auto if args.audio_file.is_some() => {
-            audio::Backend::File(args.audio_file.clone().expect("checked file"))
-        }
-        AudioSourceArg::Auto => audio::Backend::Auto,
-        AudioSourceArg::Pipewire => audio::Backend::PipeWire,
-        AudioSourceArg::Pulse => audio::Backend::Pulse,
-        AudioSourceArg::Command => {
-            audio::Backend::Command(args.audio_command.clone().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "--audio-source command needs --audio-command",
-                )
-            })?)
-        }
-        AudioSourceArg::File => audio::Backend::File(args.audio_file.clone().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "--audio-source file needs --audio-file",
-            )
-        })?),
-    };
-    let format = audio::PcmFormat {
-        rate: args.audio_rate,
-        channels: args.audio_channels,
-        sample: args.audio_format,
+
+    if args.audio_source == Some(AudioSourceArg::Command) && args.audio_command.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--audio-source command needs --audio-command",
+        ));
     }
-    .validate()?;
-    let capture_config = audio::CaptureConfig {
-        backend,
-        target: args.audio_target.clone(),
-        format,
-    };
+    if args.audio_source == Some(AudioSourceArg::File) && args.audio_file.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--audio-source file needs --audio-file",
+        ));
+    }
+    if let Some(name) = &args.palette {
+        if !palette::PALETTES
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown palette '{name}'; choose: {}",
+                    palette::PALETTES.join(", ")
+                ),
+            ));
+        }
+    }
+
+    let config_path = config_path(&args);
+    let mut warnings = Vec::new();
+    let (mut config, config_warnings) = config::load(&config_path);
+    warnings.extend(config_warnings);
+    apply_cli(&mut config, &args);
+
+    let state_path = state::state_path(
+        env_path("XDG_STATE_HOME").as_deref(),
+        env_path("HOME").as_deref(),
+    );
+    let legacy = state::legacy_scene_path(
+        env_path("XDG_STATE_HOME").as_deref(),
+        env_path("HOME").as_deref(),
+    );
+    let mut state_data = state::State::default();
+    if let Some(path) = &state_path {
+        let (loaded, state_warnings) = state::load(path, legacy.as_deref());
+        state_data = loaded;
+        warnings.extend(state_warnings);
+    }
+
+    for warning in &warnings {
+        eprintln!("{warning}");
+    }
+
     if let Some(seconds) = args.check_audio {
-        let capture = audio::Capture::start(capture_config)?;
+        let capture = audio::Capture::start(audio::capture_config(&config.audio))?;
         check_audio(&capture, Duration::from_secs(seconds))?;
         return Ok(());
     }
+
+    let saved_scene = (!state_data.last_scene.is_empty()).then_some(state_data.last_scene.as_str());
+    let initial_scene = starting_scene(args.scene.as_deref(), saved_scene)?;
+
     let mut app = App::new(Options {
         scene: initial_scene,
-        palette: initial_palette,
-        sensitivity: args.sensitivity,
+        config,
         demo: args.demo,
-        capture: capture_config,
+        config_path: config_path.clone(),
+        state_path: state_path.clone(),
     });
     match args.color {
         ColorMode::Auto => {}
@@ -325,17 +423,18 @@ fn main() -> io::Result<()> {
 
     let mut renderer = visuals::Renderer::default();
     let mut terminal = ratatui::init();
-    let frame_time = Duration::from_secs_f32(1.0 / args.fps as f32);
-    let color_depth = args.color_depth.resolve();
-    let glyph_mode = args.glyphs.resolve();
-    let result = (|| -> io::Result<usize> {
-        let mut input = palette::TerminalInput::open(args.follow_theme)?;
+    let result = (|| -> io::Result<()> {
+        let mut input = palette::TerminalInput::open(false)?;
         let start = Instant::now();
         'frames: loop {
             let frame_start = Instant::now();
             let t = start.elapsed().as_secs_f32();
-            {
+            let frame_time = {
                 let view = app.view(t);
+                let frame_time = Duration::from_secs_f32(1.0 / view.fps as f32);
+                let color_depth = view.color_depth.resolve();
+                let glyph_mode = view.glyphs.resolve();
+                input.set_follow_theme(view.follow_theme);
                 terminal.draw(|frame| {
                     let area = frame.area();
                     renderer.draw(
@@ -349,18 +448,17 @@ fn main() -> io::Result<()> {
                         &input.theme,
                     );
                     ui::draw(frame, view.analysis, &view.status(), &input.theme);
-                    if let Some(menu) = view.menu {
-                        ui::menu(frame, menu.title, menu.items, menu.selected, &input.theme);
+                    if let Some(menu) = &view.menu {
+                        ui::menu(frame, menu, &input.theme);
                     }
                     if glyph_mode == palette::GlyphMode::Ascii {
                         palette::ascii_buffer(frame.buffer_mut());
                     }
                     palette::quantize_buffer(frame.buffer_mut(), color_depth);
                 })?;
-            }
+                frame_time
+            };
             // Handle queued keys in order without rendering intermediate scenes.
-            // If a frame overruns, keep a small idle slice instead of polling
-            // immediately; `--fps` can lower the target for slow terminals.
             let elapsed = frame_start.elapsed();
             let mut timeout = if elapsed < frame_time {
                 frame_time - elapsed
@@ -374,18 +472,15 @@ fn main() -> io::Result<()> {
                     break 'frames;
                 }
             }
+            app.maybe_persist(Instant::now());
         }
-        Ok(app.scene())
+        Ok(())
     })();
     ratatui::restore();
-    let scene = result?;
-    if let Some(path) = state_path {
-        if let Err(error) = preferences::save(&path, visuals::SCENES[scene]) {
-            eprintln!(
-                "Could not save last visualisation to {}: {error}",
-                path.display()
-            );
-        }
+    app.flush();
+    result?;
+    for error in app.take_save_errors() {
+        eprintln!("{error}");
     }
     Ok(())
 }
@@ -393,6 +488,7 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn scene_cli_overrides_saved_name_and_missing_or_stale_state_uses_liquid() {
         use clap::Parser;
@@ -422,5 +518,41 @@ mod tests {
         for value in ["0", "192001"] {
             assert!(Args::try_parse_from(["vibe", "--audio-rate", value]).is_err());
         }
+    }
+
+    #[test]
+    fn cli_flags_seed_the_config_and_config_path_defaults_to_xdg() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "vibe",
+            "--fps",
+            "30",
+            "--palette",
+            "Ember",
+            "--audio-source",
+            "command",
+            "--audio-command",
+            "parec",
+        ])
+        .unwrap();
+        let mut config = config::Config::default();
+        apply_cli(&mut config, &args);
+        assert_eq!(config.appearance.fps, 30);
+        assert_eq!(config.appearance.palette, "Ember");
+        assert_eq!(config.audio.source, "command");
+        assert_eq!(config.audio.command, "parec");
+        // Absent flags leave the config defaults in place.
+        assert_eq!(config.appearance.sensitivity, 1.0);
+        assert_eq!(config.audio.rate, 48_000);
+    }
+
+    #[test]
+    fn explicit_command_and_file_sources_need_their_payloads() {
+        use clap::Parser;
+        assert!(Args::try_parse_from(["vibe", "--audio-source", "command"]).is_ok());
+        assert!(Args::try_parse_from(["vibe", "--audio-source", "file"]).is_ok());
+        // Payload requirements are validated in main() before the TUI starts.
+        let command = Args::try_parse_from(["vibe", "--audio-source", "command"]).unwrap();
+        assert_eq!(command.audio_command, None);
     }
 }

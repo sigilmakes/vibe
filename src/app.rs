@@ -1,14 +1,17 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
-use crate::{audio, palette, ui, visuals};
+use crate::{audio, config, menu, palette, state, ui, visuals};
 
-/// Starting state for an interactive session.
+/// Starting state for an interactive session. The CLI loads and seeds the
+/// config and resolves the scene before constructing an `App`.
 pub struct Options {
     pub scene: usize,
-    pub palette: usize,
-    pub sensitivity: f32,
+    pub config: config::Config,
     pub demo: bool,
-    pub capture: audio::CaptureConfig,
+    pub config_path: PathBuf,
+    pub state_path: Option<PathBuf>,
 }
 
 /// Whether the frame loop should keep running.
@@ -18,17 +21,19 @@ pub enum Flow {
     Quit,
 }
 
-/// One frame's visual input.
-///
-/// Audio-derived values are already scaled by the current sensitivity.
-/// `status()` projects the diagnostic subset used by the UI overlays.
+/// One frame's visual input. Settings are resolved from the in-memory config
+/// so menu edits take effect on the very next frame.
 pub struct View<'a> {
     pub scene: usize,
     pub palette: usize,
     pub bands: &'a [f32; 32],
     pub reactivity: &'a visuals::Reactivity,
     pub analysis: bool,
-    pub menu: Option<MenuView>,
+    pub menu: Option<menu::MenuView>,
+    pub fps: u32,
+    pub color_depth: palette::ColorDepth,
+    pub glyphs: palette::GlyphMode,
+    pub follow_theme: bool,
     audio: &'a audio::AudioState,
     sensitivity: f32,
 }
@@ -50,88 +55,50 @@ impl View<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MenuView {
-    pub title: &'static str,
-    pub items: &'static [&'static str],
-    pub selected: usize,
-}
+const CONFIG_DEBOUNCE: Duration = Duration::from_millis(250);
 
-#[derive(Clone, Copy)]
-enum MenuKind {
-    Root,
-    Scenes,
-    Palettes,
-}
-
-struct Menu {
-    kind: MenuKind,
-    selected: usize,
-}
-
-impl Menu {
-    fn items(&self) -> &'static [&'static str] {
-        match self.kind {
-            MenuKind::Root => &["Visualisation", "Palette", "Analysis"],
-            MenuKind::Scenes => visuals::SCENES,
-            MenuKind::Palettes => palette::PALETTES,
-        }
-    }
-
-    fn title(&self) -> &'static str {
-        match self.kind {
-            MenuKind::Root => "Vibe",
-            MenuKind::Scenes => "Visualisation",
-            MenuKind::Palettes => "Palette",
-        }
-    }
-
-    fn step(&mut self, delta: isize) {
-        self.selected =
-            (self.selected as isize + delta).rem_euclid(self.items().len() as isize) as usize;
-    }
-
-    fn view(&self) -> MenuView {
-        MenuView {
-            title: self.title(),
-            items: self.items(),
-            selected: self.selected,
-        }
-    }
-}
-
-/// Interactive session state: visuals, the analysis overlay, sensitivity,
-/// and audio. The CLI resolves names and indices before constructing an `App`.
+/// Interactive session state: the scene, the in-memory config, the analysis
+/// overlay, and live audio. Menu edits change the config in place, mark it
+/// dirty, and are debounced to disk; the state file is written when the scene
+/// changes and on exit.
 pub struct App {
     scene: usize,
-    palette: usize,
+    config: config::Config,
+    config_dirty: bool,
+    config_touched: Option<Instant>,
+    save_errors: Vec<String>,
+    config_path: PathBuf,
+    state_path: Option<PathBuf>,
     analysis: bool,
-    menu: Option<Menu>,
-    sensitivity: f32,
+    menu: Option<menu::Menu>,
     demo: bool,
     capture: Option<audio::Capture>,
-    capture_config: audio::CaptureConfig,
     audio: audio::AudioState,
     bands: [f32; 32],
     reactivity: visuals::Reactivity,
+    pages: Vec<menu::Page>,
 }
 
 impl App {
-    /// Start a session, opening live audio unless `demo` is set.
     pub fn new(options: Options) -> Self {
         let mut app = Self {
             scene: options.scene,
-            palette: options.palette,
+            config: options.config,
+            config_dirty: false,
+            config_touched: None,
+            save_errors: Vec::new(),
+            config_path: options.config_path,
+            state_path: options.state_path,
             analysis: false,
             menu: None,
-            sensitivity: options.sensitivity,
             demo: options.demo,
             capture: None,
-            capture_config: options.capture,
             audio: audio::AudioState::default(),
             bands: [0.0; 32],
             reactivity: visuals::Reactivity::default(),
+            pages: Vec::new(),
         };
+        app.rebuild_pages();
         if !app.demo {
             app.connect();
         }
@@ -148,24 +115,28 @@ impl App {
                 .map(audio::Capture::snapshot)
                 .unwrap_or_default()
         };
-        let gain = self.sensitivity;
+        let gain = self.config.appearance.sensitivity;
         self.bands = self.audio.bands.map(|band| (band * gain).clamp(0.0, 1.0));
         self.reactivity = reactivity(&self.audio, gain);
+        let menu = self.menu.as_ref().map(|menu| menu.view(&self.pages));
         View {
             scene: self.scene,
-            palette: self.palette,
+            palette: self.palette_index(),
             bands: &self.bands,
             reactivity: &self.reactivity,
             analysis: self.analysis,
-            menu: self.menu.as_ref().map(Menu::view),
+            menu,
+            fps: self.config.appearance.fps,
+            color_depth: self.color_depth(),
+            glyphs: self.glyphs(),
+            follow_theme: self.config.appearance.follow_theme,
             audio: &self.audio,
             sensitivity: gain,
         }
     }
 
-    /// Apply a key press. Only press events are considered; key releases and
-    /// repeats are ignored. A popup owns the keyboard until it closes, apart
-    /// from quit shortcuts, which always work.
+    /// Apply a key press. Only press events are considered. The menu owns the
+    /// keyboard while open; quit shortcuts always work.
     pub fn handle_key(&mut self, key: KeyEvent) -> Flow {
         if key.kind != KeyEventKind::Press {
             return Flow::Continue;
@@ -173,40 +144,30 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Flow::Quit;
         }
-        if let Some(mut active) = self.menu.take() {
-            match key.code {
-                KeyCode::Esc => {}
-                KeyCode::Char('q') => return Flow::Quit,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    active.step(-1);
-                    self.menu = Some(active);
+        if self.menu.is_some() {
+            let effect = self
+                .menu
+                .as_mut()
+                .expect("menu checked above")
+                .handle_key(key, &self.pages);
+            match effect {
+                menu::Effect::Quit => return Flow::Quit,
+                menu::Effect::CloseMenu => {
+                    self.menu = None;
+                    self.flush_config();
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    active.step(1);
-                    self.menu = Some(active);
+                menu::Effect::OpenAnalysis => {
+                    self.menu = None;
+                    self.analysis = true;
                 }
-                KeyCode::Enter => match active.kind {
-                    MenuKind::Root => match active.selected {
-                        0 => {
-                            self.menu = Some(Menu {
-                                kind: MenuKind::Scenes,
-                                selected: self.scene,
-                            });
-                        }
-                        1 => {
-                            self.menu = Some(Menu {
-                                kind: MenuKind::Palettes,
-                                selected: self.palette,
-                            });
-                        }
-                        2 => self.analysis = true,
-                        _ => {}
-                    },
-                    MenuKind::Scenes => self.scene = active.selected,
-                    MenuKind::Palettes => self.palette = active.selected,
-                },
-                _ => self.menu = Some(active),
+                menu::Effect::SelectScene(scene) => {
+                    self.menu = None;
+                    self.set_scene(scene);
+                }
+                menu::Effect::Changed { id, value } => self.apply_change(id, &value),
+                menu::Effect::None => {}
             }
+            self.rebuild_pages();
             return Flow::Continue;
         }
         if self.analysis {
@@ -219,32 +180,236 @@ impl App {
         }
         match key.code {
             KeyCode::Left | KeyCode::Right => {
-                self.scene = if key.code == KeyCode::Left {
+                let next = if key.code == KeyCode::Left {
                     (self.scene + visuals::SCENES.len() - 1) % visuals::SCENES.len()
                 } else {
                     (self.scene + 1) % visuals::SCENES.len()
                 };
+                self.set_scene(next);
             }
             KeyCode::Char('q') => return Flow::Quit,
             KeyCode::Char('m') => {
-                self.menu = Some(Menu {
-                    kind: MenuKind::Root,
-                    selected: 0,
-                })
+                self.menu = Some(menu::Menu::new());
+                self.rebuild_pages();
             }
             _ => {}
         }
         Flow::Continue
     }
 
-    /// The selected visualisation, for persistence when the session ends.
-    pub fn scene(&self) -> usize {
-        self.scene
+    /// Debounced config write; call once per frame.
+    pub fn maybe_persist(&mut self, now: Instant) {
+        if self.config_dirty {
+            let due = self
+                .config_touched
+                .is_none_or(|touched| now.duration_since(touched) >= CONFIG_DEBOUNCE);
+            if due {
+                self.flush_config();
+            }
+        }
+    }
+
+    /// Flush the config and state before exit; errors are reported afterwards.
+    pub fn flush(&mut self) {
+        self.flush_config();
+        self.save_state();
+    }
+
+    /// Errors accumulated while saving, reported once after terminal restore.
+    pub fn take_save_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.save_errors)
+    }
+
+    fn rebuild_pages(&mut self) {
+        self.pages = menu::build_pages(&self.config, self.scene, self.demo);
+        if let Some(menu) = &mut self.menu {
+            menu.rebuild(&self.pages);
+        }
+    }
+
+    fn palette_index(&self) -> usize {
+        palette::PALETTES
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(&self.config.appearance.palette))
+            .unwrap_or(0)
+    }
+
+    fn color_depth(&self) -> palette::ColorDepth {
+        use clap::ValueEnum;
+        palette::ColorDepth::from_str(&self.config.appearance.color_depth, true)
+            .unwrap_or(palette::ColorDepth::Auto)
+    }
+
+    fn glyphs(&self) -> palette::GlyphMode {
+        use clap::ValueEnum;
+        palette::GlyphMode::from_str(&self.config.appearance.glyphs, true)
+            .unwrap_or(palette::GlyphMode::Auto)
+    }
+
+    fn apply_change(&mut self, id: menu::RowId, value: &str) {
+        use menu::ids;
+        match id {
+            ids::DEMO => {
+                let on = value == "on";
+                if on != self.demo {
+                    self.demo = on;
+                    if on {
+                        self.capture = None;
+                    } else {
+                        self.connect();
+                    }
+                }
+            }
+            ids::SOURCE => {
+                if self.config.audio.source != value {
+                    self.config.audio.source = value.to_owned();
+                    self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::TARGET => {
+                if self.config.audio.target != value {
+                    self.config.audio.target = value.to_owned();
+                    self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::FORMAT => {
+                if self.config.audio.format != value {
+                    self.config.audio.format = value.to_owned();
+                    self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::RATE => {
+                if let Ok(rate) = value.parse::<u32>() {
+                    if (8_000..=192_000).contains(&rate) && rate != self.config.audio.rate {
+                        self.config.audio.rate = rate;
+                        self.mark_config_dirty();
+                        self.connect();
+                    }
+                }
+            }
+            ids::CHANNELS => {
+                if let Ok(channels) = value.parse::<u16>() {
+                    if (1..=32).contains(&channels) && channels != self.config.audio.channels {
+                        self.config.audio.channels = channels;
+                        self.mark_config_dirty();
+                        self.connect();
+                    }
+                }
+            }
+            ids::COMMAND => {
+                if self.config.audio.command != value {
+                    self.config.audio.command = value.to_owned();
+                    self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::FILE => {
+                if self.config.audio.file != value {
+                    self.config.audio.file = value.to_owned();
+                    self.mark_config_dirty();
+                    self.connect();
+                }
+            }
+            ids::LOOP_FILE => {
+                let on = value == "on";
+                if self.config.audio.loop_file != on {
+                    self.config.audio.loop_file = on;
+                    self.mark_config_dirty();
+                }
+            }
+            ids::PALETTE => {
+                if self.config.appearance.palette != value {
+                    self.config.appearance.palette = value.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
+            ids::FOLLOW_THEME => {
+                let on = value == "on";
+                if self.config.appearance.follow_theme != on {
+                    self.config.appearance.follow_theme = on;
+                    self.mark_config_dirty();
+                }
+            }
+            ids::FPS => {
+                if let Ok(fps) = value.parse::<u32>() {
+                    if (1..=240).contains(&fps) && fps != self.config.appearance.fps {
+                        self.config.appearance.fps = fps;
+                        self.mark_config_dirty();
+                    }
+                }
+            }
+            ids::COLOR_DEPTH => {
+                if self.config.appearance.color_depth != value {
+                    self.config.appearance.color_depth = value.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
+            ids::GLYPHS => {
+                if self.config.appearance.glyphs != value {
+                    self.config.appearance.glyphs = value.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
+            ids::SENSITIVITY => {
+                if let Ok(sensitivity) = value.parse::<f32>() {
+                    if (0.25..=3.0).contains(&sensitivity)
+                        && sensitivity != self.config.appearance.sensitivity
+                    {
+                        self.config.appearance.sensitivity = sensitivity;
+                        self.mark_config_dirty();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn set_scene(&mut self, scene: usize) {
+        self.scene = scene;
+        self.save_state();
+    }
+
+    fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+        self.config_touched = Some(Instant::now());
+    }
+
+    fn flush_config(&mut self) {
+        if !self.config_dirty {
+            return;
+        }
+        if let Err(error) = config::save(&self.config_path, &self.config) {
+            self.save_errors.push(format!(
+                "Could not save config to {}: {error}",
+                self.config_path.display()
+            ));
+        }
+        self.config_dirty = false;
+        self.config_touched = None;
+    }
+
+    fn save_state(&mut self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        let state = state::State {
+            last_scene: visuals::SCENES[self.scene].to_owned(),
+            active_playlist: String::new(),
+        };
+        if let Err(error) = state::save(path, &state) {
+            self.save_errors.push(format!(
+                "Could not save state to {}: {error}",
+                path.display()
+            ));
+        }
     }
 
     fn connect(&mut self) {
         self.capture = None;
-        if let Ok(capture) = audio::Capture::start(self.capture_config.clone()) {
+        if let Ok(capture) = audio::Capture::start(audio::capture_config(&self.config.audio)) {
             self.capture = Some(capture);
         }
     }
@@ -322,27 +487,26 @@ fn reactivity(state: &audio::AudioState, gain: f32) -> visuals::Reactivity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn unreachable_capture() -> audio::CaptureConfig {
-        audio::CaptureConfig {
-            backend: audio::Backend::File(PathBuf::from("/nonexistent/vibe-audio.pcm")),
-            target: None,
-            format: audio::PcmFormat::default(),
-        }
+    fn temp_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vibe-app-{tag}-{}-{unique}", std::process::id()))
     }
 
     fn demo_options() -> Options {
         Options {
             scene: 0,
-            palette: 0,
-            sensitivity: 1.0,
+            config: config::Config::default(),
             demo: true,
-            capture: unreachable_capture(),
+            config_path: std::env::temp_dir().join("vibe-unused-config.toml"),
+            state_path: None,
         }
     }
 
@@ -376,71 +540,97 @@ mod tests {
     fn arrows_walk_the_scene_catalog_with_wraparound() {
         let mut app = demo_app();
         app.handle_key(press(KeyCode::Left));
-        assert_eq!(app.scene(), visuals::SCENES.len() - 1);
+        assert_eq!(app.scene, visuals::SCENES.len() - 1);
         app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.scene(), 0);
+        assert_eq!(app.scene, 0);
         app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.scene(), 1);
+        assert_eq!(app.scene, 1);
     }
 
     #[test]
-    fn menu_navigation_wraps_and_selection_applies_to_the_scene() {
+    fn analysis_is_reached_from_the_root_menu() {
         let mut app = demo_app();
-        assert_eq!(app.handle_key(press(KeyCode::Char('m'))), Flow::Continue);
-        let menu = app.view(0.0).menu.unwrap();
-        assert_eq!(menu.title, "Vibe");
-        assert_eq!(menu.items.len(), 3);
+        app.handle_key(press(KeyCode::Char('m')));
+        let view = app.view(0.0);
+        assert!(view.menu.is_some());
+        assert_eq!(
+            view.menu.as_ref().unwrap().path.last().map(String::as_str),
+            Some("Vibe")
+        );
 
-        app.handle_key(press(KeyCode::Up));
-        assert_eq!(app.view(0.0).menu.unwrap().selected, 2);
-        app.handle_key(press(KeyCode::Down));
-        assert_eq!(app.view(0.0).menu.unwrap().selected, 0);
+        for _ in 0..3 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        let view = app.view(0.0);
+        assert!(view.analysis);
+        assert!(view.menu.is_none());
 
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.view(0.0).analysis);
+    }
+
+    #[test]
+    fn scene_picker_selects_a_scene_and_closes_the_menu() {
+        let mut app = demo_app();
+        app.handle_key(press(KeyCode::Char('m')));
         app.handle_key(press(KeyCode::Enter));
-        let menu = app.view(0.0).menu.unwrap();
-        assert_eq!(menu.title, "Visualisation");
-        assert_eq!(menu.selected, 0);
+        app.handle_key(press(KeyCode::Enter));
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Enter));
-        assert_eq!(app.scene(), 1);
+        assert_eq!(app.scene, 1);
         assert!(app.view(0.0).menu.is_none());
     }
 
     #[test]
-    fn palette_menu_is_reached_from_the_root_and_starts_on_the_active_palette() {
+    fn menu_edits_update_config_in_place() {
         let mut app = demo_app();
         app.handle_key(press(KeyCode::Char('m')));
         app.handle_key(press(KeyCode::Down));
-        app.handle_key(press(KeyCode::Enter));
-        {
-            let view = app.view(0.0);
-            let menu = view.menu.unwrap();
-            assert_eq!(menu.title, "Palette");
-            assert_eq!(menu.selected, view.palette);
-        }
-
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Enter));
-        assert_eq!(app.view(0.0).palette, 1);
+        app.handle_key(press(KeyCode::Right));
+        assert_eq!(app.config.appearance.palette, "Phosphor");
     }
 
     #[test]
-    fn menu_analysis_entry_opens_the_overlay_and_escape_closes_it() {
+    fn demo_toggle_hides_audio_rows() {
         let mut app = demo_app();
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let view = app.view(0.0);
+        let rows = &view.menu.as_ref().unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Demo mode");
+        assert_eq!(rows[0].value, "on");
+    }
+
+    #[test]
+    fn config_and_state_are_written_on_flush() {
+        let dir = temp_dir("flush");
+        let config_path = dir.join("config.toml");
+        let state_path = dir.join("state.toml");
+        let mut app = App::new(Options {
+            scene: 0,
+            config: config::Config::default(),
+            demo: true,
+            config_path: config_path.clone(),
+            state_path: Some(state_path.clone()),
+        });
+
         app.handle_key(press(KeyCode::Char('m')));
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Enter));
-        {
-            let view = app.view(0.0);
-            assert!(view.analysis);
-            assert!(view.menu.is_none());
-        }
-
         app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.scene(), 0);
-        app.handle_key(press(KeyCode::Esc));
-        assert!(!app.view(0.0).analysis);
+        app.flush();
+
+        let (loaded, _) = config::load(&config_path);
+        assert_eq!(loaded.appearance.palette, "Phosphor");
+        let (state, _) = state::load(&state_path, None);
+        assert_eq!(state.last_scene, visuals::SCENES[0]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

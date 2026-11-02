@@ -207,11 +207,9 @@ pub enum Effect {
 /// Render-ready snapshot of the open menu.
 #[derive(Clone, Debug)]
 pub struct MenuView {
-    pub title: String,
     pub path: Vec<String>,
     pub rows: Vec<MenuRowView>,
     pub selected: usize,
-    pub editing: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -272,11 +270,9 @@ impl Menu {
     pub fn view(&self, pages: &[Page]) -> MenuView {
         let Some(page) = self.current_page(pages) else {
             return MenuView {
-                title: String::new(),
                 path: Vec::new(),
                 rows: Vec::new(),
                 selected: 0,
-                editing: false,
             };
         };
         let editing_row = self.editing.as_ref().map(|edit| edit.row);
@@ -301,7 +297,6 @@ impl Menu {
             })
             .collect();
         MenuView {
-            title: page.title.clone(),
             path: page.path.clone(),
             selected: self
                 .last_index
@@ -309,7 +304,6 @@ impl Menu {
                 .copied()
                 .unwrap_or(0)
                 .min(rows.len().saturating_sub(1)),
-            editing: self.editing.is_some(),
             rows,
         }
     }
@@ -637,7 +631,7 @@ fn build_appearance(appearance: &config::AppearanceConfig) -> Page {
                 palette::PALETTES,
                 &appearance.palette,
             ),
-            Row::toggle(ids::FOLLOW_THEME, "Follow theme", appearance.follow_theme),
+            Row::checkbox(ids::FOLLOW_THEME, "Follow theme", appearance.follow_theme),
             Row::number(ids::FPS, "FPS", appearance.fps as f32, FPS_SPEC),
             Row::choice(
                 ids::COLOR_DEPTH,
@@ -686,6 +680,14 @@ mod tests {
 
     fn default_pages(demo: bool) -> Vec<Page> {
         build_pages(&config::Config::default(), 0, demo)
+    }
+
+    fn title(menu: &Menu, pages: &[Page]) -> String {
+        menu.view(pages).path.last().cloned().unwrap_or_default()
+    }
+
+    fn editing(menu: &Menu, pages: &[Page]) -> bool {
+        menu.view(pages).rows.iter().any(|row| row.editing)
     }
 
     #[test]
@@ -743,14 +745,14 @@ mod tests {
         let mut menu = Menu::new();
         let pages = default_pages(false);
         menu.rebuild(&pages);
-        assert_eq!(menu.view(&pages).title, "Vibe");
+        assert_eq!(title(&menu, &pages), "Vibe");
 
         menu.handle_key(press(KeyCode::Down), &pages);
         assert_eq!(menu.handle_key(press(KeyCode::Enter), &pages), Effect::None);
-        assert_eq!(menu.view(&pages).title, "Audio");
+        assert_eq!(title(&menu, &pages), "Audio");
 
         assert_eq!(menu.handle_key(press(KeyCode::Esc), &pages), Effect::None);
-        assert_eq!(menu.view(&pages).title, "Vibe");
+        assert_eq!(title(&menu, &pages), "Vibe");
         assert_eq!(
             menu.handle_key(press(KeyCode::Esc), &pages),
             Effect::CloseMenu
@@ -766,7 +768,7 @@ mod tests {
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
-        assert_eq!(menu.view(&pages).title, "Appearance");
+        assert_eq!(title(&menu, &pages), "Appearance");
         assert_eq!(
             menu.handle_key(press(KeyCode::Right), &pages),
             Effect::Changed {
@@ -833,7 +835,7 @@ mod tests {
             menu.handle_key(press(KeyCode::Down), &pages);
         }
         assert_eq!(menu.handle_key(press(KeyCode::Enter), &pages), Effect::None);
-        assert!(menu.view(&pages).editing);
+        assert!(editing(&menu, &pages));
         menu.handle_key(press(KeyCode::Char('x')), &pages);
         assert_eq!(
             menu.handle_key(press(KeyCode::Enter), &pages),
@@ -842,13 +844,13 @@ mod tests {
                 value: "x".into()
             }
         );
-        assert!(!menu.view(&pages).editing);
+        assert!(!editing(&menu, &pages));
 
         // Cancelling leaves the value untouched.
         menu.handle_key(press(KeyCode::Enter), &pages);
         menu.handle_key(press(KeyCode::Char('y')), &pages);
         assert_eq!(menu.handle_key(press(KeyCode::Esc), &pages), Effect::None);
-        assert!(!menu.view(&pages).editing);
+        assert!(!editing(&menu, &pages));
     }
 
     #[test]
@@ -869,7 +871,7 @@ mod tests {
         let pages = build_pages(&config, 0, false);
         menu.rebuild(&pages);
         let view = menu.view(&pages);
-        assert_eq!(view.title, "Audio");
+        assert_eq!(title(&menu, &pages), "Audio");
         assert!(view.selected < view.rows.len());
         assert_eq!(view.rows[view.selected].label, "File");
     }

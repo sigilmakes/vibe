@@ -72,17 +72,25 @@ vibe --glyphs ascii
 vibe --follow-theme
 ```
 
+## Config
+
+All settings live in a config file and are editable from the in-app menu
+(press `m`). CLI flags seed the in-memory config for the session and are not
+persisted.
+
+Config: `$XDG_CONFIG_HOME/vibe/config.toml`, or
+`~/.config/vibe/config.toml`. Override with `--config PATH`.
+
 ## State
 
 Remembers the last visualiser on normal exit. `--scene` overrides it.
-State: `$XDG_STATE_HOME/vibe/last-scene`, or
-`~/.local/state/vibe/last-scene`.
+State: `$XDG_STATE_HOME/vibe/state.toml`, or
+`~/.local/state/vibe/state.toml`. The pre-state.toml `last-scene` file is
+migrated automatically.
 
 ## Keys
 
 - `←` / `→`: switch visualiser
-- `m`: menu; `Esc`: close
-- `p`: palettes; `?`: controls
-- `+` / `-`: sensitivity
-- `d`: demo; `r`: reconnect audio
+- `m`: open / close menu; `Esc`: back / close
+- `↑` / `↓`, `Enter`: navigate and edit menu entries
 - `q` / `Ctrl-C`: quit
