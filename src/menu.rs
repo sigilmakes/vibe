@@ -1569,4 +1569,156 @@ mod tests {
         assert!(view.selected < view.rows.len());
         assert_eq!(view.rows[view.selected].label, "File");
     }
+
+    fn config_with_playlists() -> config::Config {
+        let mut config = config::Config::default();
+        config.playlists = vec![
+            config::Playlist {
+                name: "Chill".into(),
+                scenes: vec!["Julia".into(), "Waveform Scope".into()],
+            },
+            config::Playlist {
+                name: "Empty".into(),
+                scenes: vec![],
+            },
+        ];
+        config
+    }
+
+    #[test]
+    fn playlists_page_lists_playlists_and_the_empty_state() {
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "Chill", "");
+        let playlists = find_page(&pages, PageId::Playlists).unwrap();
+        let labels: Vec<&str> = playlists
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(labels, ["New playlist", "* Chill", "Empty"]);
+        let values: Vec<&str> = playlists
+            .visible_rows()
+            .map(|row| row.value.as_str())
+            .collect();
+        assert_eq!(values[1], "2 scenes");
+        assert_eq!(values[2], "0 scenes");
+
+        let empty = build_pages(&config::Config::default(), 0, false, "", "");
+        let playlists = find_page(&empty, PageId::Playlists).unwrap();
+        let labels: Vec<&str> = playlists
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(labels, ["New playlist", "No playlists yet"]);
+    }
+
+    #[test]
+    fn playlist_page_has_name_active_scenes_and_actions() {
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "Chill", "");
+        let page = find_page(&pages, PageId::Playlist("Chill".into())).unwrap();
+        let labels: Vec<&str> = page.visible_rows().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Name",
+                "Active",
+                "1. Julia",
+                "2. Waveform Scope",
+                "Add current scene",
+                "Remove selected",
+                "Move up",
+                "Move down",
+                "Delete playlist…",
+            ]
+        );
+        let active = page
+            .visible_rows()
+            .find(|row| row.id == ids::PLAYLIST_ACTIVE)
+            .unwrap();
+        assert_eq!(active.value, "on");
+        let scene_rows: Vec<&Row> = page
+            .visible_rows()
+            .filter(|row| row.kind == RowKind::Action && !row.value.is_empty())
+            .collect();
+        assert_eq!(scene_rows.len(), 2);
+        assert_eq!(scene_rows[0].id, ids::playlist_scene("Chill", "Julia"));
+        assert_eq!(scene_rows[1].value, "Waveform Scope");
+    }
+
+    #[test]
+    fn confirm_delete_page_prompts_and_offers_delete_and_cancel() {
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "", "");
+        let page = find_page(&pages, PageId::ConfirmDelete("Chill".into())).unwrap();
+        let labels: Vec<&str> = page.visible_rows().map(|row| row.label.as_str()).collect();
+        assert_eq!(labels, ["Delete \"Chill\"?", "Delete", "Cancel"]);
+        assert!(page.visible_rows().any(|row| row.id == ids::CONFIRM_DELETE));
+        assert!(page.visible_rows().any(|row| row.id == ids::CONFIRM_CANCEL));
+    }
+
+    #[test]
+    fn playlist_scene_selection_maps_back_to_index_and_follows_reorder() {
+        let mut menu = Menu::new();
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "Chill", "");
+        menu.rebuild(&pages);
+        menu.handle_key(press(KeyCode::Enter), &pages); // Scenes
+        menu.handle_key(press(KeyCode::Down), &pages);
+        menu.handle_key(press(KeyCode::Down), &pages); // Playlists…
+        menu.handle_key(press(KeyCode::Enter), &pages); // Playlists
+        menu.handle_key(press(KeyCode::Down), &pages); // * Chill
+        menu.handle_key(press(KeyCode::Enter), &pages); // Chill page
+        assert_eq!(menu.current_playlist(), Some("Chill"));
+        menu.handle_key(press(KeyCode::Down), &pages); // Active
+        menu.handle_key(press(KeyCode::Down), &pages); // 1. Julia
+        assert_eq!(menu.selected_playlist_scene(&pages), Some(0));
+        assert_eq!(
+            menu.handle_key(press(KeyCode::Right), &pages),
+            Effect::MoveSelectedScene(1)
+        );
+        // The row id is keyed by scene name, so the selection still points at
+        // Julia even though the app has not reordered the page here.
+        assert_eq!(menu.selected_playlist_scene(&pages), Some(0));
+    }
+
+    #[test]
+    fn rename_page_updates_every_page_in_the_stack() {
+        let mut menu = Menu::new();
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "", "");
+        menu.rebuild(&pages);
+        menu.handle_key(press(KeyCode::Enter), &pages); // Scenes
+        menu.handle_key(press(KeyCode::Down), &pages);
+        menu.handle_key(press(KeyCode::Down), &pages); // Playlists…
+        menu.handle_key(press(KeyCode::Enter), &pages); // Playlists
+        menu.handle_key(press(KeyCode::Down), &pages); // Chill
+        menu.handle_key(press(KeyCode::Enter), &pages); // Chill page
+        menu.rename_page(
+            PageId::Playlist("Chill".into()),
+            PageId::Playlist("Relax".into()),
+        );
+        assert_eq!(menu.current_playlist(), Some("Relax"));
+    }
+
+    #[test]
+    fn back_to_and_open_page_manage_the_stack() {
+        let mut menu = Menu::new();
+        let config = config_with_playlists();
+        let pages = build_pages(&config, 0, false, "", "");
+        menu.rebuild(&pages);
+        menu.handle_key(press(KeyCode::Enter), &pages); // Scenes
+        menu.handle_key(press(KeyCode::Down), &pages);
+        menu.handle_key(press(KeyCode::Down), &pages); // Playlists…
+        menu.handle_key(press(KeyCode::Enter), &pages); // Playlists
+        menu.handle_key(press(KeyCode::Down), &pages); // Chill
+        menu.handle_key(press(KeyCode::Enter), &pages); // Chill page
+        menu.back_to(PageId::Playlists);
+        assert_eq!(menu.stack.last().cloned(), Some(PageId::Playlists));
+
+        menu.open_page(PageId::Playlist("Empty".into()));
+        assert_eq!(
+            menu.stack.last().cloned(),
+            Some(PageId::Playlist("Empty".into()))
+        );
+    }
 }

@@ -1088,4 +1088,215 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.handle_key(ctrl_c), Flow::Quit);
     }
+
+    fn open_playlists(app: &mut App) {
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Enter)); // Scenes
+        app.handle_key(press(KeyCode::Down)); // Filter…
+        app.handle_key(press(KeyCode::Down)); // Playlists…
+        app.handle_key(press(KeyCode::Enter)); // Playlists page
+    }
+
+    #[test]
+    fn creating_a_playlist_pushes_a_unique_named_empty_playlist() {
+        let mut app = demo_app();
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Enter)); // New playlist
+        assert_eq!(app.config.playlists.len(), 1);
+        assert_eq!(app.config.playlists[0].name, "Playlist 1");
+        assert!(app.config.playlists[0].scenes.is_empty());
+        let view = app.view(0.0);
+        let menu = view.menu.as_ref().unwrap();
+        assert_eq!(menu.path.last().map(String::as_str), Some("Playlist 1"));
+
+        app.handle_key(press(KeyCode::Esc)); // back to Playlists
+        app.handle_key(press(KeyCode::Enter)); // New playlist again
+        assert_eq!(app.config.playlists[1].name, "Playlist 2");
+    }
+
+    #[test]
+    fn renaming_a_playlist_updates_its_name_and_the_active_reference() {
+        let mut options = demo_options();
+        options.config.playlists = vec![config::Playlist {
+            name: "A".into(),
+            scenes: vec![],
+        }];
+        options.active_playlist = "A".into();
+        let mut app = App::new(options);
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Down)); // A
+        app.handle_key(press(KeyCode::Enter)); // A page
+        app.handle_key(press(KeyCode::Enter)); // begin editing Name
+        app.handle_key(press(KeyCode::Backspace)); // clear "A"
+        for ch in "Chill".chars() {
+            app.handle_key(press(KeyCode::Char(ch)));
+        }
+        app.handle_key(press(KeyCode::Enter)); // commit
+        assert_eq!(app.config.playlists[0].name, "Chill");
+        assert_eq!(app.active_playlist, "Chill");
+    }
+
+    #[test]
+    fn renaming_to_an_existing_name_is_rejected() {
+        let mut options = demo_options();
+        options.config.playlists = vec![
+            config::Playlist {
+                name: "A".into(),
+                scenes: vec![],
+            },
+            config::Playlist {
+                name: "B".into(),
+                scenes: vec![],
+            },
+        ];
+        let mut app = App::new(options);
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Down)); // A
+        app.handle_key(press(KeyCode::Enter)); // A page
+        app.handle_key(press(KeyCode::Enter)); // edit Name
+        app.handle_key(press(KeyCode::Backspace)); // clear "A"
+        app.handle_key(press(KeyCode::Char('B')));
+        app.handle_key(press(KeyCode::Enter)); // commit -> rejected
+        assert_eq!(app.config.playlists[0].name, "A");
+        assert_eq!(app.config.playlists[1].name, "B");
+    }
+
+    #[test]
+    fn toggling_active_sets_and_clears_the_active_playlist() {
+        let mut options = demo_options();
+        options.config.playlists = vec![config::Playlist {
+            name: "A".into(),
+            scenes: vec![],
+        }];
+        let mut app = App::new(options);
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Down)); // A
+        app.handle_key(press(KeyCode::Enter)); // A page
+        app.handle_key(press(KeyCode::Down)); // Active
+        app.handle_key(press(KeyCode::Enter)); // set active
+        assert_eq!(app.active_playlist, "A");
+        app.handle_key(press(KeyCode::Enter)); // clear active
+        assert_eq!(app.active_playlist, "");
+    }
+
+    #[test]
+    fn adding_the_current_scene_appends_it_once() {
+        let mut app = demo_app();
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Enter)); // New playlist
+        app.handle_key(press(KeyCode::Down)); // Active
+        app.handle_key(press(KeyCode::Down)); // Add current scene
+        app.handle_key(press(KeyCode::Enter)); // add
+        assert_eq!(app.config.playlists[0].scenes, vec![visuals::SCENES[0]]);
+        let view = app.view(0.0);
+        let menu = view.menu.as_ref().unwrap();
+        assert!(!menu.rows.iter().any(|row| row.label == "Add current scene"));
+    }
+
+    #[test]
+    fn removing_the_selected_scene_removes_it() {
+        let mut options = demo_options();
+        options.config.playlists = vec![config::Playlist {
+            name: "A".into(),
+            scenes: vec!["Julia".into()],
+        }];
+        let mut app = App::new(options);
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Down)); // A
+        app.handle_key(press(KeyCode::Enter)); // A page
+        app.handle_key(press(KeyCode::Down)); // Active
+        app.handle_key(press(KeyCode::Down)); // 1. Julia
+        app.handle_key(press(KeyCode::Down)); // Add current scene
+        app.handle_key(press(KeyCode::Down)); // Remove selected
+        app.handle_key(press(KeyCode::Enter)); // remove
+        assert!(app.config.playlists[0].scenes.is_empty());
+    }
+
+    #[test]
+    fn moving_a_scene_reorders_and_selection_follows() {
+        let mut options = demo_options();
+        options.config.playlists = vec![config::Playlist {
+            name: "A".into(),
+            scenes: vec!["Julia".into(), "Waveform Scope".into()],
+        }];
+        let mut app = App::new(options);
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Down)); // A
+        app.handle_key(press(KeyCode::Enter)); // A page
+        app.handle_key(press(KeyCode::Down)); // Active
+        app.handle_key(press(KeyCode::Down)); // 1. Julia
+        app.handle_key(press(KeyCode::Right)); // move down
+        assert_eq!(
+            app.config.playlists[0].scenes,
+            vec!["Waveform Scope", "Julia"]
+        );
+        assert_eq!(app.selected_playlist_scene(), Some(1));
+        let view = app.view(0.0);
+        let menu = view.menu.as_ref().unwrap();
+        assert_eq!(menu.rows[menu.selected].label, "2. Julia");
+    }
+
+    #[test]
+    fn playlist_edits_persist_to_config_and_state() {
+        let dir = temp_dir("playlist-persist");
+        let config_path = dir.join("config.toml");
+        let state_path = dir.join("state.toml");
+        let mut app = App::new(Options {
+            scene: 0,
+            config: config::Config::default(),
+            demo: true,
+            config_path: config_path.clone(),
+            state_path: Some(state_path.clone()),
+            active_playlist: String::new(),
+        });
+        open_playlists(&mut app);
+        app.handle_key(press(KeyCode::Enter)); // New playlist
+        app.handle_key(press(KeyCode::Down)); // Active
+        app.handle_key(press(KeyCode::Down)); // Add current scene
+        app.handle_key(press(KeyCode::Enter)); // add current scene
+        app.handle_key(press(KeyCode::Up)); // back to Active
+        app.handle_key(press(KeyCode::Enter)); // set active
+        app.flush();
+
+        let (loaded, _) = config::load(&config_path);
+        assert_eq!(loaded.playlists, app.config.playlists);
+        let (state, _) = state::load(&state_path, None);
+        assert_eq!(state.active_playlist, "Playlist 1");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn playlist_data_is_normalised_on_startup() {
+        let mut options = demo_options();
+        options.config.playlists = vec![
+            config::Playlist {
+                name: "  Chill  ".into(),
+                scenes: vec!["julia".into(), "JULIA".into(), "missing scene".into()],
+            },
+            config::Playlist {
+                name: "chill".into(),
+                scenes: vec![],
+            },
+            config::Playlist {
+                name: "  ".into(),
+                scenes: vec![],
+            },
+        ];
+        options.active_playlist = "chill".into();
+        let app = App::new(options);
+        assert_eq!(app.config.playlists.len(), 1);
+        assert_eq!(app.config.playlists[0].name, "Chill");
+        assert_eq!(app.config.playlists[0].scenes, vec!["Julia"]);
+        assert_eq!(app.active_playlist, "Chill");
+
+        // A missing active playlist is cleared on startup.
+        let mut options = demo_options();
+        options.config.playlists = vec![config::Playlist {
+            name: "Chill".into(),
+            scenes: vec![],
+        }];
+        options.active_playlist = "Missing".into();
+        let app = App::new(options);
+        assert_eq!(app.active_playlist, "");
+    }
 }

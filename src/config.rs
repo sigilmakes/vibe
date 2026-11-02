@@ -289,6 +289,32 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn playlists_roundtrip_and_fill_in_defaults() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-config-playlists-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        let path = directory.join("vibe/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[[playlists]]\nname = \"Chill\"\nscenes = [\"Julia\", \"Waveform Scope\"]\n",
+        )
+        .unwrap();
+        let (loaded, warnings) = load(&path);
+        assert!(warnings.is_empty());
+        assert_eq!(loaded.playlists.len(), 1);
+        assert_eq!(loaded.playlists[0].name, "Chill");
+        assert_eq!(
+            loaded.playlists[0].scenes,
+            vec!["Julia".to_owned(), "Waveform Scope".to_owned()]
+        );
+        assert_eq!(loaded.audio, AudioConfig::default());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn unique() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
