@@ -31,6 +31,14 @@ nix profile add git+https://tangled.org/sigilzero.dev/vibe
 vibe
 ```
 
+## Development
+
+```sh
+nix develop
+cargo test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+```
 
 ## Usage
 
