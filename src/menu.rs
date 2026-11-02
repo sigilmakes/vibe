@@ -63,6 +63,9 @@ pub mod ids {
     pub const FILTER_MATCHES: RowId = RowId::new(14);
     pub const TAGS_CLEAR: RowId = RowId::new(15);
 
+    pub const SEARCH: RowId = RowId::new(16);
+    pub const NO_MATCHES: RowId = RowId::new(17);
+
     pub const TAG_BASE: u64 = 2000;
 
     pub const fn tag(index: usize) -> RowId {
@@ -249,6 +252,7 @@ pub struct Menu {
     selected: Vec<RowId>,
     last_index: Vec<usize>,
     editing: Option<TextEdit>,
+    search: String,
 }
 
 impl Menu {
@@ -258,7 +262,17 @@ impl Menu {
             selected: vec![ids::SCENES],
             last_index: vec![0],
             editing: None,
+            search: String::new(),
         }
+    }
+
+    /// The scene picker's session-local search query (not persisted).
+    pub fn search(&self) -> &str {
+        &self.search
+    }
+
+    pub fn set_search(&mut self, value: String) {
+        self.search = value;
     }
 
     /// Re-clamp the selection after pages change, following stable row ids and
@@ -364,6 +378,7 @@ impl Menu {
                 }
                 KeyCode::Char('m') => Effect::CloseMenu,
                 KeyCode::Char('q') => Effect::Quit,
+                KeyCode::Char('/') => self.start_search_edit(pages),
                 KeyCode::Char('f') => self.toggle_favourite(pages),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.move_selection(-1, pages);
@@ -427,6 +442,26 @@ impl Menu {
         } else {
             self.step_row(direction, pages)
         }
+    }
+
+    /// `/` begins editing the picker's search row, keeping the current query.
+    fn start_search_edit(&mut self, pages: &[Page]) -> Effect {
+        if self
+            .current_page(pages)
+            .is_some_and(|page| page.id != PageId::ScenePicker)
+        {
+            return Effect::None;
+        }
+        let Some(page) = self.current_page(pages) else {
+            return Effect::None;
+        };
+        if page.rows.iter().any(|row| row.id == ids::SEARCH) {
+            self.editing = Some(TextEdit {
+                row: ids::SEARCH,
+                buffer: self.search.clone(),
+            });
+        }
+        Effect::None
     }
 
     /// `f` toggles the favourite flag for the selected scene row.
@@ -613,12 +648,12 @@ fn is_pipewire_or_pulse_or_auto(source: &str) -> bool {
 }
 
 /// Build all pages from the current config, scene, and session state.
-pub fn build_pages(config: &config::Config, scene: usize, demo: bool) -> Vec<Page> {
+pub fn build_pages(config: &config::Config, scene: usize, demo: bool, search: &str) -> Vec<Page> {
     let scene_name = visuals::SCENES.get(scene).copied().unwrap_or_default();
     vec![
         build_root(),
         build_scenes(&config.scenes, scene_name),
-        build_scene_picker(&config.scenes, scene),
+        build_scene_picker(&config.scenes, scene, search),
         build_filter(&config.scenes),
         build_tags(&config.scenes),
         build_audio(&config.audio, demo),
@@ -695,13 +730,22 @@ fn scene_filtered(scenes: &config::ScenesConfig, scene: usize) -> bool {
     }
 }
 
-fn build_scene_picker(scenes: &config::ScenesConfig, scene: usize) -> Page {
+/// Whether a scene passes the filter and the picker's search query.
+fn scene_matches(scenes: &config::ScenesConfig, scene: usize, search: &str) -> bool {
+    let name = visuals::SCENES[scene];
+    let search_ok = search.is_empty() || name.to_lowercase().contains(&search.to_lowercase());
+    search_ok && scene_filtered(scenes, scene)
+}
+
+fn build_scene_picker(scenes: &config::ScenesConfig, scene: usize, search: &str) -> Page {
     let filtered: Vec<usize> = (0..visuals::SCENES.len())
-        .filter(|&index| scene_filtered(scenes, index))
+        .filter(|&index| scene_matches(scenes, index, search))
         .collect();
-    let rows: Vec<Row> = filtered
-        .iter()
-        .map(|&index| {
+    let mut rows = vec![Row::text(ids::SEARCH, "Search", search)];
+    if filtered.is_empty() {
+        rows.push(Row::readonly(ids::NO_MATCHES, "No scenes match", ""));
+    } else {
+        for &index in &filtered {
             let name = visuals::SCENES[index];
             let mut label = String::new();
             if index == scene {
@@ -715,9 +759,9 @@ fn build_scene_picker(scenes: &config::ScenesConfig, scene: usize) -> Page {
                 label.push_str("* ");
             }
             label.push_str(name);
-            Row::action(ids::scene(index), &label)
-        })
-        .collect();
+            rows.push(Row::action(ids::scene(index), &label));
+        }
+    }
     let initial = if filtered.contains(&scene) {
         Some(ids::scene(scene))
     } else {
@@ -889,7 +933,7 @@ mod tests {
     }
 
     fn default_pages(demo: bool) -> Vec<Page> {
-        build_pages(&config::Config::default(), 0, demo)
+        build_pages(&config::Config::default(), 0, demo, "")
     }
 
     fn title(menu: &Menu, pages: &[Page]) -> String {
@@ -912,23 +956,25 @@ mod tests {
     }
 
     #[test]
-    fn scene_picker_lists_every_scene_and_starts_on_current() {
-        let pages = build_pages(&config::Config::default(), 7, false);
+    fn scene_picker_lists_every_scene_with_search_and_starts_on_current() {
+        let pages = build_pages(&config::Config::default(), 7, false, "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
-        assert_eq!(picker.rows.len(), visuals::SCENES.len());
+        assert_eq!(picker.rows.len(), visuals::SCENES.len() + 1);
+        assert_eq!(picker.rows[0].id, ids::SEARCH);
         assert_eq!(picker.initial, Some(ids::scene(7)));
     }
 
     #[test]
-    fn scene_picker_filters_by_mode_favourites_and_tags() {
+    fn scene_picker_filters_by_mode_favourites_tags_and_search() {
         // Favourites mode keeps only favourited scenes.
         let mut config = config::Config::default();
         config.scenes.filter = "favourites".into();
         config.scenes.favourites = vec!["Julia".into(), "Missing Scene".into()];
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         let labels: Vec<&str> = picker
             .visible_rows()
+            .filter(|row| row.id != ids::SEARCH)
             .map(|row| row.label.as_str())
             .collect();
         assert_eq!(labels, ["* Julia"]);
@@ -937,21 +983,25 @@ mod tests {
         config.scenes.filter = "tags".into();
         config.scenes.filter_tags.clear();
         config.scenes.favourites.clear();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
-        assert_eq!(picker.rows.len(), visuals::SCENES.len());
+        assert_eq!(picker.rows.len(), visuals::SCENES.len() + 1);
 
-        // Tags mode matches any selected tag.
+        // Tags mode matches any selected tag; search narrows case-insensitively.
         config.scenes.filter_tags = vec!["fractal".into()];
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "julia");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         let labels: Vec<&str> = picker
             .visible_rows()
+            .filter(|row| row.id != ids::SEARCH)
             .map(|row| row.label.as_str())
             .collect();
-        assert!(labels.contains(&"Julia"));
-        assert!(labels.contains(&"Mandelbrot"));
-        assert!(!labels.contains(&"Spectral Flower"));
+        assert_eq!(labels, ["Julia"]);
+
+        // A search with no matches shows the read-only placeholder row.
+        let pages = build_pages(&config, 0, false, "zzzz");
+        let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+        assert!(picker.visible_rows().any(|row| row.id == ids::NO_MATCHES));
     }
 
     #[test]
@@ -959,7 +1009,7 @@ mod tests {
         let mut config = config::Config::default();
         config.scenes.filter = "tags".into();
         config.scenes.filter_tags = vec!["fractal".into(), "particles".into()];
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let filter = find_page(&pages, PageId::Filter).unwrap();
         let tags = filter
             .visible_rows()
@@ -977,7 +1027,7 @@ mod tests {
 
         // Tags submenu is hidden outside tags mode.
         config.scenes.filter = "all".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let filter = find_page(&pages, PageId::Filter).unwrap();
         assert!(!filter.visible_rows().any(|row| row.id == ids::FILTER_TAGS));
     }
@@ -985,7 +1035,7 @@ mod tests {
     #[test]
     fn tags_page_has_a_checkbox_per_tag_and_clear_when_selected() {
         let mut config = config::Config::default();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let tags = find_page(&pages, PageId::Tags).unwrap();
         assert_eq!(
             tags.visible_rows().count(),
@@ -995,7 +1045,7 @@ mod tests {
         assert!(tags.visible_rows().all(|row| row.kind == RowKind::Checkbox));
 
         config.scenes.filter_tags = vec!["calm".into()];
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let tags = find_page(&pages, PageId::Tags).unwrap();
         let clear = tags.visible_rows().find(|row| row.id == ids::TAGS_CLEAR);
         assert!(clear.is_some());
@@ -1006,7 +1056,7 @@ mod tests {
     fn audio_page_hides_rows_that_do_not_apply_to_the_source() {
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
         assert!(visible.contains(&ids::SOURCE));
@@ -1017,7 +1067,7 @@ mod tests {
 
         let mut config = config::Config::default();
         config.audio.source = "file".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
         assert!(visible.contains(&ids::FILE));
@@ -1081,7 +1131,7 @@ mod tests {
     fn choice_rows_cycle_and_report_changed() {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Down), &pages);
@@ -1097,7 +1147,7 @@ mod tests {
 
         // The app applies the change and rebuilds before the next key.
         config.appearance.palette = "Phosphor".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         menu.rebuild(&pages);
         assert_eq!(
             menu.handle_key(press(KeyCode::Left), &pages),
@@ -1145,7 +1195,7 @@ mod tests {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
@@ -1176,7 +1226,7 @@ mod tests {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
@@ -1186,7 +1236,7 @@ mod tests {
         assert_eq!(menu.view(&pages).rows[5].label, "Command");
 
         config.audio.source = "file".into();
-        let pages = build_pages(&config, 0, false);
+        let pages = build_pages(&config, 0, false, "");
         menu.rebuild(&pages);
         let view = menu.view(&pages);
         assert_eq!(title(&menu, &pages), "Audio");

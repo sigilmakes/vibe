@@ -234,7 +234,12 @@ impl App {
     }
 
     fn rebuild_pages(&mut self) {
-        self.pages = menu::build_pages(&self.config, self.scene, self.demo);
+        let search = self
+            .menu
+            .as_ref()
+            .map(menu::Menu::search)
+            .unwrap_or_default();
+        self.pages = menu::build_pages(&self.config, self.scene, self.demo, search);
         if let Some(menu) = &mut self.menu {
             menu.rebuild(&self.pages);
         }
@@ -402,6 +407,11 @@ impl App {
                 if self.config.scenes.filter != mode {
                     self.config.scenes.filter = mode.to_owned();
                     self.mark_config_dirty();
+                }
+            }
+            ids::SEARCH => {
+                if let Some(menu) = &mut self.menu {
+                    menu.set_search(value.to_owned());
                 }
             }
             _ => {}
