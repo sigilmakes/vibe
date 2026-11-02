@@ -56,6 +56,18 @@ pub mod ids {
     pub const fn scene(index: usize) -> RowId {
         RowId::new(SCENE_BASE + index as u64)
     }
+
+    pub const FILTER: RowId = RowId::new(11);
+    pub const FILTER_MODE: RowId = RowId::new(12);
+    pub const FILTER_TAGS: RowId = RowId::new(13);
+    pub const FILTER_MATCHES: RowId = RowId::new(14);
+    pub const TAGS_CLEAR: RowId = RowId::new(15);
+
+    pub const TAG_BASE: u64 = 2000;
+
+    pub const fn tag(index: usize) -> RowId {
+        RowId::new(TAG_BASE + index as u64)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +95,8 @@ pub enum PageId {
     Root,
     Scenes,
     ScenePicker,
+    Filter,
+    Tags,
     Audio,
     Appearance,
     Controls,
@@ -201,6 +215,8 @@ pub enum Effect {
     CloseMenu,
     OpenAnalysis,
     SelectScene(usize),
+    ToggleFavourite(usize),
+    ClearTags,
     Changed { id: RowId, value: String },
 }
 
@@ -348,6 +364,7 @@ impl Menu {
                 }
                 KeyCode::Char('m') => Effect::CloseMenu,
                 KeyCode::Char('q') => Effect::Quit,
+                KeyCode::Char('f') => self.toggle_favourite(pages),
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.move_selection(-1, pages);
                     Effect::None
@@ -409,6 +426,23 @@ impl Menu {
             Effect::None
         } else {
             self.step_row(direction, pages)
+        }
+    }
+
+    /// `f` toggles the favourite flag for the selected scene row.
+    fn toggle_favourite(&self, pages: &[Page]) -> Effect {
+        if self
+            .current_page(pages)
+            .is_some_and(|page| page.id != PageId::ScenePicker)
+        {
+            return Effect::None;
+        }
+        let Some(row) = self.selected_row(pages) else {
+            return Effect::None;
+        };
+        match scene_index(row.id) {
+            Some(index) => Effect::ToggleFavourite(index),
+            None => Effect::None,
         }
     }
 
@@ -479,6 +513,8 @@ impl Menu {
             RowKind::Action => {
                 if id == ids::ANALYSIS {
                     Effect::OpenAnalysis
+                } else if id == ids::TAGS_CLEAR {
+                    Effect::ClearTags
                 } else if let Some(index) = scene_index(id) {
                     Effect::SelectScene(index)
                 } else {
@@ -514,6 +550,32 @@ fn find_page(pages: &[Page], id: PageId) -> Option<&Page> {
 fn scene_index(id: RowId) -> Option<usize> {
     let index = id.0.checked_sub(ids::SCENE_BASE)?;
     (index < visuals::SCENES.len() as u64).then_some(index as usize)
+}
+
+/// Inverse of `ids::tag`; only tag checkbox ids round-trip here.
+pub fn tag_index(id: RowId) -> Option<usize> {
+    let index = id.0.checked_sub(ids::TAG_BASE)?;
+    (index < visuals::TAGS.len() as u64).then_some(index as usize)
+}
+
+const FILTER_MODES: &[&str] = &["All", "Favourites", "Tags"];
+
+/// Maps a filter choice's display text to the persisted config string.
+pub fn filter_mode_to_config(display: &str) -> &'static str {
+    match display {
+        "Favourites" => "favourites",
+        "Tags" => "tags",
+        _ => "all",
+    }
+}
+
+/// Maps the persisted filter string to its choice display text.
+pub fn filter_mode_display(config_value: &str) -> &'static str {
+    match config_value {
+        "favourites" => "Favourites",
+        "tags" => "Tags",
+        _ => "All",
+    }
 }
 
 const SOURCES: &[&str] = &["auto", "pipewire", "pulse", "command", "file"];
@@ -555,8 +617,10 @@ pub fn build_pages(config: &config::Config, scene: usize, demo: bool) -> Vec<Pag
     let scene_name = visuals::SCENES.get(scene).copied().unwrap_or_default();
     vec![
         build_root(),
-        build_scenes(scene_name),
-        build_scene_picker(scene),
+        build_scenes(&config.scenes, scene_name),
+        build_scene_picker(&config.scenes, scene),
+        build_filter(&config.scenes),
+        build_tags(&config.scenes),
         build_audio(&config.audio, demo),
         build_appearance(&config.appearance),
         build_controls(),
@@ -579,33 +643,153 @@ fn build_root() -> Page {
     }
 }
 
-fn build_scenes(scene_name: &str) -> Page {
+fn filter_summary(scenes: &config::ScenesConfig) -> String {
+    match scenes.filter.as_str() {
+        "favourites" => "Favourites".to_owned(),
+        "tags" => format!("Tags ({})", scenes.filter_tags.len()),
+        _ => "All".to_owned(),
+    }
+}
+
+fn build_scenes(scenes: &config::ScenesConfig, scene_name: &str) -> Page {
     Page {
         id: PageId::Scenes,
         title: "Scenes".into(),
         path: vec!["Vibe".into(), "Scenes".into()],
-        rows: vec![Row::submenu(
-            ids::CURRENT_SCENE,
-            "Visualisation",
-            scene_name,
-            PageId::ScenePicker,
-        )],
+        rows: vec![
+            Row::submenu(
+                ids::CURRENT_SCENE,
+                "Visualisation",
+                scene_name,
+                PageId::ScenePicker,
+            ),
+            Row::submenu(
+                ids::FILTER,
+                "Filter…",
+                &filter_summary(scenes),
+                PageId::Filter,
+            ),
+        ],
         initial: None,
     }
 }
 
-fn build_scene_picker(scene: usize) -> Page {
-    let rows = visuals::SCENES
-        .iter()
-        .enumerate()
-        .map(|(index, name)| Row::action(ids::scene(index), name))
+/// Whether a scene passes the configured filter (mode and tags only).
+fn scene_filtered(scenes: &config::ScenesConfig, scene: usize) -> bool {
+    let name = visuals::SCENES[scene];
+    match scenes.filter.as_str() {
+        "favourites" => scenes
+            .favourites
+            .iter()
+            .any(|f| f.eq_ignore_ascii_case(name)),
+        "tags" => {
+            scenes.filter_tags.is_empty()
+                || visuals::tags(scene).iter().any(|tag| {
+                    scenes
+                        .filter_tags
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(tag))
+                })
+        }
+        _ => true,
+    }
+}
+
+fn build_scene_picker(scenes: &config::ScenesConfig, scene: usize) -> Page {
+    let filtered: Vec<usize> = (0..visuals::SCENES.len())
+        .filter(|&index| scene_filtered(scenes, index))
         .collect();
+    let rows: Vec<Row> = filtered
+        .iter()
+        .map(|&index| {
+            let name = visuals::SCENES[index];
+            let mut label = String::new();
+            if index == scene {
+                label.push_str("> ");
+            }
+            if scenes
+                .favourites
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name))
+            {
+                label.push_str("* ");
+            }
+            label.push_str(name);
+            Row::action(ids::scene(index), &label)
+        })
+        .collect();
+    let initial = if filtered.contains(&scene) {
+        Some(ids::scene(scene))
+    } else {
+        filtered.first().map(|&index| ids::scene(index))
+    };
     Page {
         id: PageId::ScenePicker,
         title: "Visualisation".into(),
         path: vec!["Vibe".into(), "Scenes".into(), "Visualisation".into()],
         rows,
-        initial: Some(ids::scene(scene)),
+        initial,
+    }
+}
+
+fn build_filter(scenes: &config::ScenesConfig) -> Page {
+    let mut rows = vec![Row::choice(
+        ids::FILTER_MODE,
+        "Mode",
+        FILTER_MODES,
+        filter_mode_display(&scenes.filter),
+    )];
+    if scenes.filter == "tags" {
+        rows.push(Row::submenu(
+            ids::FILTER_TAGS,
+            "Tags",
+            &scenes.filter_tags.len().to_string(),
+            PageId::Tags,
+        ));
+    }
+    let matches = (0..visuals::SCENES.len())
+        .filter(|&scene| scene_filtered(scenes, scene))
+        .count();
+    rows.push(Row::readonly(
+        ids::FILTER_MATCHES,
+        "Matches",
+        &matches.to_string(),
+    ));
+    Page {
+        id: PageId::Filter,
+        title: "Filter".into(),
+        path: vec!["Vibe".into(), "Scenes".into(), "Filter".into()],
+        rows,
+        initial: None,
+    }
+}
+
+fn build_tags(scenes: &config::ScenesConfig) -> Page {
+    let mut rows: Vec<Row> = visuals::TAGS
+        .iter()
+        .enumerate()
+        .map(|(index, tag)| {
+            let on = scenes
+                .filter_tags
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(tag));
+            Row::checkbox(ids::tag(index), tag, on)
+        })
+        .collect();
+    let mut clear = Row::action(ids::TAGS_CLEAR, "Clear tags");
+    clear.visible = !scenes.filter_tags.is_empty();
+    rows.push(clear);
+    Page {
+        id: PageId::Tags,
+        title: "Tags".into(),
+        path: vec![
+            "Vibe".into(),
+            "Scenes".into(),
+            "Filter".into(),
+            "Tags".into(),
+        ],
+        rows,
+        initial: None,
     }
 }
 
@@ -728,11 +912,94 @@ mod tests {
     }
 
     #[test]
-    fn scene_picker_has_one_row_per_scene_and_starts_on_current() {
+    fn scene_picker_lists_every_scene_and_starts_on_current() {
         let pages = build_pages(&config::Config::default(), 7, false);
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         assert_eq!(picker.rows.len(), visuals::SCENES.len());
         assert_eq!(picker.initial, Some(ids::scene(7)));
+    }
+
+    #[test]
+    fn scene_picker_filters_by_mode_favourites_and_tags() {
+        // Favourites mode keeps only favourited scenes.
+        let mut config = config::Config::default();
+        config.scenes.filter = "favourites".into();
+        config.scenes.favourites = vec!["Julia".into(), "Missing Scene".into()];
+        let pages = build_pages(&config, 0, false);
+        let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+        let labels: Vec<&str> = picker
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(labels, ["* Julia"]);
+
+        // Tags mode with no tags behaves as All.
+        config.scenes.filter = "tags".into();
+        config.scenes.filter_tags.clear();
+        config.scenes.favourites.clear();
+        let pages = build_pages(&config, 0, false);
+        let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+        assert_eq!(picker.rows.len(), visuals::SCENES.len());
+
+        // Tags mode matches any selected tag.
+        config.scenes.filter_tags = vec!["fractal".into()];
+        let pages = build_pages(&config, 0, false);
+        let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+        let labels: Vec<&str> = picker
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Julia"));
+        assert!(labels.contains(&"Mandelbrot"));
+        assert!(!labels.contains(&"Spectral Flower"));
+    }
+
+    #[test]
+    fn filter_page_reports_mode_tag_count_and_matches() {
+        let mut config = config::Config::default();
+        config.scenes.filter = "tags".into();
+        config.scenes.filter_tags = vec!["fractal".into(), "particles".into()];
+        let pages = build_pages(&config, 0, false);
+        let filter = find_page(&pages, PageId::Filter).unwrap();
+        let tags = filter
+            .visible_rows()
+            .find(|row| row.id == ids::FILTER_TAGS)
+            .unwrap();
+        assert_eq!(tags.value, "2");
+        let matches = filter
+            .visible_rows()
+            .find(|row| row.id == ids::FILTER_MATCHES)
+            .unwrap();
+        let expected = (0..visuals::SCENES.len())
+            .filter(|&scene| scene_filtered(&config.scenes, scene))
+            .count();
+        assert_eq!(matches.value, expected.to_string());
+
+        // Tags submenu is hidden outside tags mode.
+        config.scenes.filter = "all".into();
+        let pages = build_pages(&config, 0, false);
+        let filter = find_page(&pages, PageId::Filter).unwrap();
+        assert!(!filter.visible_rows().any(|row| row.id == ids::FILTER_TAGS));
+    }
+
+    #[test]
+    fn tags_page_has_a_checkbox_per_tag_and_clear_when_selected() {
+        let mut config = config::Config::default();
+        let pages = build_pages(&config, 0, false);
+        let tags = find_page(&pages, PageId::Tags).unwrap();
+        assert_eq!(
+            tags.visible_rows().count(),
+            visuals::TAGS.len(),
+            "Clear tags is hidden until a tag is selected"
+        );
+        assert!(tags.visible_rows().all(|row| row.kind == RowKind::Checkbox));
+
+        config.scenes.filter_tags = vec!["calm".into()];
+        let pages = build_pages(&config, 0, false);
+        let tags = find_page(&pages, PageId::Tags).unwrap();
+        let clear = tags.visible_rows().find(|row| row.id == ids::TAGS_CLEAR);
+        assert!(clear.is_some());
+        assert_eq!(clear.unwrap().kind, RowKind::Action);
     }
 
     #[test]

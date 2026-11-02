@@ -45,8 +45,6 @@ enum Family {
 }
 
 /// Tag vocabulary shared by every scene. Filters match against these.
-/// Temporary allow: consumed by scene filtering (next commit).
-#[allow(dead_code)]
 pub const TAGS: &[&str] = &[
     "calm",
     "dense",
@@ -121,8 +119,6 @@ struct SceneEntry {
     name: &'static str,
     family: Family,
     local: usize,
-    /// Temporary: consumed by scene filtering (next commit).
-    #[allow(dead_code)]
     tags: &'static [&'static str],
 }
 
@@ -185,8 +181,6 @@ const fn catalog() -> [&'static str; SCENE_COUNT] {
 }
 
 /// Tags assigned to a scene, in `TAGS` order of appearance.
-/// Temporary allow: consumed by scene filtering (next commit).
-#[allow(dead_code)]
 pub fn tags(scene: usize) -> &'static [&'static str] {
     assert!(scene < SCENE_COUNT);
     REGISTRY[scene].tags

@@ -98,6 +98,7 @@ impl App {
             reactivity: visuals::Reactivity::default(),
             pages: Vec::new(),
         };
+        app.prune_scenes();
         app.rebuild_pages();
         if !app.demo {
             app.connect();
@@ -163,6 +164,13 @@ impl App {
                 menu::Effect::SelectScene(scene) => {
                     self.menu = None;
                     self.set_scene(scene);
+                }
+                menu::Effect::ToggleFavourite(index) => self.toggle_favourite(index),
+                menu::Effect::ClearTags => {
+                    if !self.config.scenes.filter_tags.is_empty() {
+                        self.config.scenes.filter_tags.clear();
+                        self.mark_config_dirty();
+                    }
                 }
                 menu::Effect::Changed { id, value } => self.apply_change(id, &value),
                 menu::Effect::None => {}
@@ -253,6 +261,27 @@ impl App {
 
     fn apply_change(&mut self, id: menu::RowId, value: &str) {
         use menu::ids;
+        if let Some(index) = menu::tag_index(id) {
+            let tag = visuals::TAGS[index].to_owned();
+            let on = value == "on";
+            let present = self
+                .config
+                .scenes
+                .filter_tags
+                .iter()
+                .any(|selected| selected == &tag);
+            if on && !present {
+                self.config.scenes.filter_tags.push(tag);
+                self.mark_config_dirty();
+            } else if !on && present {
+                self.config
+                    .scenes
+                    .filter_tags
+                    .retain(|selected| selected != &tag);
+                self.mark_config_dirty();
+            }
+            return;
+        }
         match id {
             ids::DEMO => {
                 let on = value == "on";
@@ -368,8 +397,31 @@ impl App {
                     }
                 }
             }
+            ids::FILTER_MODE => {
+                let mode = menu::filter_mode_to_config(value);
+                if self.config.scenes.filter != mode {
+                    self.config.scenes.filter = mode.to_owned();
+                    self.mark_config_dirty();
+                }
+            }
             _ => {}
         }
+    }
+
+    fn toggle_favourite(&mut self, index: usize) {
+        let name = visuals::SCENES[index];
+        if let Some(position) = self
+            .config
+            .scenes
+            .favourites
+            .iter()
+            .position(|f| f.eq_ignore_ascii_case(name))
+        {
+            self.config.scenes.favourites.remove(position);
+        } else {
+            self.config.scenes.favourites.push(name.to_owned());
+        }
+        self.mark_config_dirty();
     }
 
     fn set_scene(&mut self, scene: usize) {
@@ -382,7 +434,30 @@ impl App {
         self.config_touched = Some(Instant::now());
     }
 
+    /// Drop favourites and filter tags that no longer resolve to a known scene
+    /// or tag, so old or hand-edited configs become clean again.
+    fn prune_scenes(&mut self) {
+        let favourites = self.config.scenes.favourites.len();
+        self.config.scenes.favourites.retain(|name| {
+            visuals::SCENES
+                .iter()
+                .any(|scene| scene.eq_ignore_ascii_case(name))
+        });
+        let tags = self.config.scenes.filter_tags.len();
+        self.config.scenes.filter_tags.retain(|tag| {
+            visuals::TAGS
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(tag))
+        });
+        if self.config.scenes.favourites.len() != favourites
+            || self.config.scenes.filter_tags.len() != tags
+        {
+            self.mark_config_dirty();
+        }
+    }
+
     fn flush_config(&mut self) {
+        self.prune_scenes();
         if !self.config_dirty {
             return;
         }

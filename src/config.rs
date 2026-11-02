@@ -3,15 +3,25 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScenesConfig {
-    /// Placeholder: a filter applied to the scene picker.
+    /// "all", "favourites", or "tags".
     pub filter: String,
-    /// Placeholder: favourited scene names.
+    /// Selected tags when `filter` is "tags".
+    pub filter_tags: Vec<String>,
+    /// Favourited scene names.
     pub favourites: Vec<String>,
-    /// Placeholder: named scene playlists.
-    pub playlists: Vec<String>,
+}
+
+impl Default for ScenesConfig {
+    fn default() -> Self {
+        Self {
+            filter: "all".into(),
+            filter_tags: Vec::new(),
+            favourites: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -245,6 +255,28 @@ mod tests {
         assert_eq!(loaded.audio.rate, 44100);
         assert_eq!(loaded.audio.channels, 2);
         assert_eq!(loaded.appearance, AppearanceConfig::default());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_scenes_config_ignores_the_removed_playlists_field() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-config-legacy-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        let path = directory.join("vibe/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "[scenes]\nfilter = \"favourites\"\nplaylists = [\"A\", \"B\"]\n",
+        )
+        .unwrap();
+        let (loaded, warnings) = load(&path);
+        assert!(warnings.is_empty());
+        assert_eq!(loaded.scenes.filter, "favourites");
+        assert!(loaded.scenes.favourites.is_empty());
+        assert!(loaded.scenes.filter_tags.is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
