@@ -44,6 +44,54 @@ enum Family {
     FractalMath,
 }
 
+/// Tag vocabulary shared by every scene. Filters match against these.
+/// Temporary allow: consumed by scene filtering (next commit).
+#[allow(dead_code)]
+pub const TAGS: &[&str] = &[
+    "calm",
+    "dense",
+    "minimal",
+    "organic",
+    "geometric",
+    "particles",
+    "fractal",
+    "chaotic",
+    "flow",
+    "structure",
+    "bright",
+    "dark",
+];
+
+/// Tags for a scene, chosen per family with a few local special cases for the
+/// original scenes so the vocabulary stays descriptive without per-scene data.
+const fn scene_tags(family: Family, local: usize) -> &'static [&'static str] {
+    match family {
+        Family::Original => match local {
+            0 => &["calm", "organic", "bright"],
+            1 => &["structure", "flow", "minimal"],
+            2 => &["organic", "flow", "calm"],
+            3 => &["bright", "flow", "chaotic"],
+            4 => &["geometric", "structure", "calm"],
+            5 => &["flow", "minimal", "structure"],
+            _ => &["particles", "chaotic", "organic"],
+        },
+        Family::Glyphs => &["minimal", "structure", "geometric"],
+        Family::Sculptures => &["structure", "geometric", "minimal"],
+        Family::Flocks => &["particles", "flow", "organic"],
+        Family::Spectrum => &["structure", "bright", "flow"],
+        Family::Fractals => &["fractal", "dense", "structure"],
+        Family::Chaos => &["chaotic", "flow", "dark"],
+        Family::Curves => &["flow", "minimal", "calm"],
+        Family::Waves => &["flow", "calm", "structure"],
+        Family::Cells => &["structure", "dense", "organic"],
+        Family::Geometry => &["geometric", "structure", "minimal"],
+        Family::Particles => &["particles", "flow", "chaotic"],
+        Family::Typography => &["structure", "minimal", "geometric"],
+        Family::Organic => &["organic", "flow", "calm"],
+        Family::FractalMath => &["fractal", "dense", "structure"],
+    }
+}
+
 /// Original scenes first, grouped by the renderer that owns them.
 const ORIGINAL_FAMILIES: [(Family, usize); 7] = [
     (Family::Original, 7),
@@ -73,6 +121,9 @@ struct SceneEntry {
     name: &'static str,
     family: Family,
     local: usize,
+    /// Temporary: consumed by scene filtering (next commit).
+    #[allow(dead_code)]
+    tags: &'static [&'static str],
 }
 
 const REGISTRY: [SceneEntry; SCENE_COUNT] = build_registry();
@@ -82,6 +133,7 @@ const fn build_registry() -> [SceneEntry; SCENE_COUNT] {
         name: "",
         family: Family::Original,
         local: 0,
+        tags: &[],
     }; SCENE_COUNT];
     let mut index = 0;
     let mut family = 0;
@@ -93,6 +145,7 @@ const fn build_registry() -> [SceneEntry; SCENE_COUNT] {
                 name: ORIGINAL_SCENES[index],
                 family: kind,
                 local,
+                tags: scene_tags(kind, local),
             };
             index += 1;
             local += 1;
@@ -108,6 +161,7 @@ const fn build_registry() -> [SceneEntry; SCENE_COUNT] {
                 name: names[local],
                 family: kind,
                 local,
+                tags: scene_tags(kind, local),
             };
             index += 1;
             local += 1;
@@ -128,6 +182,14 @@ const fn catalog() -> [&'static str; SCENE_COUNT] {
         index += 1;
     }
     names
+}
+
+/// Tags assigned to a scene, in `TAGS` order of appearance.
+/// Temporary allow: consumed by scene filtering (next commit).
+#[allow(dead_code)]
+pub fn tags(scene: usize) -> &'static [&'static str] {
+    assert!(scene < SCENE_COUNT);
+    REGISTRY[scene].tags
 }
 
 const fn scene_route(scene: usize) -> (Family, usize) {
@@ -1226,6 +1288,21 @@ mod tests {
         assert_eq!(SCENES.len(), SCENE_COUNT);
         assert_eq!(names.len(), SCENES.len());
         assert!(!names.contains(""));
+    }
+
+    #[test]
+    fn every_scene_has_unique_valid_tags() {
+        let allowed: std::collections::HashSet<_> = TAGS.iter().copied().collect();
+        assert_eq!(allowed.len(), TAGS.len(), "TAGS must not repeat");
+        for (scene, name) in SCENES.iter().enumerate() {
+            let tags = tags(scene);
+            assert!(!tags.is_empty(), "{name} has no tags");
+            let seen: std::collections::HashSet<_> = tags.iter().copied().collect();
+            assert_eq!(seen.len(), tags.len(), "{name} repeats a tag");
+            for tag in tags {
+                assert!(allowed.contains(tag), "{name} uses unknown tag {tag}");
+            }
+        }
     }
 
     #[test]
