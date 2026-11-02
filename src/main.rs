@@ -414,6 +414,7 @@ fn main() -> io::Result<()> {
 
     let saved_scene = (!state_data.last_scene.is_empty()).then_some(state_data.last_scene.as_str());
     let initial_scene = starting_scene(args.scene.as_deref(), saved_scene)?;
+    let active_playlist = state_data.active_playlist;
 
     let mut app = App::new(Options {
         scene: initial_scene,
@@ -421,6 +422,7 @@ fn main() -> io::Result<()> {
         demo: args.demo,
         config_path: config_path.clone(),
         state_path: state_path.clone(),
+        active_playlist,
     });
     match args.color {
         ColorMode::Auto => {}

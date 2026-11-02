@@ -108,6 +108,14 @@ impl Default for AppearanceConfig {
     }
 }
 
+/// A named, ordered set of visualisations the user can activate and edit.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Playlist {
+    pub name: String,
+    pub scenes: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -115,6 +123,7 @@ pub struct Config {
     pub auto_advance: AutoAdvanceConfig,
     pub audio: AudioConfig,
     pub appearance: AppearanceConfig,
+    pub playlists: Vec<Playlist>,
 }
 
 /// `$XDG_CONFIG_HOME/vibe/config.toml`, or `~/.config/vibe/config.toml`.

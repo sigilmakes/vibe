@@ -9,7 +9,7 @@ use crate::config::atomic_write;
 #[serde(default)]
 pub struct State {
     pub last_scene: String,
-    /// Placeholder: the name of the active playlist, if any.
+    /// The name of the active playlist, if any.
     pub active_playlist: String,
 }
 

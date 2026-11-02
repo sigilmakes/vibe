@@ -11,6 +11,20 @@ impl RowId {
     pub const fn new(id: u64) -> Self {
         Self(id)
     }
+
+    /// Build a stable row id from a dynamic name. The id is an FNV-1a hash of
+    /// `kind` and `name` with the high bit set, so dynamic rows never collide
+    /// with the small fixed ids or the `SCENE_BASE`/`TAG_BASE` ranges.
+    pub fn named(kind: &str, name: &str) -> Self {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for &byte in kind.as_bytes().iter().chain(b"\x00").chain(name.as_bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        Self(hash | (1 << 63))
+    }
 }
 
 /// Row ids shared between the page builder and the app, which maps ids back
@@ -71,6 +85,28 @@ pub mod ids {
     pub const fn tag(index: usize) -> RowId {
         RowId::new(TAG_BASE + index as u64)
     }
+
+    pub const PLAYLISTS: RowId = RowId::new(50);
+    pub const PLAYLISTS_NEW: RowId = RowId::new(51);
+    pub const PLAYLISTS_EMPTY: RowId = RowId::new(52);
+    pub const PLAYLIST_NAME: RowId = RowId::new(60);
+    pub const PLAYLIST_ACTIVE: RowId = RowId::new(61);
+    pub const PLAYLIST_ADD_CURRENT: RowId = RowId::new(62);
+    pub const PLAYLIST_REMOVE: RowId = RowId::new(63);
+    pub const PLAYLIST_UP: RowId = RowId::new(64);
+    pub const PLAYLIST_DOWN: RowId = RowId::new(65);
+    pub const PLAYLIST_DELETE: RowId = RowId::new(66);
+    pub const CONFIRM_DELETE: RowId = RowId::new(67);
+    pub const CONFIRM_CANCEL: RowId = RowId::new(68);
+    pub const CONFIRM_PROMPT: RowId = RowId::new(69);
+
+    pub fn playlist(name: &str) -> RowId {
+        RowId::named("playlist", name)
+    }
+
+    pub fn playlist_scene(playlist: &str, scene: &str) -> RowId {
+        RowId::named("playlist_scene", &format!("{playlist}\x00{scene}"))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +129,7 @@ pub struct NumSpec {
     pub decimals: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PageId {
     Root,
     Scenes,
@@ -103,6 +139,9 @@ pub enum PageId {
     Audio,
     Appearance,
     Controls,
+    Playlists,
+    Playlist(String),
+    ConfirmDelete(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -220,6 +259,12 @@ pub enum Effect {
     SelectScene(usize),
     ToggleFavourite(usize),
     ClearTags,
+    CreatePlaylist,
+    DeletePlaylist(String),
+    AddCurrentScene,
+    RemoveSelectedScene,
+    MoveSelectedScene(isize),
+    Back,
     Changed { id: RowId, value: String },
 }
 
@@ -278,8 +323,17 @@ impl Menu {
     /// Re-clamp the selection after pages change, following stable row ids and
     /// falling back to the nearest visible row when the selected row vanished.
     pub fn rebuild(&mut self, pages: &[Page]) {
+        // Drop trailing pages that no longer exist (deleted or renamed
+        // playlists) so the stack never points at a vanished page.
+        while self.stack.len() > 1
+            && find_page(pages, self.stack.last().expect("non-empty").clone()).is_none()
+        {
+            self.stack.pop();
+            self.selected.pop();
+            self.last_index.pop();
+        }
         for depth in 0..self.stack.len() {
-            let Some(page) = find_page(pages, self.stack[depth]) else {
+            let Some(page) = find_page(pages, self.stack[depth].clone()) else {
                 continue;
             };
             let visible: Vec<&Row> = page.visible_rows().collect();
@@ -397,7 +451,9 @@ impl Menu {
     }
 
     fn current_page<'a>(&self, pages: &'a [Page]) -> Option<&'a Page> {
-        self.stack.last().and_then(|id| find_page(pages, *id))
+        self.stack
+            .last()
+            .and_then(|id| find_page(pages, id.clone()))
     }
 
     fn selected_row<'a>(&self, pages: &'a [Page]) -> Option<&'a Row> {
@@ -529,6 +585,7 @@ impl Menu {
             return Effect::None;
         };
         let id = row.id;
+        let value = row.value.clone();
         match row.kind {
             RowKind::Toggle | RowKind::Checkbox => {
                 let on = row.value != "on";
@@ -552,12 +609,35 @@ impl Menu {
                     Effect::ClearTags
                 } else if let Some(index) = scene_index(id) {
                     Effect::SelectScene(index)
+                } else if id == ids::PLAYLISTS_NEW {
+                    Effect::CreatePlaylist
+                } else if id == ids::PLAYLIST_ADD_CURRENT {
+                    Effect::AddCurrentScene
+                } else if id == ids::PLAYLIST_REMOVE {
+                    Effect::RemoveSelectedScene
+                } else if id == ids::PLAYLIST_UP {
+                    Effect::MoveSelectedScene(-1)
+                } else if id == ids::PLAYLIST_DOWN {
+                    Effect::MoveSelectedScene(1)
+                } else if id == ids::CONFIRM_DELETE {
+                    match self.current_page(pages).map(|page| &page.id) {
+                        Some(PageId::ConfirmDelete(name)) => Effect::DeletePlaylist(name.clone()),
+                        _ => Effect::None,
+                    }
+                } else if id == ids::CONFIRM_CANCEL {
+                    Effect::Back
+                } else if !value.is_empty() {
+                    // Playlist scene rows store their scene name in the value.
+                    visuals::SCENES
+                        .iter()
+                        .position(|scene| *scene == value.as_str())
+                        .map_or(Effect::None, Effect::SelectScene)
                 } else {
                     Effect::None
                 }
             }
             RowKind::Submenu => {
-                self.descend(row.submenu, pages);
+                self.descend(row.submenu.clone(), pages);
                 Effect::None
             }
             RowKind::ReadOnly => Effect::None,
@@ -568,7 +648,7 @@ impl Menu {
         let Some(target) = target else {
             return;
         };
-        let page = find_page(pages, target);
+        let page = find_page(pages, target.clone());
         let initial = page
             .and_then(|page| page.initial)
             .or_else(|| page.and_then(|page| page.visible_rows().next().map(|row| row.id)));
@@ -648,18 +728,35 @@ fn is_pipewire_or_pulse_or_auto(source: &str) -> bool {
 }
 
 /// Build all pages from the current config, scene, and session state.
-pub fn build_pages(config: &config::Config, scene: usize, demo: bool, search: &str) -> Vec<Page> {
+pub fn build_pages(
+    config: &config::Config,
+    scene: usize,
+    demo: bool,
+    active_playlist: &str,
+    search: &str,
+) -> Vec<Page> {
     let scene_name = visuals::SCENES.get(scene).copied().unwrap_or_default();
-    vec![
+    let mut pages = vec![
         build_root(),
-        build_scenes(&config.scenes, scene_name),
+        build_scenes(
+            &config.scenes,
+            scene_name,
+            &config.playlists,
+            active_playlist,
+        ),
         build_scene_picker(&config.scenes, scene, search),
         build_filter(&config.scenes),
         build_tags(&config.scenes),
         build_audio(&config.audio, demo),
         build_appearance(&config.appearance),
         build_controls(),
-    ]
+    ];
+    pages.push(build_playlists(&config.playlists, active_playlist));
+    for playlist in &config.playlists {
+        pages.push(build_playlist(playlist, scene, active_playlist));
+        pages.push(build_confirm_delete(playlist));
+    }
+    pages
 }
 
 fn build_root() -> Page {
@@ -686,7 +783,22 @@ fn filter_summary(scenes: &config::ScenesConfig) -> String {
     }
 }
 
-fn build_scenes(scenes: &config::ScenesConfig, scene_name: &str) -> Page {
+fn playlist_summary(playlists: &[config::Playlist], active: &str) -> String {
+    if !active.is_empty() {
+        return format!("active: {active}");
+    }
+    match playlists.len() {
+        0 => "none".to_owned(),
+        count => format!("{count} playlists"),
+    }
+}
+
+fn build_scenes(
+    scenes: &config::ScenesConfig,
+    scene_name: &str,
+    playlists: &[config::Playlist],
+    active: &str,
+) -> Page {
     Page {
         id: PageId::Scenes,
         title: "Scenes".into(),
@@ -704,6 +816,112 @@ fn build_scenes(scenes: &config::ScenesConfig, scene_name: &str) -> Page {
                 &filter_summary(scenes),
                 PageId::Filter,
             ),
+            Row::submenu(
+                ids::PLAYLISTS,
+                "Playlists…",
+                &playlist_summary(playlists, active),
+                PageId::Playlists,
+            ),
+        ],
+        initial: None,
+    }
+}
+
+fn build_playlists(playlists: &[config::Playlist], active: &str) -> Page {
+    let mut rows = vec![Row::action(ids::PLAYLISTS_NEW, "New playlist")];
+    if playlists.is_empty() {
+        rows.push(Row::readonly(ids::PLAYLISTS_EMPTY, "No playlists yet", ""));
+    } else {
+        for playlist in playlists {
+            let label = if playlist.name == active {
+                format!("* {}", playlist.name)
+            } else {
+                playlist.name.clone()
+            };
+            rows.push(Row::submenu(
+                ids::playlist(&playlist.name),
+                &label,
+                &format!("{} scenes", playlist.scenes.len()),
+                PageId::Playlist(playlist.name.clone()),
+            ));
+        }
+    }
+    Page {
+        id: PageId::Playlists,
+        title: "Playlists".into(),
+        path: vec!["Vibe".into(), "Scenes".into(), "Playlists".into()],
+        rows,
+        initial: None,
+    }
+}
+
+fn build_playlist(playlist: &config::Playlist, scene: usize, active: &str) -> Page {
+    let mut rows = vec![
+        Row::text(ids::PLAYLIST_NAME, "Name", &playlist.name),
+        Row::checkbox(ids::PLAYLIST_ACTIVE, "Active", playlist.name == active),
+    ];
+    for (index, scene_name) in playlist.scenes.iter().enumerate() {
+        let mut row = Row::action(
+            ids::playlist_scene(&playlist.name, scene_name),
+            &format!("{}. {scene_name}", index + 1),
+        );
+        row.value = scene_name.clone();
+        rows.push(row);
+    }
+    let current = visuals::SCENES.get(scene).copied().unwrap_or_default();
+    if !playlist
+        .scenes
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(current))
+    {
+        rows.push(Row::action(ids::PLAYLIST_ADD_CURRENT, "Add current scene"));
+    }
+    if !playlist.scenes.is_empty() {
+        rows.push(Row::action(ids::PLAYLIST_REMOVE, "Remove selected"));
+    }
+    if playlist.scenes.len() > 1 {
+        rows.push(Row::action(ids::PLAYLIST_UP, "Move up"));
+        rows.push(Row::action(ids::PLAYLIST_DOWN, "Move down"));
+    }
+    rows.push(Row::submenu(
+        ids::PLAYLIST_DELETE,
+        "Delete playlist…",
+        "",
+        PageId::ConfirmDelete(playlist.name.clone()),
+    ));
+    Page {
+        id: PageId::Playlist(playlist.name.clone()),
+        title: playlist.name.clone(),
+        path: vec![
+            "Vibe".into(),
+            "Scenes".into(),
+            "Playlists".into(),
+            playlist.name.clone(),
+        ],
+        rows,
+        initial: Some(ids::PLAYLIST_NAME),
+    }
+}
+
+fn build_confirm_delete(playlist: &config::Playlist) -> Page {
+    Page {
+        id: PageId::ConfirmDelete(playlist.name.clone()),
+        title: "Delete".into(),
+        path: vec![
+            "Vibe".into(),
+            "Scenes".into(),
+            "Playlists".into(),
+            playlist.name.clone(),
+            "Delete".into(),
+        ],
+        rows: vec![
+            Row::readonly(
+                ids::CONFIRM_PROMPT,
+                &format!("Delete \"{}\"?", playlist.name),
+                "",
+            ),
+            Row::action(ids::CONFIRM_DELETE, "Delete"),
+            Row::action(ids::CONFIRM_CANCEL, "Cancel"),
         ],
         initial: None,
     }
@@ -933,7 +1151,7 @@ mod tests {
     }
 
     fn default_pages(demo: bool) -> Vec<Page> {
-        build_pages(&config::Config::default(), 0, demo, "")
+        build_pages(&config::Config::default(), 0, demo, "", "")
     }
 
     fn title(menu: &Menu, pages: &[Page]) -> String {
@@ -957,7 +1175,7 @@ mod tests {
 
     #[test]
     fn scene_picker_lists_every_scene_with_search_and_starts_on_current() {
-        let pages = build_pages(&config::Config::default(), 7, false, "");
+        let pages = build_pages(&config::Config::default(), 7, false, "", "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         assert_eq!(picker.rows.len(), visuals::SCENES.len() + 1);
         assert_eq!(picker.rows[0].id, ids::SEARCH);
@@ -970,7 +1188,7 @@ mod tests {
         let mut config = config::Config::default();
         config.scenes.filter = "favourites".into();
         config.scenes.favourites = vec!["Julia".into(), "Missing Scene".into()];
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         let labels: Vec<&str> = picker
             .visible_rows()
@@ -983,13 +1201,13 @@ mod tests {
         config.scenes.filter = "tags".into();
         config.scenes.filter_tags.clear();
         config.scenes.favourites.clear();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         assert_eq!(picker.rows.len(), visuals::SCENES.len() + 1);
 
         // Tags mode matches any selected tag; search narrows case-insensitively.
         config.scenes.filter_tags = vec!["fractal".into()];
-        let pages = build_pages(&config, 0, false, "julia");
+        let pages = build_pages(&config, 0, false, "", "julia");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         let labels: Vec<&str> = picker
             .visible_rows()
@@ -999,7 +1217,7 @@ mod tests {
         assert_eq!(labels, ["Julia"]);
 
         // A search with no matches shows the read-only placeholder row.
-        let pages = build_pages(&config, 0, false, "zzzz");
+        let pages = build_pages(&config, 0, false, "", "zzzz");
         let picker = find_page(&pages, PageId::ScenePicker).unwrap();
         assert!(picker.visible_rows().any(|row| row.id == ids::NO_MATCHES));
     }
@@ -1009,7 +1227,7 @@ mod tests {
         let mut config = config::Config::default();
         config.scenes.filter = "tags".into();
         config.scenes.filter_tags = vec!["fractal".into(), "particles".into()];
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let filter = find_page(&pages, PageId::Filter).unwrap();
         let tags = filter
             .visible_rows()
@@ -1027,7 +1245,7 @@ mod tests {
 
         // Tags submenu is hidden outside tags mode.
         config.scenes.filter = "all".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let filter = find_page(&pages, PageId::Filter).unwrap();
         assert!(!filter.visible_rows().any(|row| row.id == ids::FILTER_TAGS));
     }
@@ -1035,7 +1253,7 @@ mod tests {
     #[test]
     fn tags_page_has_a_checkbox_per_tag_and_clear_when_selected() {
         let mut config = config::Config::default();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let tags = find_page(&pages, PageId::Tags).unwrap();
         assert_eq!(
             tags.visible_rows().count(),
@@ -1045,7 +1263,7 @@ mod tests {
         assert!(tags.visible_rows().all(|row| row.kind == RowKind::Checkbox));
 
         config.scenes.filter_tags = vec!["calm".into()];
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let tags = find_page(&pages, PageId::Tags).unwrap();
         let clear = tags.visible_rows().find(|row| row.id == ids::TAGS_CLEAR);
         assert!(clear.is_some());
@@ -1056,7 +1274,7 @@ mod tests {
     fn audio_page_hides_rows_that_do_not_apply_to_the_source() {
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
         assert!(visible.contains(&ids::SOURCE));
@@ -1067,7 +1285,7 @@ mod tests {
 
         let mut config = config::Config::default();
         config.audio.source = "file".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
         assert!(visible.contains(&ids::FILE));
@@ -1131,7 +1349,7 @@ mod tests {
     fn choice_rows_cycle_and_report_changed() {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Down), &pages);
@@ -1147,7 +1365,7 @@ mod tests {
 
         // The app applies the change and rebuilds before the next key.
         config.appearance.palette = "Phosphor".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         menu.rebuild(&pages);
         assert_eq!(
             menu.handle_key(press(KeyCode::Left), &pages),
@@ -1195,7 +1413,7 @@ mod tests {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
@@ -1226,7 +1444,7 @@ mod tests {
         let mut menu = Menu::new();
         let mut config = config::Config::default();
         config.audio.source = "command".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
@@ -1236,7 +1454,7 @@ mod tests {
         assert_eq!(menu.view(&pages).rows[5].label, "Command");
 
         config.audio.source = "file".into();
-        let pages = build_pages(&config, 0, false, "");
+        let pages = build_pages(&config, 0, false, "", "");
         menu.rebuild(&pages);
         let view = menu.view(&pages);
         assert_eq!(title(&menu, &pages), "Audio");

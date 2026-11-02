@@ -12,6 +12,7 @@ pub struct Options {
     pub demo: bool,
     pub config_path: PathBuf,
     pub state_path: Option<PathBuf>,
+    pub active_playlist: String,
 }
 
 /// Whether the frame loop should keep running.
@@ -64,6 +65,7 @@ const CONFIG_DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct App {
     scene: usize,
     config: config::Config,
+    active_playlist: String,
     config_dirty: bool,
     config_touched: Option<Instant>,
     save_errors: Vec<String>,
@@ -84,6 +86,7 @@ impl App {
         let mut app = Self {
             scene: options.scene,
             config: options.config,
+            active_playlist: options.active_playlist,
             config_dirty: false,
             config_touched: None,
             save_errors: Vec::new(),
@@ -99,6 +102,7 @@ impl App {
             pages: Vec::new(),
         };
         app.prune_scenes();
+        app.prune_playlists();
         app.rebuild_pages();
         if !app.demo {
             app.connect();
@@ -172,6 +176,12 @@ impl App {
                         self.mark_config_dirty();
                     }
                 }
+                menu::Effect::CreatePlaylist => {}
+                menu::Effect::DeletePlaylist(_) => {}
+                menu::Effect::AddCurrentScene => {}
+                menu::Effect::RemoveSelectedScene => {}
+                menu::Effect::MoveSelectedScene(_) => {}
+                menu::Effect::Back => {}
                 menu::Effect::Changed { id, value } => self.apply_change(id, &value),
                 menu::Effect::None => {}
             }
@@ -239,7 +249,13 @@ impl App {
             .as_ref()
             .map(menu::Menu::search)
             .unwrap_or_default();
-        self.pages = menu::build_pages(&self.config, self.scene, self.demo, search);
+        self.pages = menu::build_pages(
+            &self.config,
+            self.scene,
+            self.demo,
+            &self.active_playlist,
+            search,
+        );
         if let Some(menu) = &mut self.menu {
             menu.rebuild(&self.pages);
         }
@@ -492,8 +508,74 @@ impl App {
         }
     }
 
+    /// Canonicalise playlist data: trim names, drop empty and duplicate names,
+    /// drop empty/duplicate/unknown scene names, and resolve the active
+    /// playlist against the surviving names.
+    fn prune_playlists(&mut self) {
+        let before = self.config.playlists.clone();
+        let mut playlists: Vec<config::Playlist> = Vec::new();
+        for playlist in &before {
+            let name = playlist.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if playlists
+                .iter()
+                .any(|known| known.name.eq_ignore_ascii_case(name))
+            {
+                continue;
+            }
+            let mut scenes = Vec::new();
+            for scene in &playlist.scenes {
+                let scene = scene.trim();
+                if scene.is_empty() {
+                    continue;
+                }
+                let Some(canonical) = visuals::SCENES
+                    .iter()
+                    .find(|known| known.eq_ignore_ascii_case(scene))
+                else {
+                    continue;
+                };
+                if !scenes
+                    .iter()
+                    .any(|known: &String| known.eq_ignore_ascii_case(canonical))
+                {
+                    scenes.push((*canonical).to_owned());
+                }
+            }
+            playlists.push(config::Playlist {
+                name: name.to_owned(),
+                scenes,
+            });
+        }
+        self.config.playlists = playlists;
+
+        if !self.active_playlist.is_empty() {
+            match self
+                .config
+                .playlists
+                .iter()
+                .find(|playlist| playlist.name.eq_ignore_ascii_case(&self.active_playlist))
+            {
+                Some(playlist) => {
+                    let canonical = playlist.name.clone();
+                    if canonical != self.active_playlist {
+                        self.active_playlist = canonical;
+                    }
+                }
+                None => self.active_playlist.clear(),
+            }
+        }
+
+        if self.config.playlists != before {
+            self.mark_config_dirty();
+        }
+    }
+
     fn flush_config(&mut self) {
         self.prune_scenes();
+        self.prune_playlists();
         if !self.config_dirty {
             return;
         }
@@ -513,7 +595,7 @@ impl App {
         };
         let state = state::State {
             last_scene: visuals::SCENES[self.scene].to_owned(),
-            active_playlist: String::new(),
+            active_playlist: self.active_playlist.clone(),
         };
         if let Err(error) = state::save(path, &state) {
             self.save_errors.push(format!(
@@ -623,6 +705,7 @@ mod tests {
             demo: true,
             config_path: std::env::temp_dir().join("vibe-unused-config.toml"),
             state_path: None,
+            active_playlist: String::new(),
         }
     }
 
@@ -798,6 +881,7 @@ mod tests {
             demo: true,
             config_path: config_path.clone(),
             state_path: Some(state_path.clone()),
+            active_playlist: String::new(),
         });
 
         app.handle_key(press(KeyCode::Char('m')));
