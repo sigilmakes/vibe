@@ -24,34 +24,119 @@ const ORIGINAL_SCENES: &[&str] = &[
     "Reaction Garden",
 ];
 
-pub const SCENES: &[&str] = &scene_names();
+/// The renderer family that owns a contiguous run of global scene indices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Family {
+    Original,
+    Glyphs,
+    Sculptures,
+    Flocks,
+    Spectrum,
+    Fractals,
+    Chaos,
+    Curves,
+    Waves,
+    Cells,
+    Geometry,
+    Particles,
+    Typography,
+    Organic,
+    FractalMath,
+}
 
-const fn scene_names() -> [&'static str; 100] {
-    let families = [
-        ORIGINAL_SCENES,
-        crate::families::curves::NAMES,
-        crate::families::waves::NAMES,
-        crate::families::cells::NAMES,
-        crate::families::geometry::NAMES,
-        crate::families::particles::NAMES,
-        crate::families::typography::NAMES,
-        crate::families::organic::NAMES,
-        crate::families::fractalmath::NAMES,
+/// Original scenes first, grouped by the renderer that owns them.
+const ORIGINAL_FAMILIES: [(Family, usize); 7] = [
+    (Family::Original, 7),
+    (Family::Glyphs, 2),
+    (Family::Sculptures, 2),
+    (Family::Flocks, 2),
+    (Family::Spectrum, 2),
+    (Family::Fractals, 2),
+    (Family::Chaos, 2),
+];
+
+const NEW_FAMILIES: [(Family, &[&str]); 8] = [
+    (Family::Curves, crate::families::curves::NAMES),
+    (Family::Waves, crate::families::waves::NAMES),
+    (Family::Cells, crate::families::cells::NAMES),
+    (Family::Geometry, crate::families::geometry::NAMES),
+    (Family::Particles, crate::families::particles::NAMES),
+    (Family::Typography, crate::families::typography::NAMES),
+    (Family::Organic, crate::families::organic::NAMES),
+    (Family::FractalMath, crate::families::fractalmath::NAMES),
+];
+
+const SCENE_COUNT: usize = 100;
+
+#[derive(Clone, Copy)]
+struct SceneEntry {
+    name: &'static str,
+    family: Family,
+    local: usize,
+}
+
+const REGISTRY: [SceneEntry; SCENE_COUNT] = build_registry();
+
+const fn build_registry() -> [SceneEntry; SCENE_COUNT] {
+    let mut scenes = [
+        SceneEntry {
+            name: "",
+            family: Family::Original,
+            local: 0,
+        };
+        SCENE_COUNT
     ];
-    let mut names = [""; 100];
-    let mut family = 0;
     let mut index = 0;
-    while family < families.len() {
-        let mut style = 0;
-        while style < families[family].len() {
-            names[index] = families[family][style];
+    let mut family = 0;
+    while family < ORIGINAL_FAMILIES.len() {
+        let (kind, count) = ORIGINAL_FAMILIES[family];
+        let mut local = 0;
+        while local < count {
+            scenes[index] = SceneEntry {
+                name: ORIGINAL_SCENES[index],
+                family: kind,
+                local,
+            };
             index += 1;
-            style += 1;
+            local += 1;
         }
         family += 1;
     }
-    assert!(index == names.len());
+    let mut family = 0;
+    while family < NEW_FAMILIES.len() {
+        let (kind, names) = NEW_FAMILIES[family];
+        let mut local = 0;
+        while local < names.len() {
+            scenes[index] = SceneEntry {
+                name: names[local],
+                family: kind,
+                local,
+            };
+            index += 1;
+            local += 1;
+        }
+        family += 1;
+    }
+    assert!(index == SCENE_COUNT);
+    scenes
+}
+
+pub const SCENES: &[&str] = &catalog();
+
+const fn catalog() -> [&'static str; SCENE_COUNT] {
+    let mut names = [""; SCENE_COUNT];
+    let mut index = 0;
+    while index < SCENE_COUNT {
+        names[index] = REGISTRY[index].name;
+        index += 1;
+    }
     names
+}
+
+const fn scene_route(scene: usize) -> (Family, usize) {
+    assert!(scene < SCENE_COUNT);
+    let entry = REGISTRY[scene];
+    (entry.family, entry.local)
 }
 
 /// Normalized live audio. Transients carry independent low-to-high attacks.
@@ -209,192 +294,87 @@ impl Renderer {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        if (19..30).contains(&scene) {
-            self.curves.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 19,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
+        let (family, local) = scene_route(scene);
+        match family {
+            Family::Original => self.draw_original(
+                buf, area, time, local, palette, bands, audio, theme,
+            ),
+            Family::Glyphs => self
+                .glyphs
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Sculptures => self
+                .sculptures
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Flocks => self
+                .flocks
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Spectrum => self
+                .spectrum
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Fractals => self
+                .fractals
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Chaos => self
+                .chaos
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Curves => self
+                .curves
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Waves => self
+                .waves
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Cells => self
+                .cells
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Geometry => self
+                .geometry
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Particles => self
+                .particles
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Typography => self
+                .typography
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Organic => self
+                .organic
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::FractalMath => self
+                .fractalmath
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
         }
-        if (30..40).contains(&scene) {
-            self.waves.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 30,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (40..50).contains(&scene) {
-            self.cells.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 40,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (50..60).contains(&scene) {
-            self.geometry.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 50,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (60..70).contains(&scene) {
-            self.particles.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 60,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (70..80).contains(&scene) {
-            self.typography.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 70,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (80..90).contains(&scene) {
-            self.organic.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 80,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (90..100).contains(&scene) {
-            self.fractalmath.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 90,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (17..=18).contains(&scene) {
-            self.chaos.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 17,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (15..=16).contains(&scene) {
-            self.fractals.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 15,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (13..=14).contains(&scene) {
-            self.spectrum.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 13,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (11..=12).contains(&scene) {
-            self.flocks.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 11,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (9..=10).contains(&scene) {
-            self.sculptures.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 9,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
-        if (7..=8).contains(&scene) {
-            self.glyphs.get_or_insert_with(Default::default).draw(
-                buf,
-                area,
-                time,
-                scene - 7,
-                palette,
-                bands,
-                audio,
-                theme,
-            );
-            return;
-        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_original(
+        &mut self,
+        buf: &mut Buffer,
+        area: Rect,
+        time: f32,
+        scene: usize,
+        palette: usize,
+        bands: &[f32; 32],
+        audio: &Reactivity,
+        theme: &crate::palette::Theme,
+    ) {
         if scene == 6 {
             self.swarm(buf, area, time, palette, bands, audio, theme);
             return;
         }
+
         // Seven recognizable scalloped petals, drawn as hard facets. Each
         // frequency region and recent attack can displace an individual petal.
         let vertices: [[f32; 2]; 42] = std::array::from_fn(|i| {
@@ -1246,9 +1226,91 @@ mod tests {
     #[test]
     fn catalog_has_one_hundred_unique_names() {
         let names: std::collections::HashSet<_> = SCENES.iter().copied().collect();
-        assert_eq!(SCENES.len(), 100);
+        assert_eq!(SCENES.len(), SCENE_COUNT);
         assert_eq!(names.len(), SCENES.len());
         assert!(!names.contains(""));
+    }
+
+    #[test]
+    fn registry_maps_every_scene_once_to_a_family_and_name() {
+        use std::collections::{HashMap, HashSet};
+
+        let expected: HashSet<Family> = ORIGINAL_FAMILIES
+            .iter()
+            .map(|(family, _)| *family)
+            .chain(NEW_FAMILIES.iter().map(|(family, _)| *family))
+            .collect();
+        let mut routes = HashSet::new();
+        let mut locals: HashMap<Family, Vec<usize>> = HashMap::new();
+        for (index, name) in SCENES.iter().enumerate() {
+            let (family, local) = scene_route(index);
+            assert_eq!(REGISTRY[index].name, *name);
+            assert!(routes.insert((family, local)), "duplicate route at {index}");
+            locals.entry(family).or_default().push(local);
+        }
+        assert_eq!(SCENES.len(), SCENE_COUNT);
+        assert_eq!(routes.len(), SCENE_COUNT);
+        assert_eq!(locals.len(), expected.len());
+        assert_eq!(locals.keys().copied().collect::<HashSet<_>>(), expected);
+        for (family, indexes) in locals.iter_mut() {
+            indexes.sort_unstable();
+            let expected_indexes: Vec<_> = (0..indexes.len()).collect();
+            assert_eq!(indexes, &expected_indexes, "{family:?}");
+        }
+    }
+
+    #[test]
+    fn original_special_scenes_route_to_their_families() {
+        for scene in 0..=6 {
+            assert_eq!(scene_route(scene), (Family::Original, scene));
+        }
+        let area = Rect::new(2, 3, 24, 12);
+        let theme = crate::palette::Theme::default();
+        let audio = Reactivity {
+            energy: 0.6,
+            bass: 0.5,
+            mid: 0.4,
+            treble: 0.3,
+            transients: [0.7; 4],
+            ..Reactivity::default()
+        };
+        macro_rules! check_legacy {
+            ($first:expr, $family:ident, $kind:ident) => {
+                for local in 0..2 {
+                    let scene = $first + local;
+                    assert_eq!(scene_route(scene), (Family::$kind, local));
+                    let mut routed = Buffer::empty(area);
+                    let mut direct = Buffer::empty(area);
+                    Renderer::default().draw(
+                        &mut routed,
+                        area,
+                        1.0,
+                        scene,
+                        0,
+                        &[0.5; 32],
+                        &audio,
+                        &theme,
+                    );
+                    crate::families::$family::Renderer::default().draw(
+                        &mut direct,
+                        area,
+                        1.0,
+                        local,
+                        0,
+                        &[0.5; 32],
+                        &audio,
+                        &theme,
+                    );
+                    assert_eq!(routed, direct, "legacy dispatch for scene {scene}");
+                }
+            };
+        }
+        check_legacy!(7, glyphs, Glyphs);
+        check_legacy!(9, sculptures, Sculptures);
+        check_legacy!(11, flocks, Flocks);
+        check_legacy!(13, spectrum, Spectrum);
+        check_legacy!(15, fractals, Fractals);
+        check_legacy!(17, chaos, Chaos);
     }
 
     #[test]
@@ -1265,16 +1327,18 @@ mod tests {
         };
         let mut offset = ORIGINAL_SCENES.len();
         macro_rules! check_family {
-            ($family:ident) => {
-                for (style, name) in crate::families::$family::NAMES.iter().enumerate() {
-                    assert_eq!(SCENES[offset + style], *name);
+            ($family:ident, $kind:ident) => {
+                for (local, name) in crate::families::$family::NAMES.iter().enumerate() {
+                    let scene = offset + local;
+                    assert_eq!(SCENES[scene], *name);
+                    assert_eq!(scene_route(scene), (Family::$kind, local));
                     let mut routed = Buffer::empty(area);
                     let mut direct = Buffer::empty(area);
                     Renderer::default().draw(
                         &mut routed,
                         area,
                         1.0,
-                        offset + style,
+                        scene,
                         0,
                         &[0.5; 32],
                         &audio,
@@ -1284,7 +1348,7 @@ mod tests {
                         &mut direct,
                         area,
                         1.0,
-                        style,
+                        local,
                         0,
                         &[0.5; 32],
                         &audio,
@@ -1295,14 +1359,14 @@ mod tests {
                 offset += crate::families::$family::NAMES.len();
             };
         }
-        check_family!(curves);
-        check_family!(waves);
-        check_family!(cells);
-        check_family!(geometry);
-        check_family!(particles);
-        check_family!(typography);
-        check_family!(organic);
-        check_family!(fractalmath);
+        check_family!(curves, Curves);
+        check_family!(waves, Waves);
+        check_family!(cells, Cells);
+        check_family!(geometry, Geometry);
+        check_family!(particles, Particles);
+        check_family!(typography, Typography);
+        check_family!(organic, Organic);
+        check_family!(fractalmath, FractalMath);
         assert_eq!(offset, SCENES.len());
     }
 
