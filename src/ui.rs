@@ -19,9 +19,6 @@ pub struct Status<'a> {
     pub tempo_confidence: f32,
     pub sensitivity: f32,
     pub bands: &'a [f32; 32],
-    pub error: Option<&'a str>,
-    pub source: Option<&'a str>,
-    pub silent_for: f32,
 }
 
 fn color([r, g, b]: [u8; 3]) -> Color {
@@ -107,27 +104,6 @@ fn centered(screen: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
-}
-
-fn help_popup(frame: &mut Frame, theme: &Theme) {
-    let area = centered(frame.area(), 38, 9);
-    let lines = vec![
-        Line::styled(
-            " Controls",
-            Style::default()
-                .fg(color(theme.ansi[12]))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(" m     opens menu"),
-        Line::raw(" Esc   closes menu / popup"),
-        Line::raw(" ↑/↓ Enter navigate / select menus"),
-        Line::raw(" ←/→   visualisation   p  palette"),
-        Line::raw(" +/-   sensitivity"),
-        Line::raw(" d     demo"),
-        Line::raw(" r     reconnect"),
-        Line::raw(" q     quit"),
-    ];
-    overlay(frame, area, lines, theme);
 }
 
 fn analysis_popup(frame: &mut Frame, status: &Status<'_>, theme: &Theme) {
@@ -225,45 +201,14 @@ pub fn menu(frame: &mut Frame, title: &str, items: &[&str], selected: usize, the
     overlay(frame, area, lines, theme);
 }
 
-/// Leave the canvas untouched unless an explicit popup or error is present.
-pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>, theme: &Theme) {
+/// Leave the canvas untouched unless the analysis popup is open.
+pub fn draw(frame: &mut Frame, analysis: bool, status: &Status<'_>, theme: &Theme) {
     let screen = frame.area();
     if screen.width == 0 || screen.height == 0 {
         return;
     }
-    if let Some(error) = status.error {
-        let message = error.lines().next().unwrap_or("Audio unavailable");
-        let width = message.chars().count().saturating_add(8).min(60) as u16;
-        let area = centered(screen, width, 1);
-        overlay(
-            frame,
-            area,
-            vec![Line::styled(
-                format!(" Audio: {message}"),
-                Style::default().fg(color(theme.ansi[1])),
-            )],
-            theme,
-        );
-    } else if status.silent_for > 3.0 {
-        let source = status.source.unwrap_or("selected source");
-        let message = format!("{source} is silent · --list-audio");
-        let width = message.chars().count().saturating_add(8).min(60) as u16;
-        let area = centered(screen, width, 1);
-        overlay(
-            frame,
-            area,
-            vec![Line::styled(
-                format!(" Audio: {message}"),
-                Style::default().fg(color(theme.ansi[3])),
-            )],
-            theme,
-        );
-    }
     if analysis {
         analysis_popup(frame, status, theme);
-    }
-    if help {
-        help_popup(frame, theme);
     }
 }
 
@@ -284,23 +229,19 @@ mod tests {
             tempo_confidence: 0.8,
             sensitivity: 1.0,
             bands,
-            error: None,
-            source: None,
-            silent_for: 0.0,
         }
     }
 
-    fn render(width: u16, height: u16, analysis: bool, help: bool, error: Option<&str>) -> Buffer {
+    fn render(width: u16, height: u16, analysis: bool) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let bands = [0.5; 32];
-        let mut status = status(&bands);
-        status.error = error;
+        let status = status(&bands);
         terminal
             .draw(|frame| {
                 for cell in &mut frame.buffer_mut().content {
                     cell.set_symbol("▀");
                 }
-                draw(frame, analysis, help, &status, &Theme::default());
+                draw(frame, analysis, &status, &Theme::default());
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -336,14 +277,14 @@ mod tests {
     #[test]
     fn default_leaves_the_full_canvas_untouched() {
         for (width, height) in [(1, 1), (20, 7), (80, 24), (160, 50)] {
-            let buffer = render(width, height, false, false, None);
+            let buffer = render(width, height, false);
             assert!(buffer.content.iter().all(|cell| cell.symbol() == "▀"));
         }
     }
 
     #[test]
     fn analysis_is_a_centered_opaque_popup_only_when_requested() {
-        let buffer = render(100, 30, true, false, None);
+        let buffer = render(100, 30, true);
         assert_popup_only(&buffer, Rect::new(28, 10, 44, 10));
         let text = text(&buffer);
         for measurement in [
@@ -364,62 +305,11 @@ mod tests {
     }
 
     #[test]
-    fn errors_do_not_create_a_persistent_status_line() {
-        let buffer = render(80, 24, false, false, Some("Disconnected"));
-        assert_popup_only(&buffer, Rect::new(30, 11, 20, 1));
-        assert!(text(&buffer).contains("Audio: Disconnected"));
-    }
-
-    #[test]
-    fn silent_capture_shows_a_source_hint() {
-        let bands = [0.0; 32];
-        let mut status = status(&bands);
-        status.source = Some("Dummy Output");
-        status.silent_for = 4.0;
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| draw(frame, false, false, &status, &Theme::default()))
-            .unwrap();
-        let text = text(terminal.backend().buffer());
-        assert!(text.contains("Dummy Output is silent"));
-        assert!(text.contains("--list-audio"));
-    }
-
-    #[test]
-    fn help_is_opaque_and_describes_only_current_controls() {
-        let buffer = render(80, 25, false, true, None);
-        assert_popup_only(&buffer, Rect::new(21, 8, 38, 9));
-        let text = text(&buffer);
-        for control in [
-            "m     opens menu",
-            "Esc   closes",
-            "↑/↓ Enter",
-            "←/→   visualisation",
-            "+/-",
-            "d     demo",
-            "r     reconnect",
-            "q     quit",
-        ] {
-            assert!(text.contains(control));
-        }
-        for obsolete in [
-            "show", "hide", "toggle", "s/p/v", "space", "?", "LIVE", "Scene",
-        ] {
-            assert!(!text.contains(obsolete));
-        }
-    }
-
-    #[test]
     fn small_and_empty_terminals_clip_popups_without_touching_other_cells() {
         for (width, height) in [(0, 0), (1, 1), (8, 2), (20, 7), (160, 50)] {
-            for (analysis, help, w, h) in [(true, false, 44, 10), (false, true, 38, 9)] {
-                let buffer = render(width, height, analysis, help, None);
-                assert_popup_only(&buffer, centered(buffer.area, w, h));
-            }
+            let buffer = render(width, height, true);
+            assert_popup_only(&buffer, centered(buffer.area, 44, 10));
         }
-        let buffer = render(20, 7, false, true, None);
-        assert!(row(&buffer, 1).contains("opens menu"));
-        assert!(row(&buffer, 2).contains("closes"));
     }
 
     #[test]

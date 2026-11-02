@@ -28,13 +28,9 @@ pub struct View<'a> {
     pub bands: &'a [f32; 32],
     pub reactivity: &'a visuals::Reactivity,
     pub analysis: bool,
-    pub help: bool,
     pub menu: Option<MenuView>,
     audio: &'a audio::AudioState,
     sensitivity: f32,
-    source: &'a str,
-    capture_error: Option<&'a str>,
-    demo: bool,
 }
 
 impl View<'_> {
@@ -50,17 +46,6 @@ impl View<'_> {
             bpm: self.audio.bpm,
             tempo_confidence: self.audio.tempo_confidence,
             bands: self.bands,
-            error: if self.demo {
-                None
-            } else {
-                self.capture_error.or(self.audio.error.as_deref())
-            },
-            source: if self.demo { None } else { Some(self.source) },
-            silent_for: if self.demo {
-                0.0
-            } else {
-                self.audio.silent_for
-            },
         }
     }
 }
@@ -87,7 +72,7 @@ struct Menu {
 impl Menu {
     fn items(&self) -> &'static [&'static str] {
         match self.kind {
-            MenuKind::Root => &["Visualisation", "Palette", "Analysis", "Controls"],
+            MenuKind::Root => &["Visualisation", "Palette", "Analysis"],
             MenuKind::Scenes => visuals::SCENES,
             MenuKind::Palettes => palette::PALETTES,
         }
@@ -115,27 +100,20 @@ impl Menu {
     }
 }
 
-/// Interactive session state: visuals, overlays, sensitivity, and audio.
-///
-/// The CLI resolves names and indices before constructing an `App`. A live
-/// capture that fails to start is recorded and reported through the frame
-/// status rather than failing construction, so an unavailable sink degrades
-/// to an error overlay instead of ending the session.
+/// Interactive session state: visuals, the analysis overlay, sensitivity,
+/// and audio. The CLI resolves names and indices before constructing an `App`.
 pub struct App {
     scene: usize,
     palette: usize,
     analysis: bool,
-    help: bool,
     menu: Option<Menu>,
     sensitivity: f32,
     demo: bool,
     capture: Option<audio::Capture>,
-    capture_error: Option<String>,
     capture_config: audio::CaptureConfig,
     audio: audio::AudioState,
     bands: [f32; 32],
     reactivity: visuals::Reactivity,
-    source: String,
 }
 
 impl App {
@@ -145,17 +123,14 @@ impl App {
             scene: options.scene,
             palette: options.palette,
             analysis: false,
-            help: false,
             menu: None,
             sensitivity: options.sensitivity,
             demo: options.demo,
             capture: None,
-            capture_error: None,
             capture_config: options.capture,
             audio: audio::AudioState::default(),
             bands: [0.0; 32],
             reactivity: visuals::Reactivity::default(),
-            source: String::new(),
         };
         if !app.demo {
             app.connect();
@@ -176,20 +151,15 @@ impl App {
         let gain = self.sensitivity;
         self.bands = self.audio.bands.map(|band| (band * gain).clamp(0.0, 1.0));
         self.reactivity = reactivity(&self.audio, gain);
-        self.source = self.audio.source.describe();
         View {
             scene: self.scene,
             palette: self.palette,
             bands: &self.bands,
             reactivity: &self.reactivity,
             analysis: self.analysis,
-            help: self.help,
             menu: self.menu.as_ref().map(Menu::view),
             audio: &self.audio,
             sensitivity: gain,
-            source: &self.source,
-            capture_error: self.capture_error.as_deref(),
-            demo: self.demo,
         }
     }
 
@@ -230,7 +200,7 @@ impl App {
                             });
                         }
                         2 => self.analysis = true,
-                        _ => self.help = true,
+                        _ => {}
                     },
                     MenuKind::Scenes => self.scene = active.selected,
                     MenuKind::Palettes => self.palette = active.selected,
@@ -242,14 +212,6 @@ impl App {
         if self.analysis {
             match key.code {
                 KeyCode::Esc => self.analysis = false,
-                KeyCode::Char('q') => return Flow::Quit,
-                _ => {}
-            }
-            return Flow::Continue;
-        }
-        if self.help {
-            match key.code {
-                KeyCode::Esc => self.help = false,
                 KeyCode::Char('q') => return Flow::Quit,
                 _ => {}
             }
@@ -270,29 +232,6 @@ impl App {
                     selected: 0,
                 })
             }
-            KeyCode::Char('p') => {
-                self.menu = Some(Menu {
-                    kind: MenuKind::Palettes,
-                    selected: self.palette,
-                })
-            }
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                self.sensitivity = (self.sensitivity + 0.1).min(3.0)
-            }
-            KeyCode::Char('-') => self.sensitivity = (self.sensitivity - 0.1).max(0.25),
-            KeyCode::Char('r') => {
-                self.demo = false;
-                self.connect();
-            }
-            KeyCode::Char('d') => {
-                self.demo = !self.demo;
-                if self.demo {
-                    self.capture = None;
-                } else {
-                    self.connect();
-                }
-            }
             _ => {}
         }
         Flow::Continue
@@ -305,12 +244,8 @@ impl App {
 
     fn connect(&mut self) {
         self.capture = None;
-        match audio::Capture::start(self.capture_config.clone()) {
-            Ok(capture) => {
-                self.capture = Some(capture);
-                self.capture_error = None;
-            }
-            Err(error) => self.capture_error = Some(error.to_string()),
+        if let Ok(capture) = audio::Capture::start(self.capture_config.clone()) {
+            self.capture = Some(capture);
         }
     }
 }
@@ -454,10 +389,10 @@ mod tests {
         assert_eq!(app.handle_key(press(KeyCode::Char('m'))), Flow::Continue);
         let menu = app.view(0.0).menu.unwrap();
         assert_eq!(menu.title, "Vibe");
-        assert_eq!(menu.items.len(), 4);
+        assert_eq!(menu.items.len(), 3);
 
         app.handle_key(press(KeyCode::Up));
-        assert_eq!(app.view(0.0).menu.unwrap().selected, 3);
+        assert_eq!(app.view(0.0).menu.unwrap().selected, 2);
         app.handle_key(press(KeyCode::Down));
         assert_eq!(app.view(0.0).menu.unwrap().selected, 0);
 
@@ -472,9 +407,11 @@ mod tests {
     }
 
     #[test]
-    fn palette_menu_starts_on_the_active_palette() {
+    fn palette_menu_is_reached_from_the_root_and_starts_on_the_active_palette() {
         let mut app = demo_app();
-        app.handle_key(press(KeyCode::Char('p')));
+        app.handle_key(press(KeyCode::Char('m')));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
         {
             let view = app.view(0.0);
             let menu = view.menu.unwrap();
@@ -485,20 +422,6 @@ mod tests {
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Enter));
         assert_eq!(app.view(0.0).palette, 1);
-    }
-
-    #[test]
-    fn open_popups_consume_global_shortcuts_until_closed() {
-        let mut app = demo_app();
-        app.handle_key(press(KeyCode::Char('?')));
-        assert!(app.view(0.0).help);
-        app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.scene(), 0);
-        app.handle_key(press(KeyCode::Esc));
-        assert!(!app.view(0.0).help);
-
-        app.handle_key(press(KeyCode::Right));
-        assert_eq!(app.scene(), 1);
     }
 
     #[test]
@@ -521,54 +444,14 @@ mod tests {
     }
 
     #[test]
-    fn q_and_ctrl_c_quit_from_any_overlay() {
+    fn q_and_ctrl_c_quit_from_the_menu() {
         let mut app = demo_app();
-        app.handle_key(press(KeyCode::Char('?')));
+        app.handle_key(press(KeyCode::Char('m')));
         assert_eq!(app.handle_key(press(KeyCode::Char('q'))), Flow::Quit);
 
         let mut app = demo_app();
         app.handle_key(press(KeyCode::Char('m')));
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(app.handle_key(ctrl_c), Flow::Quit);
-    }
-
-    #[test]
-    fn sensitivity_stays_within_cli_bounds_and_does_not_change_tempo() {
-        let mut app = demo_app();
-        for _ in 0..40 {
-            app.handle_key(press(KeyCode::Char('+')));
-        }
-        {
-            let view = app.view(0.0);
-            let status = view.status();
-            assert!((status.sensitivity - 3.0).abs() < 1e-5);
-            assert_eq!(status.bpm, Some(120.0));
-            assert!(view.reactivity.energy <= 1.0);
-            assert!(view.reactivity.kick <= 1.0);
-        }
-
-        for _ in 0..40 {
-            app.handle_key(press(KeyCode::Char('-')));
-        }
-        assert!((app.view(0.0).status().sensitivity - 0.25).abs() < 1e-5);
-    }
-
-    #[test]
-    fn capture_start_failure_is_reported_and_demo_toggle_recovers() {
-        let mut options = demo_options();
-        options.demo = false;
-        let mut app = App::new(options);
-        let view = app.view(1.0);
-        assert!(view.status().error.is_some());
-        assert_eq!(view.reactivity.energy, 0.0);
-
-        app.handle_key(press(KeyCode::Char('d')));
-        let view = app.view(1.0);
-        assert!(view.status().error.is_none());
-        assert!(view.status().source.is_none());
-        assert_eq!(view.status().bpm, Some(120.0));
-
-        app.handle_key(press(KeyCode::Char('d')));
-        assert!(app.view(1.0).status().error.is_some());
     }
 }

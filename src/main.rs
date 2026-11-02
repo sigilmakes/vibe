@@ -45,7 +45,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity\n  d             Demo\n  r             Reconnect audio\n  q             Quit\n\nCaptures the configured output monitor, never your microphone.\nUse --list-audio to discover sinks; --audio-source command/file for other backends.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  q             Quit\n\nCaptures the configured output monitor, never your microphone.\nUse --list-audio to discover sinks; --audio-source command/file for other backends.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -345,13 +345,7 @@ fn main() -> io::Result<()> {
                         view.reactivity,
                         &input.theme,
                     );
-                    ui::draw(
-                        frame,
-                        view.analysis,
-                        view.help,
-                        &view.status(),
-                        &input.theme,
-                    );
+                    ui::draw(frame, view.analysis, &view.status(), &input.theme);
                     if let Some(menu) = view.menu {
                         ui::menu(frame, menu.title, menu.items, menu.selected, &input.theme);
                     }
