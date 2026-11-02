@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -16,6 +16,8 @@ const HOP: usize = 512;
 const BANDS: usize = 32;
 const LOW_HZ: f32 = 40.0;
 const HIGH_HZ: f32 = 16_000.0;
+const STALL_AFTER: Duration = Duration::from_millis(600);
+const STALL_MESSAGE: &str = "Audio stalled · r to reconnect";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SampleFormat {
@@ -189,6 +191,7 @@ pub struct AudioState {
 
 pub struct Capture {
     child: Option<Child>,
+    shared: Arc<Mutex<AudioState>>,
 }
 
 struct OpenedSource {
@@ -422,7 +425,11 @@ fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) {
 }
 
 impl Capture {
-    pub fn start(config: CaptureConfig) -> io::Result<(Self, Arc<Mutex<AudioState>>)> {
+    /// Open the configured source and start the analysis worker.
+    ///
+    /// The returned capture samples the source on its own thread. Dropping it
+    /// stops the worker's source; the detached reader then exits.
+    pub fn start(config: CaptureConfig) -> io::Result<Self> {
         let OpenedSource {
             child,
             mut reader,
@@ -486,7 +493,35 @@ impl Capture {
             }
             return Err(error);
         }
-        Ok((Self { child }, state))
+        Ok(Self {
+            child,
+            shared: state,
+        })
+    }
+
+    /// Clone the latest analyzer state for display.
+    ///
+    /// A capture that has not produced a block for 600 ms is replaced with an
+    /// error state, so a stalled reader cannot freeze the visuals on old
+    /// audio. The source is preserved so the UI can still name it.
+    pub fn snapshot(&self) -> AudioState {
+        let mut state = self
+            .shared
+            .lock()
+            .ok()
+            .map(|state| state.clone())
+            .unwrap_or_default();
+        if state
+            .updated
+            .is_some_and(|updated| updated.elapsed() > STALL_AFTER)
+        {
+            state = AudioState {
+                source: state.source,
+                error: Some(STALL_MESSAGE.into()),
+                ..Default::default()
+            };
+        }
+        state
     }
 }
 
@@ -1146,6 +1181,48 @@ impl Rhythm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn capture_with(state: AudioState) -> Capture {
+        Capture {
+            child: None,
+            shared: Arc::new(Mutex::new(state)),
+        }
+    }
+
+    #[test]
+    fn snapshot_passes_fresh_audio_through_and_halts_stale_audio() {
+        let source = SourceInfo {
+            kind: "PipeWire".into(),
+            ..Default::default()
+        };
+        let fresh = capture_with(AudioState {
+            energy: 0.8,
+            bpm: Some(120.0),
+            connected: true,
+            updated: Some(Instant::now()),
+            source: source.clone(),
+            ..Default::default()
+        });
+        let state = fresh.snapshot();
+        assert_eq!(state.energy, 0.8);
+        assert_eq!(state.bpm, Some(120.0));
+        assert!(state.error.is_none());
+
+        let stale = capture_with(AudioState {
+            energy: 0.8,
+            bpm: Some(120.0),
+            connected: true,
+            updated: Some(Instant::now() - Duration::from_secs(2)),
+            source,
+            ..Default::default()
+        });
+        let state = stale.snapshot();
+        assert_eq!(state.energy, 0.0);
+        assert!(state.bpm.is_none());
+        assert!(!state.connected);
+        assert_eq!(state.source.kind, "PipeWire");
+        assert_eq!(state.error.as_deref(), Some(STALL_MESSAGE));
+    }
 
     #[test]
     fn chroma_folds_octaves_and_uses_c_first_pitch_classes() {
