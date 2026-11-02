@@ -4,22 +4,48 @@ when:
 
 engine: microvm
 image: nixos
+dependencies: [git]
 
 environment:
-  NIX_CONFIG: "experimental-features = nix-command flakes"
+  CARGO_BUILD_JOBS: "2"
+  CARGO_HOME: ".cargo"
+
+cache:
+  - key: vibe-cargo
+    hash: [Cargo.lock]
+    paths: [".cargo", "target"]
 
 steps:
+  - name: "Configure Nix"
+    command: |
+      ulimit -n 65536
+      mkdir -p "$HOME/.config/nix"
+      cat >> "$HOME/.config/nix/nix.conf" <<'EOF'
+      extra-substituters = https://cache.nixos.org
+      extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
+      EOF
+
   - name: "Flake check"
-    command: nix flake check --no-build
+    command: |
+      export NIX_CONFIG="experimental-features = nix-command flakes"
+      nix flake check --no-build --max-jobs 1
 
   - name: "Nix build"
-    command: nix build .#default --no-link
+    command: |
+      export NIX_CONFIG="experimental-features = nix-command flakes"
+      nix build .#default --no-link --max-jobs 1 --cores 2
 
   - name: "Format"
-    command: nix develop --command cargo fmt --check
+    command: |
+      export NIX_CONFIG="experimental-features = nix-command flakes"
+      nix develop --command cargo fmt --check
 
   - name: "Clippy"
-    command: nix develop --command cargo clippy --all-targets -- -D warnings
+    command: |
+      export NIX_CONFIG="experimental-features = nix-command flakes"
+      nix develop --command cargo clippy --all-targets -- -D warnings
 
   - name: "Tests"
-    command: nix develop --command cargo test --all-targets
+    command: |
+      export NIX_CONFIG="experimental-features = nix-command flakes"
+      nix develop --command cargo test --all-targets
