@@ -20,42 +20,42 @@ const HIGH_HZ: f32 = 16_000.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum SampleFormat {
     #[value(name = "f32le")]
-    F32Le,
+    F32,
     #[value(name = "s16le")]
-    S16Le,
+    S16,
     #[value(name = "s32le")]
-    S32Le,
+    S32,
 }
 
 impl SampleFormat {
     pub fn bytes(self) -> usize {
         match self {
-            Self::F32Le | Self::S32Le => 4,
-            Self::S16Le => 2,
+            Self::F32 | Self::S32 => 4,
+            Self::S16 => 2,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::F32Le => "f32le",
-            Self::S16Le => "s16le",
-            Self::S32Le => "s32le",
+            Self::F32 => "f32le",
+            Self::S16 => "s16le",
+            Self::S32 => "s32le",
         }
     }
 
     fn pipewire(self) -> &'static str {
         match self {
-            Self::F32Le => "f32",
-            Self::S16Le => "s16",
-            Self::S32Le => "s32",
+            Self::F32 => "f32",
+            Self::S16 => "s16",
+            Self::S32 => "s32",
         }
     }
 
     fn pulse(self) -> &'static str {
         match self {
-            Self::F32Le => "float32le",
-            Self::S16Le => "s16le",
-            Self::S32Le => "s32le",
+            Self::F32 => "float32le",
+            Self::S16 => "s16le",
+            Self::S32 => "s32le",
         }
     }
 }
@@ -72,7 +72,7 @@ impl Default for PcmFormat {
         Self {
             rate: SAMPLE_RATE as u32,
             channels: 2,
-            sample: SampleFormat::F32Le,
+            sample: SampleFormat::F32,
         }
     }
 }
@@ -399,15 +399,15 @@ fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) {
         for channel in 0..channels {
             let offset = channel * format.sample.bytes();
             let value = match format.sample {
-                SampleFormat::F32Le => {
+                SampleFormat::F32 => {
                     f32::from_le_bytes(frame[offset..offset + 4].try_into().expect("f32 sample"))
                 }
-                SampleFormat::S16Le => {
+                SampleFormat::S16 => {
                     i16::from_le_bytes(frame[offset..offset + 2].try_into().expect("s16 sample"))
                         as f32
                         / 32_768.0
                 }
-                SampleFormat::S32Le => {
+                SampleFormat::S32 => {
                     i32::from_le_bytes(frame[offset..offset + 4].try_into().expect("s32 sample"))
                         as f32
                         / 2_147_483_648.0
@@ -514,19 +514,75 @@ pub struct AudioDevice {
 /// List PipeWire sink and source nodes, marking the default sink and source.
 /// The output is intentionally based on `pw-dump` rather than a guessed node name.
 pub fn list_audio() -> io::Result<Vec<AudioDevice>> {
-    let output = Command::new("pw-dump").output().map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("could not run pw-dump: {error}; install PipeWire or use --audio-command"),
-        )
-    })?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "pw-dump failed with {}",
-            output.status
-        )));
+    let pipewire_error = match Command::new("pw-dump").output() {
+        Ok(output) if output.status.success() => match parse_pw_dump(&output.stdout) {
+            Ok(devices) => return Ok(devices),
+            Err(error) => format!("could not parse pw-dump output: {error}"),
+        },
+        Ok(output) => format!("pw-dump failed with {}", output.status),
+        Err(error) => format!("could not run pw-dump: {error}"),
+    };
+    match list_pulse() {
+        Ok(devices) => Ok(devices),
+        Err(error) => Err(io::Error::other(format!(
+            "{pipewire_error}; {error}; install PipeWire or PulseAudio, or use --audio-command"
+        ))),
     }
-    parse_pw_dump(&output.stdout).map_err(io::Error::other)
+}
+
+fn list_pulse() -> io::Result<Vec<AudioDevice>> {
+    let info = Command::new("pactl").arg("info").output()?;
+    if !info.status.success() {
+        return Err(io::Error::other("pactl info failed"));
+    }
+    let info = String::from_utf8_lossy(&info.stdout);
+    let default_sink = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Default Sink: "))
+        .map(str::to_owned);
+    let default_source = info
+        .lines()
+        .find_map(|line| line.strip_prefix("Default Source: "))
+        .map(str::to_owned);
+    let mut devices = Vec::new();
+    for (kind, default) in [("sink", &default_sink), ("source", &default_source)] {
+        let output = Command::new("pactl")
+            .args(["list", "short", &format!("{kind}s")])
+            .output()?;
+        if !output.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            if fields.len() < 2 {
+                continue;
+            }
+            let name = fields[1].to_owned();
+            let serial = fields[0].parse::<u64>().ok();
+            let mut channels = None;
+            let mut rate = None;
+            if let Some(spec) = fields.get(3) {
+                for token in spec.split_whitespace() {
+                    if let Some(value) = token.strip_suffix("ch") {
+                        channels = value.parse().ok();
+                    } else if let Some(value) = token.strip_suffix("Hz") {
+                        rate = value.parse().ok();
+                    }
+                }
+            }
+            devices.push(AudioDevice {
+                kind,
+                description: name.clone(),
+                default: default.as_deref() == Some(name.as_str()),
+                name,
+                serial,
+                channels,
+                rate,
+            });
+        }
+    }
+    devices.sort_by_key(|device| (device.kind != "sink", device.name.clone()));
+    Ok(devices)
 }
 
 fn parse_pw_dump(bytes: &[u8]) -> Result<Vec<AudioDevice>, serde_json::Error> {
@@ -1605,7 +1661,7 @@ mod tests {
         let format = PcmFormat {
             rate: 48_000,
             channels: 2,
-            sample: SampleFormat::F32Le,
+            sample: SampleFormat::F32,
         };
         let mut bytes = Vec::new();
         for frame in [[0.25_f32, 0.75], [0.5, -0.5]] {
@@ -1620,7 +1676,7 @@ mod tests {
         let format = PcmFormat {
             rate: 48_000,
             channels: 1,
-            sample: SampleFormat::S16Le,
+            sample: SampleFormat::S16,
         };
         let bytes = [0x00, 0x40, 0x00, 0x80];
         decode_pcm(&bytes, format, &mut samples);
@@ -1630,7 +1686,7 @@ mod tests {
         let format = PcmFormat {
             rate: 48_000,
             channels: 1,
-            sample: SampleFormat::S32Le,
+            sample: SampleFormat::S32,
         };
         let bytes = 1_073_741_824_i32.to_le_bytes();
         decode_pcm(&bytes, format, &mut samples);

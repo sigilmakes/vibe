@@ -78,14 +78,11 @@ struct SceneEntry {
 const REGISTRY: [SceneEntry; SCENE_COUNT] = build_registry();
 
 const fn build_registry() -> [SceneEntry; SCENE_COUNT] {
-    let mut scenes = [
-        SceneEntry {
-            name: "",
-            family: Family::Original,
-            local: 0,
-        };
-        SCENE_COUNT
-    ];
+    let mut scenes = [SceneEntry {
+        name: "",
+        family: Family::Original,
+        local: 0,
+    }; SCENE_COUNT];
     let mut index = 0;
     let mut family = 0;
     while family < ORIGINAL_FAMILIES.len() {
@@ -296,9 +293,9 @@ impl Renderer {
         }
         let (family, local) = scene_route(scene);
         match family {
-            Family::Original => self.draw_original(
-                buf, area, time, local, palette, bands, audio, theme,
-            ),
+            Family::Original => {
+                self.draw_original(buf, area, time, local, palette, bands, audio, theme)
+            }
             Family::Glyphs => self
                 .glyphs
                 .get_or_insert_with(Default::default)

@@ -165,7 +165,7 @@ struct Args {
     #[arg(long, value_enum, default_value = "f32le", value_name = "FORMAT")]
     audio_format: audio::SampleFormat,
     /// Raw PCM sample rate
-    #[arg(long, default_value_t = 48000, value_parser = clap::value_parser!(u32).range(1..=384_000))]
+    #[arg(long, default_value_t = 48000, value_parser = clap::value_parser!(u32).range(8_000..=192_000))]
     audio_rate: u32,
     /// Raw PCM channel count
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=32))]
@@ -173,7 +173,7 @@ struct Args {
     /// PipeWire/PulseAudio sink node name or serial
     #[arg(long = "audio-target", visible_alias = "target", value_name = "NODE")]
     audio_target: Option<String>,
-    /// List available PipeWire sinks and sources, then exit
+    /// List available audio sinks and sources, then exit
     #[arg(long)]
     list_audio: bool,
     /// Render frame-rate cap
@@ -752,10 +752,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_sensitivity_is_rejected() {
+    fn invalid_sensitivity_and_fps_are_rejected() {
         use clap::Parser;
         for value in ["NaN", "-2", "0", "4"] {
             assert!(Args::try_parse_from(["vibe", "--sensitivity", value]).is_err());
+        }
+        for value in ["0", "241", "many"] {
+            assert!(Args::try_parse_from(["vibe", "--fps", value]).is_err());
+        }
+        for value in ["0", "192001"] {
+            assert!(Args::try_parse_from(["vibe", "--audio-rate", value]).is_err());
         }
     }
 }

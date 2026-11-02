@@ -36,7 +36,7 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postInstall = ''
               wrapProgram $out/bin/vibe \
-                  --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.pipewire ]}
+                  --prefix PATH : ${nixpkgs.lib.makeBinPath [ pkgs.pipewire pkgs.pulseaudio ]}
             '';
             meta = {
               description = "Audio-reactive terminal visualiser";
@@ -67,6 +67,7 @@
               clippy
               pkg-config
               pipewire
+              pulseaudio
               rustc
               rustfmt
             ];
