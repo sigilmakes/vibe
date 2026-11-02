@@ -21,13 +21,13 @@ cargo build --release
 Run without installing:
 
 ```sh
-nix run git+https://mnemosyne.sigilzero.dev/sigilzero/vibe
+nix run git+https://tangled.org/sigilzero.dev/vibe
 ```
 
 Install into your user profile:
 
 ```sh
-nix profile add git+https://mnemosyne.sigilzero.dev/sigilzero/vibe
+nix profile add git+https://tangled.org/sigilzero.dev/vibe
 vibe
 ```
 
