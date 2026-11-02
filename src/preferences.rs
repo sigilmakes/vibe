@@ -36,9 +36,7 @@ mod tests {
         );
         assert_eq!(
             state_path(None, Some(Path::new("/home/willow"))),
-            Some(PathBuf::from(
-                "/home/willow/.local/state/vibe/last-scene"
-            ))
+            Some(PathBuf::from("/home/willow/.local/state/vibe/last-scene"))
         );
         assert_eq!(
             state_path(Some(Path::new("")), Some(Path::new("/home/willow"))),

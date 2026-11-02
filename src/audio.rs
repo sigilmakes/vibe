@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,6 +16,133 @@ const HOP: usize = 512;
 const BANDS: usize = 32;
 const LOW_HZ: f32 = 40.0;
 const HIGH_HZ: f32 = 16_000.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum SampleFormat {
+    #[value(name = "f32le")]
+    F32Le,
+    #[value(name = "s16le")]
+    S16Le,
+    #[value(name = "s32le")]
+    S32Le,
+}
+
+impl SampleFormat {
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::F32Le | Self::S32Le => 4,
+            Self::S16Le => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F32Le => "f32le",
+            Self::S16Le => "s16le",
+            Self::S32Le => "s32le",
+        }
+    }
+
+    fn pipewire(self) -> &'static str {
+        match self {
+            Self::F32Le => "f32",
+            Self::S16Le => "s16",
+            Self::S32Le => "s32",
+        }
+    }
+
+    fn pulse(self) -> &'static str {
+        match self {
+            Self::F32Le => "float32le",
+            Self::S16Le => "s16le",
+            Self::S32Le => "s32le",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PcmFormat {
+    pub rate: u32,
+    pub channels: u16,
+    pub sample: SampleFormat,
+}
+
+impl Default for PcmFormat {
+    fn default() -> Self {
+        Self {
+            rate: SAMPLE_RATE as u32,
+            channels: 2,
+            sample: SampleFormat::F32Le,
+        }
+    }
+}
+
+impl PcmFormat {
+    pub fn frame_bytes(self) -> usize {
+        self.channels as usize * self.sample.bytes()
+    }
+
+    pub fn validate(self) -> io::Result<Self> {
+        if self.rate == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audio sample rate must be greater than zero",
+            ));
+        }
+        if self.channels == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "audio channel count must be greater than zero",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Backend {
+    Auto,
+    PipeWire,
+    Pulse,
+    Command(String),
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureConfig {
+    pub backend: Backend,
+    pub target: Option<String>,
+    pub format: PcmFormat,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceInfo {
+    pub kind: String,
+    pub target: Option<String>,
+    pub rate: u32,
+    pub channels: u16,
+    pub format: String,
+}
+
+impl SourceInfo {
+    pub fn describe(&self) -> String {
+        let mut text = self.kind.clone();
+        if let Some(target) = &self.target {
+            if !target.is_empty() {
+                text.push_str(" · ");
+                text.push_str(target);
+            }
+        }
+        if self.rate > 0 {
+            text.push_str(&format!(" · {} Hz · {} ch", self.rate, self.channels));
+        }
+        if !self.format.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&self.format);
+        }
+        text
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct AudioState {
@@ -52,71 +181,297 @@ pub struct AudioState {
     pub updated: Option<Instant>,
     pub connected: bool,
     pub error: Option<String>,
+    /// Where the samples came from, for diagnostics and the status overlay.
+    pub source: SourceInfo,
+    /// Time since the last block above the noise gate. A live pipe can be silent.
+    pub silent_for: f32,
 }
 
 pub struct Capture {
-    child: Child,
+    child: Option<Child>,
+}
+
+struct OpenedSource {
+    child: Option<Child>,
+    reader: Box<dyn Read + Send>,
+    stderr: Arc<Mutex<String>>,
+    info: SourceInfo,
+}
+
+fn which(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+fn stderr_text(stderr: &Arc<Mutex<String>>) -> String {
+    stderr
+        .lock()
+        .ok()
+        .map(|text| {
+            text.lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_owned()
+        })
+        .unwrap_or_default()
+}
+
+fn spawn_stderr(mut stderr: std::process::ChildStderr) -> Arc<Mutex<String>> {
+    let text = Arc::new(Mutex::new(String::new()));
+    let worker_text = Arc::clone(&text);
+    let _ = thread::Builder::new()
+        .name("audio-stderr".into())
+        .spawn(move || {
+            let mut buffer = [0_u8; 512];
+            while let Ok(size) = stderr.read(&mut buffer) {
+                if size == 0 {
+                    break;
+                }
+                if let Ok(mut text) = worker_text.lock() {
+                    text.push_str(&String::from_utf8_lossy(&buffer[..size]));
+                    if text.len() > 4096 {
+                        let keep = text.len() - 4096;
+                        text.drain(..keep);
+                    }
+                }
+            }
+        });
+    text
+}
+
+fn default_sink_name() -> Option<String> {
+    let output = Command::new("pw-dump").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_pw_dump(&output.stdout)
+        .ok()?
+        .into_iter()
+        .find(|device| device.kind == "sink" && device.default)
+        .map(|device| device.name)
+}
+
+fn pipewire(config: &CaptureConfig) -> io::Result<OpenedSource> {
+    let format = config.format.validate()?;
+    let mut command = Command::new("pw-record");
+    command.args([
+        "--raw",
+        "--format",
+        format.sample.pipewire(),
+        "--rate",
+        &format.rate.to_string(),
+        "--channels",
+        &format.channels.to_string(),
+        "--latency",
+        "256",
+        "--properties",
+        "{ stream.capture.sink = true }",
+    ]);
+    if let Some(target) = &config.target {
+        command.arg("--target").arg(target);
+    }
+    let mut child = command
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let reader = child.stdout.take().expect("piped capture stdout");
+    let stderr = child.stderr.take().map(spawn_stderr).unwrap_or_default();
+    Ok(OpenedSource {
+        child: Some(child),
+        reader: Box::new(reader),
+        stderr,
+        info: SourceInfo {
+            kind: "PipeWire".into(),
+            target: config
+                .target
+                .clone()
+                .or_else(default_sink_name)
+                .or_else(|| Some("default sink monitor".into())),
+            rate: format.rate,
+            channels: format.channels,
+            format: format.sample.name().into(),
+        },
+    })
+}
+
+fn pulse(config: &CaptureConfig) -> io::Result<OpenedSource> {
+    let format = config.format.validate()?;
+    let device = config
+        .target
+        .clone()
+        .unwrap_or_else(|| "@DEFAULT_MONITOR@".into());
+    let mut child = Command::new("parec")
+        .arg(format!("--format={}", format.sample.pulse()))
+        .arg(format!("--rate={}", format.rate))
+        .arg(format!("--channels={}", format.channels))
+        .arg(format!("--device={device}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let reader = child.stdout.take().expect("piped capture stdout");
+    let stderr = child.stderr.take().map(spawn_stderr).unwrap_or_default();
+    Ok(OpenedSource {
+        child: Some(child),
+        reader: Box::new(reader),
+        stderr,
+        info: SourceInfo {
+            kind: "PulseAudio".into(),
+            target: Some(device),
+            rate: format.rate,
+            channels: format.channels,
+            format: format.sample.name().into(),
+        },
+    })
+}
+
+fn command_source(command: &str, format: PcmFormat) -> io::Result<OpenedSource> {
+    let format = format.validate()?;
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let reader = child.stdout.take().expect("piped command stdout");
+    let stderr = child.stderr.take().map(spawn_stderr).unwrap_or_default();
+    Ok(OpenedSource {
+        child: Some(child),
+        reader: Box::new(reader),
+        stderr,
+        info: SourceInfo {
+            kind: "command".into(),
+            target: Some(command.to_owned()),
+            rate: format.rate,
+            channels: format.channels,
+            format: format.sample.name().into(),
+        },
+    })
+}
+
+fn file_source(path: &PathBuf, format: PcmFormat) -> io::Result<OpenedSource> {
+    let format = format.validate()?;
+    Ok(OpenedSource {
+        child: None,
+        reader: Box::new(File::open(path)?),
+        stderr: Arc::new(Mutex::new(String::new())),
+        info: SourceInfo {
+            kind: "file".into(),
+            target: Some(path.display().to_string()),
+            rate: format.rate,
+            channels: format.channels,
+            format: format.sample.name().into(),
+        },
+    })
+}
+
+fn open_source(config: &CaptureConfig) -> io::Result<OpenedSource> {
+    match &config.backend {
+        Backend::PipeWire => pipewire(config),
+        Backend::Pulse => pulse(config),
+        Backend::Command(command) => command_source(command, config.format),
+        Backend::File(path) => file_source(path, config.format),
+        Backend::Auto => {
+            if which("pw-record") {
+                pipewire(config)
+            } else if which("parec") {
+                pulse(config)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no supported audio capture tool found; install PipeWire (pw-record) or PulseAudio (parec), or use --audio-command",
+                ))
+            }
+        }
+    }
+}
+
+fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) {
+    let frame_bytes = format.frame_bytes();
+    let channels = format.channels as usize;
+    for (sample, frame) in samples.iter_mut().zip(bytes.chunks_exact(frame_bytes)) {
+        let mut sum = 0.0;
+        for channel in 0..channels {
+            let offset = channel * format.sample.bytes();
+            let value = match format.sample {
+                SampleFormat::F32Le => {
+                    f32::from_le_bytes(frame[offset..offset + 4].try_into().expect("f32 sample"))
+                }
+                SampleFormat::S16Le => {
+                    i16::from_le_bytes(frame[offset..offset + 2].try_into().expect("s16 sample"))
+                        as f32
+                        / 32_768.0
+                }
+                SampleFormat::S32Le => {
+                    i32::from_le_bytes(frame[offset..offset + 4].try_into().expect("s32 sample"))
+                        as f32
+                        / 2_147_483_648.0
+                }
+            };
+            if value.is_finite() {
+                sum += value;
+            }
+        }
+        *sample = sum / channels as f32;
+    }
 }
 
 impl Capture {
-    pub fn start(target: Option<String>) -> io::Result<(Self, Arc<Mutex<AudioState>>)> {
-        let mut command = Command::new("pw-record");
-        command.args([
-            "--raw",
-            "--format",
-            "f32",
-            "--rate",
-            "48000",
-            "--channels",
-            "2",
-            "--latency",
-            "256",
-            "--properties",
-            "{ stream.capture.sink = true }",
-        ]);
-        if let Some(target) = target {
-            command.arg("--target").arg(target);
-        }
-        let mut child = command
-            .arg("-")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let mut stdout = child.stdout.take().expect("piped capture stdout");
-        let state = Arc::new(Mutex::new(AudioState::default()));
+    pub fn start(config: CaptureConfig) -> io::Result<(Self, Arc<Mutex<AudioState>>)> {
+        let OpenedSource {
+            child,
+            mut reader,
+            stderr,
+            info,
+        } = open_source(&config)?;
+        let source = info;
+        let state = Arc::new(Mutex::new(AudioState {
+            source: source.clone(),
+            ..Default::default()
+        }));
         let worker_state = Arc::clone(&state);
+        let worker_stderr = Arc::clone(&stderr);
+        let worker_info = source;
+        let format = config.format;
         let worker = thread::Builder::new()
             .name("audio-capture".into())
             .spawn(move || {
-                let mut analyzer = Analyzer::new();
-                let mut bytes = [0_u8; HOP * 2 * 4];
+                let mut analyzer = Analyzer::with_sample_rate(format.rate as usize);
+                let mut bytes = vec![0_u8; HOP * format.frame_bytes()];
                 let mut samples = [0.0_f32; HOP];
                 loop {
-                    if let Err(error) = stdout.read_exact(&mut bytes) {
+                    if let Err(error) = reader.read_exact(&mut bytes) {
+                        let detail = stderr_text(&worker_stderr);
+                        let base = if error.kind() == io::ErrorKind::UnexpectedEof {
+                            "Audio capture ended"
+                        } else {
+                            "Audio capture failed"
+                        };
+                        let message = if detail.is_empty() {
+                            format!("{base}: {error}")
+                        } else {
+                            format!("{base}: {detail}")
+                        };
                         if let Ok(mut state) = worker_state.lock() {
-                            *state = AudioState::default();
-                            state.error = Some(if error.kind() == io::ErrorKind::UnexpectedEof {
-                                "Audio capture ended; check the PipeWire output target".into()
-                            } else {
-                                format!("Audio capture failed: {error}")
-                            });
+                            *state = AudioState {
+                                source: worker_info.clone(),
+                                error: Some(message),
+                                ..Default::default()
+                            };
                         }
                         break;
                     }
-                    for (sample, frame) in samples.iter_mut().zip(bytes.as_chunks::<8>().0) {
-                        let left = f32::from_le_bytes(frame[..4].try_into().unwrap());
-                        let right = f32::from_le_bytes(frame[4..].try_into().unwrap());
-                        *sample = if left.is_finite() && right.is_finite() {
-                            left * 0.5 + right * 0.5
-                        } else {
-                            0.0
-                        };
-                    }
+                    decode_pcm(&bytes, format, &mut samples);
                     let updated = Instant::now();
                     let mut analyzed = analyzer.analyze(&samples);
                     analyzed.updated = Some(updated);
                     analyzed.connected = true;
+                    analyzed.source = worker_info.clone();
                     if let Ok(mut state) = worker_state.lock() {
                         *state = analyzed;
                     } else {
@@ -125,8 +480,10 @@ impl Capture {
                 }
             });
         if let Err(error) = worker {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             return Err(error);
         }
         Ok((Self { child }, state))
@@ -135,22 +492,138 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         // Killing the writer releases the detached reader without joining it.
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioDevice {
+    pub kind: &'static str,
+    pub name: String,
+    pub description: String,
+    pub serial: Option<u64>,
+    pub channels: Option<u64>,
+    pub rate: Option<u64>,
+    pub default: bool,
+}
+
+/// List PipeWire sink and source nodes, marking the default sink and source.
+/// The output is intentionally based on `pw-dump` rather than a guessed node name.
+pub fn list_audio() -> io::Result<Vec<AudioDevice>> {
+    let output = Command::new("pw-dump").output().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("could not run pw-dump: {error}; install PipeWire or use --audio-command"),
+        )
+    })?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "pw-dump failed with {}",
+            output.status
+        )));
+    }
+    parse_pw_dump(&output.stdout).map_err(io::Error::other)
+}
+
+fn parse_pw_dump(bytes: &[u8]) -> Result<Vec<AudioDevice>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let Some(objects) = value.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut defaults = std::collections::HashMap::new();
+    for object in objects {
+        if object.get("type").and_then(|v| v.as_str()) != Some("PipeWire:Interface:Metadata") {
+            continue;
+        }
+        if object
+            .pointer("/props/metadata.name")
+            .and_then(|v| v.as_str())
+            != Some("default")
+        {
+            continue;
+        }
+        if let Some(entries) = object.get("metadata").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let Some(key) = entry.get("key").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if key != "default.audio.sink" && key != "default.audio.source" {
+                    continue;
+                }
+                let value = entry.get("value");
+                let name = value
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .or_else(|| value.and_then(|v| v.as_str()));
+                if let Some(name) = name {
+                    defaults.insert(
+                        if key.ends_with("sink") {
+                            "sink"
+                        } else {
+                            "source"
+                        },
+                        name.to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    let mut devices = Vec::new();
+    for object in objects {
+        if object.get("type").and_then(|v| v.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let props = object.get("info").and_then(|v| v.get("props"));
+        let Some(props) = props else { continue };
+        let media_class = props
+            .get("media.class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let kind = match media_class {
+            "Audio/Sink" => "sink",
+            "Audio/Source" => "source",
+            _ => continue,
+        };
+        let name = props
+            .get("node.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(unnamed)");
+        let description = props
+            .get("node.description")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name);
+        let serial = props.get("object.serial").and_then(|v| v.as_u64());
+        let channels = props.get("audio.channels").and_then(|v| v.as_u64());
+        let rate = props.get("audio.rate").and_then(|v| v.as_u64());
+        devices.push(AudioDevice {
+            kind,
+            name: name.to_owned(),
+            description: description.to_owned(),
+            serial,
+            channels,
+            rate,
+            default: defaults.get(kind).map(String::as_str) == Some(name),
+        });
+    }
+    devices.sort_by_key(|device| (device.kind != "sink", device.name.clone()));
+    Ok(devices)
+}
+
 // Envelopes run on the audio clock, independent of render rate or pipe scheduling.
+#[cfg(test)]
 const DT: f32 = HOP as f32 / SAMPLE_RATE as f32;
 const NOISE_GATE: f32 = 0.0015;
 const REF_MIN: f32 = 0.025;
 const REF_MAX: f32 = 0.5;
 const REFRACTORY: f32 = 0.032;
 
-fn follow(current: f32, target: f32, attack: f32, release: f32) -> f32 {
+fn follow(current: f32, target: f32, attack: f32, release: f32, dt: f32) -> f32 {
     let tau = if target > current { attack } else { release };
-    current + (target - current) * (1.0 - (-DT / tau).exp())
+    current + (target - current) * (1.0 - (-dt / tau).exp())
 }
 
 struct Analyzer {
@@ -168,11 +641,20 @@ struct Analyzer {
     state: AudioState,
     reference: f32,
     quiet_time: f32,
+    dt: f32,
+    sample_rate: f32,
     rhythm: Rhythm,
 }
 
 impl Analyzer {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_sample_rate(SAMPLE_RATE)
+    }
+
+    fn with_sample_rate(sample_rate: usize) -> Self {
+        let sample_rate = sample_rate.max(1) as f32;
+        let dt = HOP as f32 / sample_rate;
         let fft = FftPlanner::<f32>::new().plan_fft_forward(FRAMES);
         let scratch = vec![Complex::default(); fft.get_inplace_scratch_len()];
         let window = (0..FRAMES)
@@ -182,8 +664,8 @@ impl Analyzer {
         for (i, range) in ranges.iter_mut().enumerate() {
             let low = LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / BANDS as f32);
             let high = LOW_HZ * (HIGH_HZ / LOW_HZ).powf((i + 1) as f32 / BANDS as f32);
-            let start = (low * FRAMES as f32 / SAMPLE_RATE as f32).ceil() as usize;
-            let end = (high * FRAMES as f32 / SAMPLE_RATE as f32).ceil() as usize;
+            let start = (low * FRAMES as f32 / sample_rate).ceil() as usize;
+            let end = (high * FRAMES as f32 / sample_rate).ceil() as usize;
             *range = (start.max(1), end.max(start + 1).min(FRAMES / 2));
         }
         Self {
@@ -201,7 +683,9 @@ impl Analyzer {
             state: AudioState::default(),
             reference: 0.1,
             quiet_time: 0.0,
-            rhythm: Rhythm::default(),
+            dt,
+            sample_rate,
+            rhythm: Rhythm::new(dt),
         }
     }
 
@@ -212,7 +696,7 @@ impl Analyzer {
         if !audible {
             return;
         }
-        let bin_hz = SAMPLE_RATE as f32 / FRAMES as f32;
+        let bin_hz = self.sample_rate / FRAMES as f32;
         let start = (LOW_HZ / bin_hz).ceil() as usize;
         let end = (HIGH_HZ / bin_hz).ceil() as usize;
         let mut powers = [0.0_f32; FRAMES / 2];
@@ -286,15 +770,26 @@ impl Analyzer {
         }
         let rms = (squares / HOP as f32).sqrt();
         let audible = rms > NOISE_GATE;
-        self.quiet_time = if audible { 0.0 } else { self.quiet_time + DT };
+        self.quiet_time = if audible {
+            0.0
+        } else {
+            self.quiet_time + self.dt
+        };
+        self.state.silent_for = self.quiet_time;
         // Freeze adaptation below the gate: silence must never turn into extra gain.
         if audible {
-            self.reference = follow(self.reference, rms.clamp(REF_MIN, REF_MAX), 2.0, 6.0)
-                .clamp(REF_MIN, REF_MAX);
+            self.reference = follow(
+                self.reference,
+                rms.clamp(REF_MIN, REF_MAX),
+                2.0,
+                6.0,
+                self.dt,
+            )
+            .clamp(REF_MIN, REF_MAX);
         }
         let gate = ((rms - NOISE_GATE) / NOISE_GATE).clamp(0.0, 1.0);
         let target = (0.65 * (rms / self.reference).sqrt()).min(1.0) * gate;
-        self.state.energy = follow(self.state.energy, target, 0.045, 0.3);
+        self.state.energy = follow(self.state.energy, target, 0.045, 0.3, self.dt);
         self.state.rms = rms.clamp(0.0, 1.0);
         self.state.peak = peak.clamp(0.0, 1.0);
         for (point, chunk) in self
@@ -311,7 +806,7 @@ impl Analyzer {
         self.analyze_spectral_shape(audible);
         let mut power = [0.0_f32; 3];
         for i in 1..FRAMES / 2 {
-            let hz = i as f32 * SAMPLE_RATE as f32 / FRAMES as f32;
+            let hz = i as f32 * self.sample_rate / FRAMES as f32;
             let magnitude = self.buffer[i].norm() * (2.0 / FRAMES as f32);
             if (LOW_HZ..HIGH_HZ).contains(&hz) {
                 let region = if hz < 250.0 {
@@ -340,8 +835,8 @@ impl Analyzer {
             let compressed = (1.0 + magnitude / self.band_reference[i].max(0.003)).ln();
             let rise = (compressed - self.band_previous[i]).max(0.0) * gate;
             self.band_previous[i] = compressed;
-            self.band_reference[i] = follow(self.band_reference[i], magnitude, 0.8, 1.5);
-            let hz = (start + end) as f32 * 0.5 * SAMPLE_RATE as f32 / FRAMES as f32;
+            self.band_reference[i] = follow(self.band_reference[i], magnitude, 0.8, 1.5, self.dt);
+            let hz = (start + end) as f32 * 0.5 * self.sample_rate / FRAMES as f32;
             let region = if hz < 250.0 {
                 0
             } else if hz < 2000.0 {
@@ -356,12 +851,12 @@ impl Analyzer {
             attack_counts[region] += 1.0;
             novelty[0] += rise;
             counts[0] += 1.0;
-            if end as f32 * SAMPLE_RATE as f32 / FRAMES as f32 <= 300.0 {
+            if end as f32 * self.sample_rate / FRAMES as f32 <= 300.0 {
                 novelty[1] += rise;
                 counts[1] += 1.0;
             }
             let target = (0.65 * (magnitude / self.reference).sqrt()).min(1.0) * gate;
-            self.state.bands[i] = follow(self.state.bands[i], target, 0.018, 0.14);
+            self.state.bands[i] = follow(self.state.bands[i], target, 0.018, 0.14, self.dt);
         }
         for (value, count) in novelty.iter_mut().zip(counts) {
             *value /= count.max(1.0);
@@ -375,15 +870,15 @@ impl Analyzer {
         .zip(power)
         {
             let target = (0.65 * (power.sqrt() / self.reference).sqrt()).min(1.0) * gate;
-            *value = follow(*value, target, 0.04, 0.25);
+            *value = follow(*value, target, 0.04, 0.25, self.dt);
         }
         let mut onset = false;
         let mut fast_novelty = 0.0_f32;
         for region in 0..4 {
             let rise = attacks[region] / attack_counts[region].max(1.0);
             let threshold = 0.008 + self.attack_mean[region] * 2.0;
-            self.attack_cooldown[region] = (self.attack_cooldown[region] - DT).max(0.0);
-            self.state.transients[region] *= (-DT / 0.045).exp();
+            self.attack_cooldown[region] = (self.attack_cooldown[region] - self.dt).max(0.0);
+            self.state.transients[region] *= (-self.dt / 0.045).exp();
             // Independent refractory periods preserve adjacent instruments and
             // rapid subdivisions; only rising novelty can start a new attack.
             let minimum_share = if region == 0 { 0.04 } else { 0.004 };
@@ -402,14 +897,14 @@ impl Analyzer {
                 fast_novelty = fast_novelty.max((rise / (threshold * 2.0)).min(1.0));
             }
             self.attack_previous[region] = rise;
-            self.attack_mean[region] = follow(self.attack_mean[region], rise, 0.8, 0.8);
+            self.attack_mean[region] = follow(self.attack_mean[region], rise, 0.8, 0.8, self.dt);
         }
-        self.state.novelty = follow(self.state.novelty, fast_novelty, 0.005, 0.025);
+        self.state.novelty = follow(self.state.novelty, fast_novelty, 0.005, 0.025, self.dt);
         self.state.onset = self.state.transients.iter().copied().fold(0.0, f32::max);
         self.state.kick = self.state.transients[0];
         self.rhythm.push(novelty, onset);
         if self.quiet_time > 1.5 {
-            self.rhythm = Rhythm::default();
+            self.rhythm = Rhythm::new(self.dt);
         }
         self.state.bpm = self.rhythm.bpm;
         self.state.tempo_confidence = self.rhythm.confidence;
@@ -426,6 +921,7 @@ impl Analyzer {
 /// Continuous full-spectrum and low-band novelty retain subthreshold rhythm.
 #[derive(Default)]
 struct Rhythm {
+    dt: f32,
     history: VecDeque<[f32; 2]>,
     frames: usize,
     bpm: Option<f32>,
@@ -436,13 +932,20 @@ struct Rhythm {
 }
 
 impl Rhythm {
+    fn new(dt: f32) -> Self {
+        Self {
+            dt,
+            ..Default::default()
+        }
+    }
+
     fn push(&mut self, novelty: [f32; 2], attack: bool) {
         self.history.push_back(novelty);
-        if self.history.len() > (10.0 / DT) as usize {
+        if self.history.len() > (10.0 / self.dt) as usize {
             self.history.pop_front();
         }
         if let Some(bpm) = self.bpm {
-            self.phase = (self.phase + DT * bpm / 60.0).fract();
+            self.phase = (self.phase + self.dt * bpm / 60.0).fract();
             // Correct near the expected beat, never reset on arbitrary offbeats.
             let error = if self.phase > 0.5 {
                 self.phase - 1.0
@@ -454,11 +957,11 @@ impl Rhythm {
             }
         }
         self.frames += 1;
-        if !self.frames.is_multiple_of(24) || self.history.len() < (4.0 / DT) as usize {
+        if !self.frames.is_multiple_of(24) || self.history.len() < (4.0 / self.dt) as usize {
             return;
         }
-        let min_lag = (60.0 / (260.0 * DT)).floor() as usize;
-        let max_lag = (60.0 / (60.0 * DT)).ceil() as usize;
+        let min_lag = (60.0 / (260.0 * self.dt)).floor() as usize;
+        let max_lag = (60.0 / (60.0 * self.dt)).ceil() as usize;
         let n = self.history.len();
         let mut correlations = vec![[0.0_f32; 2]; max_lag * 2 + 3];
         for channel in 0..2 {
@@ -492,7 +995,7 @@ impl Rhythm {
         let mut lag = (min_lag..=max_lag)
             .max_by(|&a, &b| {
                 let preference = |lag: usize| {
-                    let bpm = 60.0 / (lag as f32 * DT);
+                    let bpm = 60.0 / (lag as f32 * self.dt);
                     let continuity = self.bpm.map_or(0.0, |old| {
                         0.025 * (1.0 - ((bpm / old).ln().abs() / 0.08).min(1.0))
                     });
@@ -502,7 +1005,7 @@ impl Rhythm {
             })
             .unwrap();
         if let Some(old) = self.bpm {
-            let old_lag = (60.0 / (old * DT)).round() as usize;
+            let old_lag = (60.0 / (old * self.dt)).round() as usize;
             let ratio = lag as f32 / old_lag as f32;
             // Half/double time is often equally valid. Keep the existing level
             // unless the new level has substantially better periodic evidence.
@@ -521,7 +1024,7 @@ impl Rhythm {
             .history
             .iter()
             .rev()
-            .take((1.2 / DT) as usize)
+            .take((1.2 / self.dt) as usize)
             .any(|v| v[0] > 0.005 || v[1] > 0.005);
         // Confidence is periodic salience, not the fraction of detected clicks.
         if scores[lag] < 0.12 || prominence < 2.5 || !recent {
@@ -539,7 +1042,7 @@ impl Rhythm {
         } else {
             0.0
         };
-        let bpm = (60.0 / ((lag as f32 + offset) * DT)).clamp(60.0, 260.0);
+        let bpm = (60.0 / ((lag as f32 + offset) * self.dt)).clamp(60.0, 260.0);
         if self
             .pending
             .is_some_and(|old| (bpm / old).ln().abs() < 0.06)
@@ -563,7 +1066,7 @@ impl Rhythm {
         if fresh {
             // Fold recent novelty onto the estimated period to find a beat
             // anchor; tempo alone has no information about beat phase.
-            let period = 60.0 / (self.bpm.unwrap() * DT);
+            let period = 60.0 / (self.bpm.unwrap() * self.dt);
             let bins = period.round() as usize;
             let mut folded = vec![0.0; bins];
             for (age, v) in self
@@ -1094,5 +1597,141 @@ mod tests {
         assert_eq!(strongest, expected);
         assert!((rms - 0.5 / 2.0_f32.sqrt()).abs() < 0.01);
         assert!((peak - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn pcm_decoder_mixes_channels_and_accepts_s16_and_f32() {
+        let mut samples = [0.0_f32; HOP];
+        let format = PcmFormat {
+            rate: 48_000,
+            channels: 2,
+            sample: SampleFormat::F32Le,
+        };
+        let mut bytes = Vec::new();
+        for frame in [[0.25_f32, 0.75], [0.5, -0.5]] {
+            for channel in frame {
+                bytes.extend_from_slice(&channel.to_le_bytes());
+            }
+        }
+        decode_pcm(&bytes, format, &mut samples);
+        assert!((samples[0] - 0.5).abs() < 1e-6);
+        assert_eq!(samples[1], 0.0);
+
+        let format = PcmFormat {
+            rate: 48_000,
+            channels: 1,
+            sample: SampleFormat::S16Le,
+        };
+        let bytes = [0x00, 0x40, 0x00, 0x80];
+        decode_pcm(&bytes, format, &mut samples);
+        assert!((samples[0] - 0.5).abs() < 1e-6);
+        assert_eq!(samples[1], -1.0);
+
+        let format = PcmFormat {
+            rate: 48_000,
+            channels: 1,
+            sample: SampleFormat::S32Le,
+        };
+        let bytes = 1_073_741_824_i32.to_le_bytes();
+        decode_pcm(&bytes, format, &mut samples);
+        assert!((samples[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn list_audio_parser_marks_defaults_and_orders_sinks_first() {
+        let dump = br#"[
+          {
+            "type": "PipeWire:Interface:Metadata",
+            "props": {"metadata.name": "default"},
+            "metadata": [
+              {"key": "default.audio.sink", "value": {"name": "auto_null"}},
+              {"key": "default.audio.source", "value": {"name": "mic"}}
+            ]
+          },
+          {
+            "type": "PipeWire:Interface:Node",
+            "info": {"props": {
+              "media.class": "Audio/Sink",
+              "node.name": "auto_null",
+              "node.description": "Dummy Output",
+              "object.serial": 9568,
+              "audio.channels": 2,
+              "audio.rate": 48000
+            }}
+          },
+          {
+            "type": "PipeWire:Interface:Node",
+            "info": {"props": {
+              "media.class": "Audio/Source",
+              "node.name": "mic",
+              "node.description": "Microphone"
+            }}
+          }
+        ]"#;
+        let devices = parse_pw_dump(dump).unwrap();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].kind, "sink");
+        assert_eq!(devices[0].name, "auto_null");
+        assert!(devices[0].default);
+        assert_eq!(devices[0].serial, Some(9568));
+        assert_eq!(devices[1].kind, "source");
+        assert!(devices[1].default);
+        assert!(!devices[1].name.is_empty());
+    }
+
+    #[test]
+    fn analyzer_uses_the_supplied_sample_rate() {
+        let sample_rate = 44_100;
+        let frequency = 1_000.0;
+        let mut analyzer = Analyzer::with_sample_rate(sample_rate);
+        let mut state = AudioState::default();
+        for frame in 0..8 {
+            let samples = std::array::from_fn(|i| {
+                0.5 * (std::f32::consts::TAU * frequency * (frame * HOP + i) as f32
+                    / sample_rate as f32)
+                    .sin()
+            });
+            state = analyzer.analyze(&samples);
+        }
+        let strongest = state
+            .bands
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap()
+            .0;
+        let expected =
+            ((frequency / LOW_HZ).ln() / (HIGH_HZ / LOW_HZ).ln() * BANDS as f32).floor() as usize;
+        assert_eq!(strongest, expected);
+    }
+
+    #[test]
+    fn silent_time_tracks_live_but_silent_capture() {
+        let mut analyzer = Analyzer::new();
+        let mut state = AudioState::default();
+        for _ in 0..100 {
+            state = analyzer.analyze(&[0.0; HOP]);
+        }
+        assert!(state.silent_for > 1.0);
+        for frame in 0..8 {
+            state = analyzer.analyze(&frame_at(frame, 440.0, 0.2));
+        }
+        assert!(state.silent_for < 0.2);
+    }
+
+    #[test]
+    fn source_info_describes_target_and_format() {
+        let info = SourceInfo {
+            kind: "PipeWire".into(),
+            target: Some("auto_null".into()),
+            rate: 48_000,
+            channels: 2,
+            format: "f32le".into(),
+        };
+        let text = info.describe();
+        assert!(text.contains("PipeWire"));
+        assert!(text.contains("auto_null"));
+        assert!(text.contains("48000 Hz"));
+        assert!(text.contains("f32le"));
     }
 }

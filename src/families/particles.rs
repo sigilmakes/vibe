@@ -286,10 +286,10 @@ impl Renderer {
         }
         for p in &self.particles {
             let fade = ((p.life - p.age) / 0.45).clamp(0.0, 1.0);
-            let intensity = (0.58 + bands[p.lane].clamp(0.0, 1.0) * 0.28
-                + audio.energy.clamp(0.0, 1.0) * 0.10)
-                .clamp(0.0, 0.96)
-                * fade;
+            let intensity =
+                (0.58 + bands[p.lane].clamp(0.0, 1.0) * 0.28 + audio.energy.clamp(0.0, 1.0) * 0.10)
+                    .clamp(0.0, 0.96)
+                    * fade;
             let length = match style {
                 3 => 0.045,
                 4 => 0.0,

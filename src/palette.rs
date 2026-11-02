@@ -121,6 +121,190 @@ fn parse_color(value: &str) -> Option<[u8; 3]> {
     parts.next().is_none().then_some(rgb)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorDepth {
+    Auto,
+    Truecolor,
+    Ansi256,
+    Ansi16,
+    Mono,
+}
+
+impl ColorDepth {
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto => {
+                if std::env::var_os("NO_COLOR").is_some() {
+                    Self::Mono
+                } else if std::env::var("COLORTERM")
+                    .is_ok_and(|value| value.contains("truecolor") || value.contains("24bit"))
+                {
+                    Self::Truecolor
+                } else if std::env::var("TERM").is_ok_and(|value| value.contains("256color")) {
+                    Self::Ansi256
+                } else {
+                    Self::Ansi16
+                }
+            }
+            depth => depth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum GlyphMode {
+    Auto,
+    Unicode,
+    Ascii,
+}
+
+impl GlyphMode {
+    pub fn resolve(self) -> Self {
+        match self {
+            Self::Auto => {
+                let dumb = std::env::var("TERM").is_ok_and(|value| value == "dumb");
+                let c_locale = std::env::var("LC_ALL")
+                    .or_else(|_| std::env::var("LANG"))
+                    .is_ok_and(|value| value == "C" || value == "POSIX");
+                if dumb || c_locale {
+                    Self::Ascii
+                } else {
+                    Self::Unicode
+                }
+            }
+            mode => mode,
+        }
+    }
+}
+
+const ANSI16: [[u8; 3]; 16] = [
+    [0, 0, 0],
+    [128, 0, 0],
+    [0, 128, 0],
+    [128, 128, 0],
+    [0, 0, 128],
+    [128, 0, 128],
+    [0, 128, 128],
+    [192, 192, 192],
+    [128, 128, 128],
+    [255, 0, 0],
+    [0, 255, 0],
+    [255, 255, 0],
+    [0, 0, 255],
+    [255, 0, 255],
+    [0, 255, 255],
+    [255, 255, 255],
+];
+
+fn distance(a: [u8; 3], b: [u8; 3]) -> u32 {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| {
+            let delta = *a as i32 - b as i32;
+            (delta * delta) as u32
+        })
+        .sum()
+}
+
+fn ansi16(rgb: [u8; 3]) -> u8 {
+    ANSI16
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, candidate)| distance(rgb, **candidate))
+        .map_or(0, |(index, _)| index as u8)
+}
+
+fn ansi256(rgb: [u8; 3]) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest_level = |value: u8| {
+        LEVELS
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, level)| (**level as i32 - value as i32).abs())
+            .map_or(0, |(index, _)| index as u8)
+    };
+    let red = nearest_level(rgb[0]);
+    let green = nearest_level(rgb[1]);
+    let blue = nearest_level(rgb[2]);
+    let cube = 16 + 36 * red + 6 * green + blue;
+    let cube_rgb = [
+        LEVELS[red as usize],
+        LEVELS[green as usize],
+        LEVELS[blue as usize],
+    ];
+    let average = (rgb[0] as u16 + rgb[1] as u16 + rgb[2] as u16) / 3;
+    let gray_index = ((average as f32 - 8.0) / 10.0).round().clamp(0.0, 23.0) as u8;
+    let gray = 8 + gray_index * 10;
+    let gray_rgb = [gray, gray, gray];
+    if distance(rgb, gray_rgb) < distance(rgb, cube_rgb) {
+        232 + gray_index
+    } else {
+        cube
+    }
+}
+
+fn quantize(color: Color, depth: ColorDepth) -> Color {
+    if depth == ColorDepth::Mono {
+        return Color::Reset;
+    }
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    let rgb = [red, green, blue];
+    match depth {
+        ColorDepth::Truecolor | ColorDepth::Auto => color,
+        ColorDepth::Ansi256 => Color::Indexed(ansi256(rgb)),
+        ColorDepth::Ansi16 => Color::Indexed(ansi16(rgb)),
+        ColorDepth::Mono => Color::Reset,
+    }
+}
+
+pub fn quantize_buffer(buffer: &mut ratatui::buffer::Buffer, depth: ColorDepth) {
+    for cell in &mut buffer.content {
+        cell.fg = quantize(cell.fg, depth);
+        cell.bg = quantize(cell.bg, depth);
+    }
+}
+
+fn ascii_glyph(symbol: &str) -> &'static str {
+    match symbol {
+        "▀" | "▁" | "▂" | "▃" | "▄" | "▅" | "▆" | "▇" | "█" | "▓" | "▰" | "▴" | "▲" => {
+            "#"
+        }
+        "░" => ".",
+        "▒" => ":",
+        "─" | "━" | "▔" | "╸" | "╺" => "-",
+        "│" | "┃" | "┊" | "╵" => "|",
+        "╱" => "/",
+        "╲" => "\\",
+        "┼" | "╋" | "┏" | "┓" | "┗" | "┛" => "+",
+        "═" => "=",
+        "●" | "•" | "∙" | "·" | "◆" | "✦" | "✧" | "✿" | "❧" | "❦" | "♣" | "▪" => {
+            "*"
+        }
+        "←" | "›" => "<",
+        "→" => ">",
+        "↑" => "^",
+        "↓" => "v",
+        "×" => "x",
+        "⠿" | "⠂" | "⠐" => ".",
+        "⁝" | "⁙" | "◦" | "∘" | "○" => "o",
+        "∽" | "≈" | "⌒" | "⌢" => "~",
+        "²" => "2",
+        _ => "?",
+    }
+}
+
+pub fn ascii_buffer(buffer: &mut ratatui::buffer::Buffer) {
+    for cell in &mut buffer.content {
+        if cell.symbol().is_ascii() {
+            continue;
+        }
+        let replacement = ascii_glyph(cell.symbol());
+        cell.set_symbol(replacement);
+    }
+}
+
 #[derive(Default)]
 struct Replies {
     bytes: Vec<u8>,
@@ -292,34 +476,50 @@ pub struct TerminalInput {
     tty: std::fs::File,
     input: Input,
     pub theme: Theme,
-    next_refresh: std::time::Instant,
+    next_refresh: Option<std::time::Instant>,
+    follow_theme: bool,
 }
 
 impl TerminalInput {
     /// Call after entering raw mode. This is the only terminal reader for the
     /// lifetime of the UI; unsupported OSC queries simply leave colors intact.
-    pub fn open() -> std::io::Result<Self> {
+    pub fn open(follow_theme: bool) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let tty = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open("/dev/tty")?;
-        Ok(Self::new(tty))
+            .open("/dev/tty")
+            .or_else(|error| {
+                // Containers and some SSH setups have a tty on stdin but no
+                // controlling /dev/tty. Duplicate stdin only when it is a tty.
+                let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+                if fd < 0 {
+                    return Err(error);
+                }
+                if unsafe { libc::isatty(fd) } != 1 {
+                    unsafe { libc::close(fd) };
+                    return Err(error);
+                }
+                Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            })?;
+        Ok(Self::new(tty, follow_theme))
     }
 
-    fn new(tty: std::fs::File) -> Self {
+    fn new(tty: std::fs::File, follow_theme: bool) -> Self {
         Self {
             tty,
             input: Input::default(),
             theme: Theme::default(),
-            next_refresh: std::time::Instant::now(),
+            next_refresh: Some(std::time::Instant::now()),
+            follow_theme,
         }
     }
 
     fn refresh(&mut self, now: std::time::Instant) -> std::io::Result<()> {
         use std::io::Write;
-        if now >= self.next_refresh {
+        if self.next_refresh.is_some_and(|next| now >= next) {
             let mut queries = String::new();
             for index in 0..16 {
                 queries.push_str(&format!("\x1b]4;{index};?\x1b\\"));
@@ -332,7 +532,7 @@ impl TerminalInput {
                     return Err(error);
                 }
             }
-            self.next_refresh = now + REFRESH_INTERVAL;
+            self.next_refresh = self.follow_theme.then(|| now + REFRESH_INTERVAL);
         }
         Ok(())
     }
@@ -442,7 +642,7 @@ mod tests {
             assert_ne!(libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK), -1);
             (
                 std::fs::File::from_raw_fd(master),
-                TerminalInput::new(std::fs::File::from_raw_fd(slave)),
+                TerminalInput::new(std::fs::File::from_raw_fd(slave), true),
             )
         }
     }
@@ -490,7 +690,7 @@ mod tests {
         let old_background = input.theme.background;
         // Advance only the refresh schedule: the second request is made by the
         // same running reader, with its previous palette and input intact.
-        input.next_refresh = Instant::now();
+        input.next_refresh = Some(Instant::now());
         assert!(input.read(wait).unwrap().is_none());
         assert!(terminal.read(&mut queries).unwrap() > 0);
         terminal
@@ -507,7 +707,7 @@ mod tests {
         assert_eq!(input.theme.ansi[2], [238, 170, 85]);
         assert_eq!(input.theme.background, old_background);
         let updated = input.theme.clone();
-        input.next_refresh = Instant::now();
+        input.next_refresh = Some(Instant::now());
         let start = Instant::now();
         assert!(input.read(wait).unwrap().is_none());
         assert!(start.elapsed() < Duration::from_millis(100));
@@ -580,6 +780,47 @@ mod tests {
             );
         }
         assert_eq!(theme.rgb(0, 0.0, 0.8), theme.rgb(0, 1.0, 0.8));
+    }
+
+    #[test]
+    fn quantizes_rgb_for_ansi16_ansi256_and_mono() {
+        let area = ratatui::layout::Rect::new(0, 0, 1, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer[(0, 0)]
+            .set_fg(Color::Rgb(255, 0, 0))
+            .set_bg(Color::Rgb(0, 0, 0));
+        quantize_buffer(&mut buffer, ColorDepth::Ansi16);
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(9));
+        assert_eq!(buffer[(0, 0)].bg, Color::Indexed(0));
+
+        quantize_buffer(&mut buffer, ColorDepth::Ansi256);
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(9));
+        // Already-indexed colours are left alone.
+        assert_eq!(buffer[(0, 0)].bg, Color::Indexed(0));
+
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer[(0, 0)]
+            .set_fg(Color::Rgb(255, 0, 0))
+            .set_bg(Color::Rgb(0, 0, 0));
+        quantize_buffer(&mut buffer, ColorDepth::Ansi256);
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(196));
+        quantize_buffer(&mut buffer, ColorDepth::Mono);
+        assert_eq!(buffer[(0, 0)].fg, Color::Reset);
+        assert_eq!(buffer[(0, 0)].bg, Color::Reset);
+    }
+
+    #[test]
+    fn ascii_fallback_keeps_layout_and_replaces_unknown_symbols() {
+        let area = ratatui::layout::Rect::new(0, 0, 3, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer[(0, 0)].set_symbol("█");
+        buffer[(1, 0)].set_symbol("x");
+        buffer[(2, 0)].set_symbol("✦");
+        ascii_buffer(&mut buffer);
+        assert_eq!(buffer[(0, 0)].symbol(), "#");
+        assert_eq!(buffer[(1, 0)].symbol(), "x");
+        assert_eq!(buffer[(2, 0)].symbol(), "*");
+        assert!(buffer.content.iter().all(|cell| cell.symbol().is_ascii()));
     }
 
     #[test]

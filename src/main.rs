@@ -11,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FRAME_TIME: Duration = Duration::from_millis(16);
 const DEFAULT_SCENE: &str = "Liquid Topography";
 
 fn demo_audio(t: f32) -> audio::AudioState {
@@ -89,6 +88,15 @@ enum ColorMode {
     Always,
     Never,
 }
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AudioSourceArg {
+    Auto,
+    Pipewire,
+    Pulse,
+    Command,
+    File,
+}
 #[derive(Clone, Copy)]
 enum MenuKind {
     Root,
@@ -135,7 +143,7 @@ fn gain_arg(input: &str) -> Result<f32, String> {
 #[command(
     version,
     about = "A psychedelic, audio-reactive terminal playground",
-    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity d  Demo         r  Reconnect audio\n  q             Quit\n\nCaptures the PipeWire output monitor, never your microphone.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
+    after_help = "KEYS\n  m             Open menu   Esc  Close popup\n  ← / →         Previous / next visualisation\n  p             Palettes\n  ?             Controls\n  + / -         Sensitivity\n  d             Demo\n  r             Reconnect audio\n  q             Quit\n\nCaptures the configured output monitor, never your microphone.\nUse --list-audio to discover sinks; --audio-source command/file for other backends.\nTempo needs several seconds of a clear rhythm; half/double-time ambiguity is possible."
 )]
 struct Args {
     /// Colour output policy
@@ -144,9 +152,42 @@ struct Args {
     /// Use a synthetic 120 BPM beat instead of live audio
     #[arg(long)]
     demo: bool,
-    /// PipeWire output node name or serial
-    #[arg(long, value_name = "NODE")]
-    target: Option<String>,
+    /// Audio capture backend
+    #[arg(long, value_enum, default_value = "auto", value_name = "SOURCE")]
+    audio_source: AudioSourceArg,
+    /// Command that writes raw PCM to stdout (used with --audio-source command)
+    #[arg(long, value_name = "COMMAND")]
+    audio_command: Option<String>,
+    /// Raw PCM file (used with --audio-source file)
+    #[arg(long, value_name = "PATH")]
+    audio_file: Option<std::path::PathBuf>,
+    /// Raw PCM sample format
+    #[arg(long, value_enum, default_value = "f32le", value_name = "FORMAT")]
+    audio_format: audio::SampleFormat,
+    /// Raw PCM sample rate
+    #[arg(long, default_value_t = 48000, value_parser = clap::value_parser!(u32).range(1..=384_000))]
+    audio_rate: u32,
+    /// Raw PCM channel count
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(1..=32))]
+    audio_channels: u16,
+    /// PipeWire/PulseAudio sink node name or serial
+    #[arg(long = "audio-target", visible_alias = "target", value_name = "NODE")]
+    audio_target: Option<String>,
+    /// List available PipeWire sinks and sources, then exit
+    #[arg(long)]
+    list_audio: bool,
+    /// Render frame-rate cap
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
+    fps: u32,
+    /// Terminal colour depth (auto detects truecolour/256/16 colours)
+    #[arg(long, value_enum, default_value = "auto")]
+    color_depth: palette::ColorDepth,
+    /// Glyph set; ascii replaces non-ASCII symbols after rendering
+    #[arg(long, value_enum, default_value = "auto")]
+    glyphs: palette::GlyphMode,
+    /// Re-query terminal colours every second instead of only at startup
+    #[arg(long)]
+    follow_theme: bool,
     /// Starting visualisation; otherwise resume the last one (see --list)
     #[arg(long, value_name = "NAME")]
     scene: Option<String>,
@@ -204,12 +245,63 @@ fn snapshot(
         .updated
         .is_some_and(|t| t.elapsed() > Duration::from_millis(600))
     {
+        let source = state.source;
         state = audio::AudioState {
+            source,
             error: Some("Audio stalled · r to reconnect".into()),
             ..Default::default()
         };
     }
     state
+}
+
+fn check_audio(
+    shared: &Option<std::sync::Arc<std::sync::Mutex<audio::AudioState>>>,
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut state = snapshot(shared);
+    while Instant::now() < deadline {
+        state = snapshot(shared);
+        if state.error.is_some() || state.rms > 0.001 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let source = state.source.describe();
+    println!(
+        "source={} connected={} signal={:.4} rms={:.4} energy={:.2} bass={:.2} mid={:.2} treble={:.2} onset={:.2} kick={:.2} tempo={} confidence={:.2} silent_for={:.1}s",
+        source,
+        state.connected,
+        state.peak,
+        state.rms,
+        state.energy,
+        state.bass,
+        state.mid,
+        state.treble,
+        state.onset,
+        state.kick,
+        state
+            .bpm
+            .map(|bpm| format!("{bpm:.0} BPM"))
+            .unwrap_or_else(|| "learning".into()),
+        state.tempo_confidence,
+        state.silent_for,
+    );
+    if let Some(error) = state.error {
+        return Err(io::Error::other(error));
+    }
+    if !state.connected {
+        return Err(io::Error::other(format!(
+            "No samples received from {source}; check --list-audio and the selected sink"
+        )));
+    }
+    if state.rms <= 0.001 {
+        return Err(io::Error::other(format!(
+            "Capture from {source} is connected but silent; run --list-audio and choose a real output sink"
+        )));
+    }
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
@@ -218,6 +310,67 @@ fn main() -> io::Result<()> {
     if args.list {
         println!("Visualisations: {}", visuals::SCENES.join(", "));
         println!("Palettes: {}", palette::PALETTES.join(", "));
+        return Ok(());
+    }
+    if args.list_audio {
+        let devices = audio::list_audio()?;
+        let mut sinks = devices
+            .iter()
+            .filter(|device| device.kind == "sink")
+            .peekable();
+        let mut sources = devices
+            .iter()
+            .filter(|device| device.kind == "source")
+            .peekable();
+        if sinks.peek().is_none() {
+            println!("Sinks: none. PipeWire has no audio output; check `wpctl status`.");
+        } else {
+            println!("Sinks:");
+            for device in sinks {
+                let marker = if device.default { "*" } else { " " };
+                println!(
+                    "  {marker} {}{} — {}{}{}",
+                    device.name,
+                    device
+                        .serial
+                        .map(|serial| format!(" [serial {serial}]"))
+                        .unwrap_or_default(),
+                    device.description,
+                    device
+                        .channels
+                        .map(|channels| format!(" · {channels} ch"))
+                        .unwrap_or_default(),
+                    device
+                        .rate
+                        .map(|rate| format!(" · {rate} Hz"))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        if sources.peek().is_some() {
+            println!("Sources:");
+            for device in sources {
+                let marker = if device.default { "*" } else { " " };
+                println!(
+                    "  {marker} {}{} — {}{}{}",
+                    device.name,
+                    device
+                        .serial
+                        .map(|serial| format!(" [serial {serial}]"))
+                        .unwrap_or_default(),
+                    device.description,
+                    device
+                        .channels
+                        .map(|channels| format!(" · {channels} ch"))
+                        .unwrap_or_default(),
+                    device
+                        .rate
+                        .map(|rate| format!(" · {rate} Hz"))
+                        .unwrap_or_default(),
+                );
+            }
+            println!("  Use --audio-target with a sink name or serial. Sources are inputs, not output monitors.");
+        }
         return Ok(());
     }
     let state_path = if args.check_audio.is_none() {
@@ -236,10 +389,45 @@ fn main() -> io::Result<()> {
     let initial_scene = starting_scene(args.scene.as_deref(), saved_scene.as_deref())?;
     let initial_palette = choice(args.palette.as_deref(), palette::PALETTES, "palette")?;
     let mut demo = args.demo;
-    let target = args.target;
+    let backend = match args.audio_source {
+        AudioSourceArg::Auto if args.audio_command.is_some() => {
+            audio::Backend::Command(args.audio_command.clone().expect("checked command"))
+        }
+        AudioSourceArg::Auto if args.audio_file.is_some() => {
+            audio::Backend::File(args.audio_file.clone().expect("checked file"))
+        }
+        AudioSourceArg::Auto => audio::Backend::Auto,
+        AudioSourceArg::Pipewire => audio::Backend::PipeWire,
+        AudioSourceArg::Pulse => audio::Backend::Pulse,
+        AudioSourceArg::Command => {
+            audio::Backend::Command(args.audio_command.clone().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "--audio-source command needs --audio-command",
+                )
+            })?)
+        }
+        AudioSourceArg::File => audio::Backend::File(args.audio_file.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--audio-source file needs --audio-file",
+            )
+        })?),
+    };
+    let format = audio::PcmFormat {
+        rate: args.audio_rate,
+        channels: args.audio_channels,
+        sample: args.audio_format,
+    }
+    .validate()?;
+    let capture_config = audio::CaptureConfig {
+        backend,
+        target: args.audio_target.clone(),
+        format,
+    };
     let (mut capture, mut shared, mut capture_error) = (None, None, None);
     if !demo || args.check_audio.is_some() {
-        match audio::Capture::start(target.clone()) {
+        match audio::Capture::start(capture_config.clone()) {
             Ok((handle, state)) => {
                 capture = Some(handle);
                 shared = Some(state);
@@ -251,17 +439,7 @@ fn main() -> io::Result<()> {
         if let Some(error) = capture_error {
             return Err(io::Error::other(error));
         }
-        std::thread::sleep(Duration::from_secs(seconds));
-        let state = snapshot(&shared);
-        println!("connected={} rms={:.4} energy={:.2} bass={:.2} mid={:.2} treble={:.2} onset={:.2} kick={:.2} tempo={} confidence={:.2}", state.connected, state.rms, state.energy, state.bass, state.mid, state.treble, state.onset, state.kick, state.bpm.map(|bpm| format!("{bpm:.0} BPM")).unwrap_or_else(|| "learning".into()), state.tempo_confidence);
-        if let Some(error) = state.error {
-            return Err(io::Error::other(error));
-        }
-        if !state.connected {
-            return Err(io::Error::other(
-                "No samples received from the output monitor",
-            ));
-        }
+        check_audio(&shared, Duration::from_secs(seconds))?;
         return Ok(());
     }
     match args.color {
@@ -272,8 +450,11 @@ fn main() -> io::Result<()> {
 
     let mut renderer = visuals::Renderer::default();
     let mut terminal = ratatui::init();
+    let frame_time = Duration::from_secs_f32(1.0 / args.fps as f32);
+    let color_depth = args.color_depth.resolve();
+    let glyph_mode = args.glyphs.resolve();
     let result = (|| -> io::Result<usize> {
-        let mut input = palette::TerminalInput::open()?;
+        let mut input = palette::TerminalInput::open(args.follow_theme)?;
         let start = Instant::now();
         let mut scene = initial_scene;
         let mut palette = initial_palette;
@@ -291,6 +472,7 @@ fn main() -> io::Result<()> {
             };
             let reactive = sensitivity(&state, gain);
             let bands = state.bands.map(|x| (x * gain).clamp(0.0, 1.0));
+            let source_label = state.source.describe();
             terminal.draw(|frame| {
                 let area = frame.area();
                 renderer.draw(
@@ -323,6 +505,12 @@ fn main() -> io::Result<()> {
                         } else {
                             capture_error.as_deref().or(state.error.as_deref())
                         },
+                        source: if demo {
+                            None
+                        } else {
+                            Some(source_label.as_str())
+                        },
+                        silent_for: if demo { 0.0 } else { state.silent_for },
                     },
                     &input.theme,
                 );
@@ -335,9 +523,20 @@ fn main() -> io::Result<()> {
                         &input.theme,
                     );
                 }
+                if glyph_mode == palette::GlyphMode::Ascii {
+                    palette::ascii_buffer(frame.buffer_mut());
+                }
+                palette::quantize_buffer(frame.buffer_mut(), color_depth);
             })?;
             // Handle queued keys in order without rendering intermediate scenes.
-            let mut timeout = FRAME_TIME.saturating_sub(frame_start.elapsed());
+            // If a frame overruns, keep a small idle slice instead of polling
+            // immediately; `--fps` can lower the target for slow terminals.
+            let elapsed = frame_start.elapsed();
+            let mut timeout = if elapsed < frame_time {
+                frame_time - elapsed
+            } else {
+                (frame_time / 4).max(Duration::from_millis(2))
+            };
             while let Some(event) = input.read(timeout)? {
                 timeout = Duration::ZERO;
                 let Event::Key(key) = event else { continue };
@@ -433,7 +632,7 @@ fn main() -> io::Result<()> {
                         drop(capture.take());
                         shared = None;
                         demo = false;
-                        match audio::Capture::start(target.clone()) {
+                        match audio::Capture::start(capture_config.clone()) {
                             Ok((handle, state)) => {
                                 capture = Some(handle);
                                 shared = Some(state);
@@ -448,7 +647,7 @@ fn main() -> io::Result<()> {
                             drop(capture.take());
                             shared = None;
                         } else {
-                            match audio::Capture::start(target.clone()) {
+                            match audio::Capture::start(capture_config.clone()) {
                                 Ok((handle, state)) => {
                                     capture = Some(handle);
                                     shared = Some(state);

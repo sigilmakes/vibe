@@ -20,6 +20,8 @@ pub struct Status<'a> {
     pub sensitivity: f32,
     pub bands: &'a [f32; 32],
     pub error: Option<&'a str>,
+    pub source: Option<&'a str>,
+    pub silent_for: f32,
 }
 
 fn color([r, g, b]: [u8; 3]) -> Color {
@@ -242,6 +244,20 @@ pub fn draw(frame: &mut Frame, analysis: bool, help: bool, status: &Status<'_>, 
             )],
             theme,
         );
+    } else if status.silent_for > 3.0 {
+        let source = status.source.unwrap_or("selected source");
+        let message = format!("{source} is silent · --list-audio");
+        let width = message.chars().count().saturating_add(8).min(60) as u16;
+        let area = centered(screen, width, 1);
+        overlay(
+            frame,
+            area,
+            vec![Line::styled(
+                format!(" Audio: {message}"),
+                Style::default().fg(color(theme.ansi[3])),
+            )],
+            theme,
+        );
     }
     if analysis {
         analysis_popup(frame, status, theme);
@@ -269,6 +285,8 @@ mod tests {
             sensitivity: 1.0,
             bands,
             error: None,
+            source: None,
+            silent_for: 0.0,
         }
     }
 
@@ -350,6 +368,21 @@ mod tests {
         let buffer = render(80, 24, false, false, Some("Disconnected"));
         assert_popup_only(&buffer, Rect::new(30, 11, 20, 1));
         assert!(text(&buffer).contains("Audio: Disconnected"));
+    }
+
+    #[test]
+    fn silent_capture_shows_a_source_hint() {
+        let bands = [0.0; 32];
+        let mut status = status(&bands);
+        status.source = Some("Dummy Output");
+        status.silent_for = 4.0;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, false, false, &status, &Theme::default()))
+            .unwrap();
+        let text = text(terminal.backend().buffer());
+        assert!(text.contains("Dummy Output is silent"));
+        assert!(text.contains("--list-audio"));
     }
 
     #[test]
