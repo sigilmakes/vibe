@@ -174,6 +174,11 @@ impl App {
             match key.code {
                 KeyCode::Esc => self.analysis = false,
                 KeyCode::Char('q') => return Flow::Quit,
+                KeyCode::Char('m') => {
+                    self.analysis = false;
+                    self.menu = Some(menu::Menu::new());
+                    self.rebuild_pages();
+                }
                 _ => {}
             }
             return Flow::Continue;
@@ -568,6 +573,21 @@ mod tests {
 
         app.handle_key(press(KeyCode::Esc));
         assert!(!app.view(0.0).analysis);
+    }
+
+    #[test]
+    fn menu_opens_over_analysis() {
+        let mut app = demo_app();
+        app.handle_key(press(KeyCode::Char('m')));
+        for _ in 0..3 {
+            app.handle_key(press(KeyCode::Down));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.view(0.0).analysis);
+        app.handle_key(press(KeyCode::Char('m')));
+        let view = app.view(0.0);
+        assert!(!view.analysis);
+        assert!(view.menu.is_some());
     }
 
     #[test]

@@ -119,7 +119,8 @@ pub struct CaptureConfig {
 
 /// Build a capture config from typed audio settings. An empty command/file
 /// with an explicit "command"/"file" source degrades to `auto` rather than
-/// spawning an empty shell or opening an empty path.
+/// spawning an empty shell or opening an empty path. A non-empty command or
+/// file does not override an explicit source.
 pub fn capture_config(audio: &crate::config::AudioConfig) -> CaptureConfig {
     use clap::ValueEnum;
     let backend = match audio.source.as_str() {
@@ -127,15 +128,7 @@ pub fn capture_config(audio: &crate::config::AudioConfig) -> CaptureConfig {
         "pulse" => Backend::Pulse,
         "command" if !audio.command.is_empty() => Backend::Command(audio.command.clone()),
         "file" if !audio.file.is_empty() => Backend::File(PathBuf::from(&audio.file)),
-        _ => {
-            if !audio.command.is_empty() {
-                Backend::Command(audio.command.clone())
-            } else if !audio.file.is_empty() {
-                Backend::File(PathBuf::from(&audio.file))
-            } else {
-                Backend::Auto
-            }
-        }
+        _ => Backend::Auto,
     };
     let format = PcmFormat {
         rate: audio.rate,
@@ -1219,6 +1212,29 @@ mod tests {
             child: None,
             shared: Arc::new(Mutex::new(state)),
         }
+    }
+
+    #[test]
+    fn capture_backend_follows_the_explicit_source() {
+        let mut audio = crate::config::AudioConfig {
+            command: "parec".into(),
+            file: "track.raw".into(),
+            ..Default::default()
+        };
+        audio.source = "auto".into();
+        assert!(matches!(capture_config(&audio).backend, Backend::Auto));
+        audio.source = "command".into();
+        assert!(matches!(
+            capture_config(&audio).backend,
+            Backend::Command(ref command) if command == "parec"
+        ));
+        audio.source = "file".into();
+        assert!(matches!(
+            capture_config(&audio).backend,
+            Backend::File(ref file) if file == &PathBuf::from("track.raw")
+        ));
+        audio.source = "pipewire".into();
+        assert!(matches!(capture_config(&audio).backend, Backend::PipeWire));
     }
 
     #[test]

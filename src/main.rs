@@ -208,14 +208,21 @@ fn apply_cli(config: &mut config::Config, args: &Args) {
     if let Some(sensitivity) = args.sensitivity {
         config.appearance.sensitivity = sensitivity;
     }
+    let explicit_source = args.audio_source.is_some();
     if let Some(source) = args.audio_source {
         config.audio.source = source_name(source).to_owned();
     }
     if let Some(command) = &args.audio_command {
         config.audio.command = command.clone();
+        if !explicit_source {
+            config.audio.source = "command".into();
+        }
     }
     if let Some(file) = &args.audio_file {
         config.audio.file = file.display().to_string();
+        if !explicit_source && args.audio_command.is_none() {
+            config.audio.source = "file".into();
+        }
     }
     if let Some(format) = args.audio_format {
         config.audio.format = format.name().to_owned();
@@ -554,5 +561,26 @@ mod tests {
         // Payload requirements are validated in main() before the TUI starts.
         let command = Args::try_parse_from(["vibe", "--audio-source", "command"]).unwrap();
         assert_eq!(command.audio_command, None);
+    }
+
+    #[test]
+    fn command_and_file_payload_flags_imply_their_source() {
+        use clap::Parser;
+        let mut config = config::Config::default();
+        let args = Args::try_parse_from(["vibe", "--audio-command", "parec"]).unwrap();
+        apply_cli(&mut config, &args);
+        assert_eq!(config.audio.source, "command");
+
+        let mut config = config::Config::default();
+        let args = Args::try_parse_from(["vibe", "--audio-file", "track.raw"]).unwrap();
+        apply_cli(&mut config, &args);
+        assert_eq!(config.audio.source, "file");
+
+        let mut config = config::Config::default();
+        let args =
+            Args::try_parse_from(["vibe", "--audio-source", "auto", "--audio-command", "parec"])
+                .unwrap();
+        apply_cli(&mut config, &args);
+        assert_eq!(config.audio.source, "auto");
     }
 }
