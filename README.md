@@ -41,18 +41,30 @@ vibe --demo
 vibe --help
 ```
 
+## Menu
+
+`m` opens the menu. Scenes → Visualisation picks a scene; `/` searches and `f`
+favourites the selected scene. Scenes also has filters, playlists, and
+auto-advance.
+
+Auto-advance can be off, follow phrases, or run on a timer. The interval or
+fallback is set in seconds. Advance within offers all scenes, favourites, or
+the active playlist when those exist.
+
 ## Audio
 
-Vibe captures the default sink's monitor.
+By default Vibe captures the output monitor of the default sink. Microphone
+capture is opt-in.
 
 ```sh
 vibe --list-audio
 vibe --check-audio 3
 vibe --audio-target auto_null
+vibe --audio-source microphone
 ```
 
-`--audio-source` accepts `auto`, `pipewire`, `pulse`, `command`, or `file`.
-For raw PCM:
+`--audio-source` accepts `auto`, `pipewire`, `pulse`, `microphone`, `command`,
+or `file`. For raw PCM:
 
 ```sh
 vibe --audio-source command \
@@ -90,7 +102,9 @@ migrated automatically.
 
 ## Keys
 
-- `←` / `→`: switch visualiser
+- `←` / `→`: switch visualiser; in the menu, back / open or change a value
 - `m`: open / close menu; `Esc`: back / close
-- `↑` / `↓`, `Enter`: navigate and edit menu entries
+- `↑` / `↓`: move
+- `Enter`: select or edit
+- `/`: search scenes; `f`: favourite the selected scene
 - `q` / `Ctrl-C`: quit
