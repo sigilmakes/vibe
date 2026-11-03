@@ -1755,9 +1755,18 @@ mod tests {
     #[test]
     #[ignore = "release-only renderer timing, excludes terminal I/O"]
     fn renderer_frame_budget() {
-        for (scene, width, height) in
-            (0..SCENES.len()).flat_map(|scene| [(scene, 120, 40), (scene, 160, 50)])
-        {
+        // The reviewed terminal sizes; 200x50 is the widest full-screen case.
+        for (scene, width, height) in (0..SCENES.len()).flat_map(|scene| {
+            [
+                (scene, 200, 50),
+                (scene, 160, 50),
+                (scene, 120, 40),
+                (scene, 80, 24),
+                (scene, 40, 12),
+                (scene, 24, 8),
+                (scene, 1, 1),
+            ]
+        }) {
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
             let mut renderer = Renderer::default();
