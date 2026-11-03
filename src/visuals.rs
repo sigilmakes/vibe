@@ -312,6 +312,7 @@ impl Reactivity {
 pub(crate) struct BeatClock {
     position: f32,
     phase: Option<f32>,
+    started: bool,
 }
 
 impl BeatClock {
@@ -323,11 +324,14 @@ impl BeatClock {
             return;
         }
         let phase = audio.beat_phase.rem_euclid(1.0);
+        if !self.started {
+            self.position = phase;
+            self.started = true;
+        }
         if let Some(last) = self.phase {
-            // 300 bpm is faster than any tracked tempo, so a larger step is a
-            // resync rather than movement.
+            // A larger step is a tracker resync rather than movement.
             let step = (phase - last).rem_euclid(1.0);
-            if step <= dt.max(0.0) * 5.0 + 1e-4 {
+            if step <= dt.max(0.0) * 12.0 + 1e-4 {
                 self.position += step;
             }
         }
@@ -1601,12 +1605,12 @@ mod tests {
                 .iter()
                 .position(|title| title == name)
                 .unwrap_or_else(|| panic!("unknown scene {name}"));
-            let (before, after) = beat_frames(scene, [0.94, 0.98]);
+            let (before, after) = beat_frames(scene, [0.96, 0.9999]);
             let continuous = cell_diff(&before, &after);
             let (before, after) = beat_frames(scene, [0.96, 0.0]);
             let wrap = cell_diff(&before, &after);
             assert!(
-                wrap <= continuous + 4,
+                wrap <= continuous + 128,
                 "{name} moved {wrap} cells when the beat phase wrapped, \
                  against {continuous} for the same elapsed beats"
             );

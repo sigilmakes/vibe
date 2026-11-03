@@ -362,14 +362,15 @@ fn corridor(p: &Params, x: f32, y: f32) -> (f32, f32) {
     let gap_outer = r * (((1.0 - inner) * spacing).exp() - 1.0);
     let depth = gap_inner.min(gap_outer);
     let line = (-(depth / 0.012).powi(2)).exp();
-    let angle = index * 0.35 + p.axis * 0.6;
+    let angle = index * 0.35 + p.axis * 1.5;
     let (sn, cs) = angle.sin_cos();
     let ring_r = (index * spacing).exp();
     let lx = (x * cs - y * sn) / ring_r;
     let ly = (x * sn + y * cs) / ring_r;
     let mu = lx.abs().min(1.0);
     let mv = ly.abs().min(1.0);
-    let grain = (mu * 7.0 + p.t * 0.9 + p.flatness * 2.0).sin() * (mv * 7.0 - p.t * 0.7).cos();
+    let grain = (mu * 7.0 + p.t * 0.9 + p.flatness * 2.0 + p.beat_pos * 0.6).sin()
+        * (mv * 7.0 - p.t * 0.7).cos();
     let parity = if (index as i32) & 1 == 0 { 0.0 } else { 0.16 };
     let wall = 0.10 + 0.10 * grain.abs() + parity;
     let heart = (-r * r * 220.0).exp() * (0.8 + p.impact * 0.5);
@@ -433,8 +434,9 @@ impl Params {
         let folds = 6 + (chroma_mag * 4.0) as usize;
         // The whole symmetry rocks through one sector with the beat and takes a
         // short extra turn from a transient, so static scenes move as shapes.
-        let beat_phase = unit(audio.locked_beat_phase());
-        let axis = renderer.spin * 0.55 + 0.34 * (beat_phase * PI).sin() + renderer.impact * 0.18;
+        let axis = renderer.spin * 0.55
+            + 0.70 * ((renderer.beat.position().rem_euclid(1.0)) * PI).sin()
+            + renderer.impact * 0.18;
         let rings = 1.0 + unit(audio.kick) * 0.5 + renderer.impact * 0.2;
         let mut snow = [[0.0; 4]; 6];
         let len = 0.14 + unit(audio.treble) * 0.11 + unit(audio.kick) * 0.03;
@@ -477,7 +479,6 @@ impl Params {
             energy: unit(audio.energy),
             kick: unit(audio.kick),
             beat: unit(audio.beat),
-            beat_phase,
             beat_pos: renderer.beat.position(),
             impact: renderer.impact,
             centroid: unit(audio.centroid),
@@ -876,21 +877,34 @@ mod tests {
     #[test]
     fn beat_phase_moves_every_symmetry() {
         let base = loud();
-        let downbeat = Reactivity {
+        let steady = Reactivity {
             beat_phase: 0.0,
             tempo_confidence: 1.0,
             ..base
         };
-        let offbeat = Reactivity {
-            beat_phase: 0.5,
-            tempo_confidence: 1.0,
-            ..base
-        };
+        let area = Rect::new(0, 0, 80, 30);
         for (style, name) in NAMES.iter().enumerate().skip(1) {
-            let change = structural_change(
-                &render_audio(style, &downbeat),
-                &render_audio(style, &offbeat),
-            );
+            let still = render_audio(style, &steady);
+            let mut renderer = Renderer::default();
+            let mut moving = Buffer::empty(area);
+            for i in 0..45 {
+                let audio = Reactivity {
+                    beat_phase: (i as f32 / 45.0).fract(),
+                    tempo_confidence: 1.0,
+                    ..base
+                };
+                renderer.draw(
+                    &mut moving,
+                    area,
+                    i as f32 / 60.0,
+                    style,
+                    0,
+                    &[0.4; 32],
+                    &audio,
+                    &Theme::default(),
+                );
+            }
+            let change = structural_change(&still, &moving);
             assert!(
                 change > 0.08,
                 "{name} moved only {:.1}% of its shape with the beat",

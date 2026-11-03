@@ -271,10 +271,7 @@ pub struct Renderer {
     /// tempo, energy, and bass, so the roads speed up with the music instead of
     /// a wall clock setting the pace.
     travel: f32,
-    /// Completed beat count, used where a scene should step once per beat.
-    beat: u32,
-    last_beat_phase: f32,
-    /// Continuous beat position for colour drift that must not snap.
+    /// Continuous beat position for motion that must not snap.
     beat_clock: BeatClock,
 }
 
@@ -285,17 +282,12 @@ impl Renderer {
             + unit(audio.bass) * 0.35
             + unit(audio.tempo_confidence) * 0.30;
         self.travel = (self.travel + dt * rate).rem_euclid(1024.0);
-        let phase = unit(audio.locked_beat_phase());
-        if phase + 0.5 < self.last_beat_phase {
-            self.beat = self.beat.wrapping_add(1);
-        }
-        self.last_beat_phase = phase;
     }
 
     /// A beat-locked sweep position in [0, 1) after `beats` beats. It holds
     /// still while the tempo is unknown rather than drifting on wall time.
-    fn sweep(&self, audio: &Reactivity, beats: f32) -> f32 {
-        ((self.beat as f32 + unit(audio.locked_beat_phase())) / beats.max(0.25)).rem_euclid(1.0)
+    fn sweep(&self, _audio: &Reactivity, beats: f32) -> f32 {
+        (self.beat_clock.position() / beats.max(0.25)).rem_euclid(1.0)
     }
 
     /// A slowly advancing index for hash-driven window occupancy, derived from
@@ -482,7 +474,8 @@ impl Renderer {
                 }
                 let blink = 0.5
                     + 0.5
-                        * (unit(audio.locked_beat_phase()) * TAU + building.seed as f32 * 0.7)
+                        * ((self.beat_clock.position().rem_euclid(1.0)) * TAU
+                            + building.seed as f32 * 0.7)
                             .sin();
                 self.canvas
                     .plot(ax, y0 - 4, '·', base + 0.12 + blink * 0.06);
@@ -572,8 +565,9 @@ impl Renderer {
         let horizon = (fh * 0.40).round() as i32;
         // The camera drifts across the street on the beat and with the stereo
         // image, so the canyon walls move instead of holding a fixed frame.
-        let vp =
-            fw * 0.5 + ((unit(audio.locked_beat_phase()) - 0.5) * 0.02 + audio.pan() * 0.012) * fw;
+        let vp = fw * 0.5
+            + ((self.beat_clock.position().rem_euclid(1.0) - 0.5) * 0.02 + audio.pan() * 0.012)
+                * fw;
         let tick = self.tick();
         let travel = self.travel;
         // Wall lights switch on as a wave of light travels from the far end of
@@ -1174,9 +1168,10 @@ impl Renderer {
         } else {
             self.travel.rem_euclid(1.0)
         };
+        let seconds = self.beat_clock.position();
         let second = -PI * 0.5 + phase * TAU + strike * 0.18;
-        let minute = -PI * 0.5 + (self.beat % 12) as f32 / 12.0 * TAU + kick * 0.05;
-        let hour = -PI * 0.5 + (self.beat % 144) as f32 / 144.0 * TAU;
+        let minute = -PI * 0.5 + (seconds % 12.0) / 12.0 * TAU + kick * 0.05;
+        let hour = -PI * 0.5 + (seconds % 144.0) / 144.0 * TAU;
         let stretch = 1.0 + strike * 0.12;
         for j in 0..h {
             let dy = (j as f32 - cy) * 2.0;
@@ -1219,7 +1214,7 @@ impl Renderer {
         }
         self.canvas.dot(cx, cy, '◉', 0.55 + kick * 0.3);
         for k in 0..24 {
-            let angle = k as f32 / 24.0 * TAU + self.beat as f32 * 0.05;
+            let angle = k as f32 / 24.0 * TAU + self.beat_clock.position() * 0.05;
             let x = cx + angle.cos() * radius * 1.10;
             let y = cy + angle.sin() * radius * 1.10 * 0.5;
             self.canvas.dot(x, y, '·', 0.12 + treble * 0.12);
@@ -1559,8 +1554,8 @@ mod tests {
             .iter()
             .map(|buf| positions_with(buf, area, "▪").len())
             .collect();
-        assert_eq!(
-            renderer.beat, 4,
+        assert!(
+            renderer.beat_clock.position() >= 4.0,
             "the harness should have counted the beats"
         );
         for pair in lit[..4].windows(2) {
