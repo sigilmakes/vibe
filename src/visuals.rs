@@ -301,6 +301,46 @@ impl Reactivity {
     }
 }
 
+/// Continuous beat position, integrated from the tempo tracker's phase.
+///
+/// `beat_phase` is a sawtooth: it ramps through one beat and snaps back at the
+/// next, so adding it straight to a continuous coordinate moves the scene by a
+/// whole beat's worth in a single frame. This integrates the same advance, so
+/// motion keeps the beat's rate without the wrap. Phase jumps too large to be
+/// elapsed time are a resync, not motion, and are dropped.
+#[derive(Default)]
+pub(crate) struct BeatClock {
+    position: f32,
+    phase: Option<f32>,
+}
+
+impl BeatClock {
+    pub fn advance(&mut self, dt: f32, audio: &Reactivity) {
+        if audio.tempo_confidence < 0.25 || !audio.beat_phase.is_finite() {
+            // Without a lock there is no rate to integrate; drop the reference
+            // so a later relock does not count as elapsed time.
+            self.phase = None;
+            return;
+        }
+        let phase = audio.beat_phase.rem_euclid(1.0);
+        if let Some(last) = self.phase {
+            // 300 bpm is faster than any tracked tempo, so a larger step is a
+            // resync rather than movement.
+            let step = (phase - last).rem_euclid(1.0);
+            if step <= dt.max(0.0) * 5.0 + 1e-4 {
+                self.position += step;
+            }
+        }
+        self.phase = Some(phase);
+    }
+
+    /// Beats elapsed while locked. Advances at the beat's rate and never wraps,
+    /// so it can drive a coordinate directly.
+    pub fn position(&self) -> f32 {
+        self.position
+    }
+}
+
 /// Step a cyclic hue toward `target` along the shorter arc.
 pub(crate) fn approach_hue(current: f32, target: f32, blend: f32) -> f32 {
     if !target.is_finite() {
@@ -1432,6 +1472,145 @@ mod tests {
             broad.impacts.is_empty(),
             "broad envelopes must not retrigger every transient channel"
         );
+    }
+
+    #[test]
+    fn beat_clock_integrates_phase_without_wrapping() {
+        let mut clock = BeatClock::default();
+        let mut last = 0.0;
+        for frame in 0..600 {
+            let t = frame as f32 / 60.0;
+            clock.advance(
+                1.0 / 60.0,
+                &Reactivity {
+                    beat_phase: (t * 2.0).fract(),
+                    tempo_confidence: 1.0,
+                    ..Reactivity::default()
+                },
+            );
+            if frame > 0 {
+                let step = clock.position() - last;
+                assert!(
+                    (step - 2.0 / 60.0).abs() < 1e-4,
+                    "beat position stepped {step} at frame {frame}"
+                );
+            }
+            last = clock.position();
+        }
+        assert!(last > 19.0, "beat position did not accumulate: {last}");
+        // Losing the lock freezes the position; the relock must not count the gap.
+        clock.advance(
+            1.0 / 60.0,
+            &Reactivity {
+                beat_phase: 0.6,
+                tempo_confidence: 0.0,
+                ..Reactivity::default()
+            },
+        );
+        clock.advance(
+            1.0 / 60.0,
+            &Reactivity {
+                beat_phase: 0.7,
+                tempo_confidence: 1.0,
+                ..Reactivity::default()
+            },
+        );
+        assert_eq!(clock.position(), last);
+    }
+
+    /// Scenes that take beat motion from the integrated clock. Each one used to
+    /// add the sawtooth `beat_phase` to a continuous coordinate.
+    const BEAT_SMOOTH_SCENES: &[&str] = &[
+        "Hyperspace Rail",
+        "Tesseract Lane",
+        "Singularity Braid",
+        "Mandala Bloom",
+        "Folded Light",
+        "Kaleido Weave",
+        "Radial Shatter",
+        "Lagrange Bloom",
+        "Total Eclipse",
+        "Gravity Assist",
+        "Tidal Lock",
+        "Roche Limit",
+        "Tartan",
+        "Warp Tension",
+        "Trace Lattice",
+        "Oscillator Bank",
+        "Bus Ribbon",
+        "Phased Array",
+        "Solder Bloom",
+        "Crossbar Route",
+        "Skyline Pulse",
+        "Street Canyon",
+        "Clock Tower",
+        "Rain Curtain",
+        "Storm Front",
+    ];
+
+    /// Two consecutive frames one sixtieth of a second apart. The phase pair
+    /// always advances the same fraction of a beat, so the two runs differ only
+    /// in whether the tracker wrapped between them.
+    fn beat_frames(scene: usize, phases: [f32; 2]) -> (Buffer, Buffer) {
+        let area = Rect::new(0, 0, 80, 24);
+        let theme = crate::palette::Theme::default();
+        let audio = |phase: f32| Reactivity {
+            beat_phase: phase,
+            tempo_confidence: 1.0,
+            beat: 0.4,
+            ..Reactivity::default()
+        };
+        let mut renderer = Renderer::default();
+        let mut first = Buffer::empty(area);
+        renderer.draw(
+            &mut first,
+            area,
+            0.0,
+            scene,
+            0,
+            &[0.3; 32],
+            &audio(phases[0]),
+            &theme,
+        );
+        let mut second = Buffer::empty(area);
+        renderer.draw(
+            &mut second,
+            area,
+            1.0 / 60.0,
+            scene,
+            0,
+            &[0.3; 32],
+            &audio(phases[1]),
+            &theme,
+        );
+        (first, second)
+    }
+
+    fn cell_diff(a: &Buffer, b: &Buffer) -> usize {
+        a.content
+            .iter()
+            .zip(&b.content)
+            .filter(|(x, y)| x != y)
+            .count()
+    }
+
+    #[test]
+    fn beat_wrap_does_not_move_continuous_geometry() {
+        for name in BEAT_SMOOTH_SCENES {
+            let scene = SCENES
+                .iter()
+                .position(|title| title == name)
+                .unwrap_or_else(|| panic!("unknown scene {name}"));
+            let (before, after) = beat_frames(scene, [0.94, 0.98]);
+            let continuous = cell_diff(&before, &after);
+            let (before, after) = beat_frames(scene, [0.96, 0.0]);
+            let wrap = cell_diff(&before, &after);
+            assert!(
+                wrap <= continuous + 4,
+                "{name} moved {wrap} cells when the beat phase wrapped, \
+                 against {continuous} for the same elapsed beats"
+            );
+        }
     }
 
     #[test]

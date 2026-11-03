@@ -5,7 +5,7 @@
 
 use crate::{
     palette::Theme,
-    visuals::{approach_hue, Reactivity},
+    visuals::{approach_hue, BeatClock, Reactivity},
 };
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::TAU;
@@ -32,6 +32,8 @@ pub struct Renderer {
     phase: f32,
     /// Abstract motion distance, wrapped to a period shared by every pattern.
     scroll: f32,
+    /// Continuous beat position, so beat-synced motion does not snap on the wrap.
+    beat: BeatClock,
     /// Bass, mid, treble, kick, onset, centroid, flatness.
     env: [f32; ENV],
     /// Smoothed chroma hue, so noise does not flicker the palette.
@@ -135,6 +137,7 @@ impl Renderer {
         // wrap would snap every woven band at once.
         self.scroll +=
             dt * (0.12 + unit(audio.energy) * 1.6 + self.env[3] * 0.4 + self.strike * 0.6);
+        self.beat.advance(dt, audio);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -161,11 +164,7 @@ impl Renderer {
         let strike = self.strike;
         let energy = unit(audio.energy);
         let beat = unit(audio.beat);
-        let beat_phase = if audio.locked_beat_phase().is_finite() {
-            audio.locked_beat_phase().rem_euclid(1.0)
-        } else {
-            0.0
-        };
+        let beat_pos = self.beat.position();
         let transient = audio
             .transients
             .iter()
@@ -306,7 +305,7 @@ impl Renderer {
                         // diagonal twill.
                         let bands_x = 5.0 + (bass * 4.0).round();
                         let bands_y = 4.0 + (mid * 3.0).round();
-                        let fx = u * bands_x + beat_phase * 0.08;
+                        let fx = u * bands_x + beat_pos * 0.08;
                         let fy = v * bands_y;
                         let ix = fx.floor();
                         let iy = fy.floor();
@@ -523,7 +522,7 @@ impl Renderer {
                         let tx = gx / spacing;
                         let idx = tx.round();
                         let base = idx * spacing;
-                        let pluck_y = 0.42 + 0.12 * (beat_phase * TAU).sin() + 0.04 * strike;
+                        let pluck_y = 0.42 + 0.12 * (beat_pos * TAU).sin() + 0.04 * strike;
                         let dy = (v - pluck_y) / (0.16 + 0.05 * bass + 0.04 * strike);
                         let shape = (-dy * dy).exp();
                         let amp = (0.03 + 0.5 * strike + 0.2 * kick) * shape;

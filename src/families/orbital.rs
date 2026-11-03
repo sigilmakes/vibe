@@ -1,7 +1,10 @@
 //! Orbital mechanics scenes. Positions use a unit-height projection with the
 //! terminal aspect corrected at rasterization, so circles stay circular on any
 //! window shape.
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{BeatClock, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::TAU;
 
@@ -44,6 +47,9 @@ pub struct Renderer {
     burst: f32,
     /// Fraction of the encounter path the ship has flown.
     ship: f32,
+    /// Continuous beat position, so beat-synced paths glide instead of stepping
+    /// once per beat.
+    beat: BeatClock,
     xs: Vec<f32>,
     ys: Vec<f32>,
 }
@@ -70,6 +76,7 @@ impl Renderer {
             .max(unit(audio.onset));
         self.burst = (self.burst * (-dt * 2.6).exp()).max(attack);
         self.ship = (self.ship + dt * (0.09 + unit(audio.energy) * 0.25)).fract();
+        self.beat.advance(dt, audio);
     }
 
     fn project(&mut self, area: Rect, visible: Rect) {
@@ -622,7 +629,7 @@ impl Renderer {
         let lg = Lagrange::new(unit(audio.bass), self.precession);
         let levels = [-4.2_f32, -3.2, -2.55, -2.10, -1.80, -1.57, -1.39];
         let level_scale = 1.0 / lg.sep;
-        let trojan = t * 0.65 + unit(audio.locked_beat_phase()) * TAU;
+        let trojan = t * 0.65 + self.beat.position() * TAU;
         let trojan_r = 0.15 + self.burst * 0.15;
         let trojan_count = 4 + (self.burst * 8.0) as usize;
         let points = lg.points_world();
@@ -702,7 +709,7 @@ impl Renderer {
     ) {
         let sun_r = 0.60 + unit(audio.bass) * 0.05;
         let moon_r = 0.63 + unit(audio.mid) * 0.02;
-        let cycle = (t * 0.072 + unit(audio.locked_beat_phase()) * 0.12).fract();
+        let cycle = (t * 0.072 + self.beat.position() * 0.12).fract();
         let mx = (cycle * 2.5 - 1.25) * sun_r;
         let my = -0.03 + 0.06 * (t * 0.31).sin();
         let energy = unit(audio.energy);
@@ -1145,7 +1152,7 @@ impl Renderer {
         let d = dir[0].hypot(dir[1]).max(0.001);
         dir = [dir[0] / d, dir[1] / d];
         let perp = [-dir[1], dir[0]];
-        let lib = (0.16 + bass * 0.22) * (t * 0.52 + unit(audio.locked_beat_phase()) * 0.6).sin();
+        let lib = (0.16 + bass * 0.22) * (t * 0.52 + self.beat.position() * 0.6).sin();
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
@@ -1303,7 +1310,10 @@ impl Renderer {
             1.58,
             2.08,
         ];
-        let pulse_r = unit(audio.locked_beat_phase()) * 2.35;
+        // The attack starts an outward ring that fades as the beat envelope
+        // decays, so the reset coincides with a transient instead of a slow
+        // coordinate sliding back to zero.
+        let pulse_r = (1.0 - beat) * 2.35;
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {

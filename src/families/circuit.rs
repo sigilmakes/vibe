@@ -2,7 +2,10 @@
 //!
 //! Every scene draws in cell space, so the whole window is the board. Geometry
 //! is precomputed where it is static and evaluated per axis where it is not.
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{BeatClock, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::TAU;
 
@@ -155,8 +158,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         _ => 0.15 + u * 0.20 + v * 0.20,
     };
     let pitch = if mode == 9 { chroma_hue * 0.18 } else { 0.0 };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05 + pitch)
-        .rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16 + pitch).rem_euclid(1.0)
 }
 
 struct Net {
@@ -325,6 +327,9 @@ pub struct Renderer {
     beat_index: usize,
     last_beat_phase: f32,
     route_phase: f32,
+    /// Continuous beat position, so beat-synced paths glide instead of
+    /// stepping once per beat.
+    beat: BeatClock,
 }
 
 impl Renderer {
@@ -364,6 +369,7 @@ impl Renderer {
         self.route_phase = (self.route_phase
             + dt * (0.25 + unit(audio.mid) * 0.5 + unit(audio.treble) * 0.45))
             .rem_euclid(1.0);
+        self.beat.advance(dt, audio);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
             return;
@@ -409,7 +415,12 @@ impl Renderer {
                 }
                 let u = i as f32 / w.max(1) as f32;
                 let v = j as f32 / h.max(1) as f32;
-                let hue = hue_for(mode, u, v, audio);
+                // Beat position drifts the tint without a wrap; the envelope
+                // adds a short accent on the attack.
+                let hue = (hue_for(mode, u, v, audio)
+                    + self.beat.position() * 0.05
+                    + unit(audio.beat) * 0.02)
+                    .rem_euclid(1.0);
                 let bright = (level * (0.62 + energy * 0.30)).clamp(0.03, 1.0);
                 cell.set_char(self.canvas.mark[j * w + i]);
                 cell.set_fg(theme.sample(palette, hue, bright));
@@ -703,8 +714,7 @@ impl Renderer {
         }
         let fw = w as f32;
         let fh = h as f32;
-        let pulse = (t * 1.3 + unit(audio.locked_beat_phase()) * 1.6 + unit(audio.bass) * 1.1)
-            .rem_euclid(6.2);
+        let pulse = (t * 1.3 + self.beat.position() * 1.6 + unit(audio.bass) * 1.1).rem_euclid(6.2);
         for b in &self.tree {
             let d = b.depth as f32;
             let ring = (-((d + 0.5 - pulse) * (d + 0.5 - pulse)) * 1.8).exp();
@@ -852,8 +862,7 @@ impl Renderer {
             route_level,
         );
         route.push([right, ys[row] as f32]);
-        let s = (t * (0.18 + unit(audio.bass) * 0.2) + unit(audio.locked_beat_phase()) * 0.5)
-            .rem_euclid(1.0);
+        let s = (t * (0.18 + unit(audio.bass) * 0.2) + self.beat.position() * 0.5).rem_euclid(1.0);
         for tail in 0..4 {
             let p = point_along(&route, (s - tail as f32 * 0.012).rem_euclid(1.0));
             self.canvas.dot(

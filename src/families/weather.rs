@@ -5,7 +5,10 @@
 //! are generated once and reused. Motion is a function of time and the audio
 //! state, so a frame is deterministic for a given call sequence; lightning is
 //! the one scene that carries a decaying strike envelope between frames.
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{BeatClock, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
 
@@ -142,7 +145,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.14 + v * 0.30,
         _ => 0.18 + u * 0.28,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16).rem_euclid(1.0)
 }
 
 struct Cloud {
@@ -273,6 +276,8 @@ pub struct Renderer {
     bolt_seed: u32,
     bolt_strength: f32,
     bolt_age: f32,
+    /// Continuous beat position, so beat-synced motion does not snap on the wrap.
+    beat: BeatClock,
 }
 
 impl Renderer {
@@ -299,6 +304,7 @@ impl Renderer {
             .map(|prev| (now - prev).clamp(0.0, 0.1))
             .unwrap_or(0.0);
         self.last_time = Some(now);
+        self.beat.advance(dt, audio);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
             return;
@@ -344,7 +350,12 @@ impl Renderer {
                 }
                 let u = i as f32 / w.max(1) as f32;
                 let v = j as f32 / h.max(1) as f32;
-                let hue = hue_for(mode, u, v, audio);
+                // Beat position drifts the tint without a wrap; the envelope
+                // adds a short accent on the attack.
+                let hue = (hue_for(mode, u, v, audio)
+                    + self.beat.position() * 0.05
+                    + unit(audio.beat) * 0.02)
+                    .rem_euclid(1.0);
                 let bright = (level * (0.62 + energy * 0.30)).clamp(0.03, 1.0);
                 cell.set_char(self.canvas.mark[j * w + i]);
                 cell.set_fg(theme.sample(palette, hue, bright));
@@ -841,9 +852,8 @@ impl Renderer {
         let bass = unit(audio.bass);
         let energy = unit(audio.energy);
         let treble = unit(audio.treble);
-        let sweep = t * (0.7 + energy * 1.1)
-            + unit(audio.locked_beat_phase()) * TAU
-            + unit(audio.centroid) * 2.0;
+        let sweep =
+            t * (0.7 + energy * 1.1) + self.beat.position() * TAU + unit(audio.centroid) * 2.0;
         for j in 0..h {
             let v = j as f32 / fh;
             for i in 0..w {

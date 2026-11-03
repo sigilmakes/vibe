@@ -1,7 +1,10 @@
 //! Kaleidoscope and symmetry: mirrored mandalas, rosettes, prisms, folded
 //! light and crystalline repeats. Fields are evaluated in a square world frame
 //! with two vertical samples per terminal cell.
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{BeatClock, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
 
@@ -26,6 +29,9 @@ pub struct Renderer {
     envelopes: [f32; 3],
     attack: f32,
     impact: f32,
+    /// Continuous beat position, so beat-synced geometry does not snap on the
+    /// wrap.
+    beat: BeatClock,
     xs: Vec<f32>,
     ys: Vec<[f32; 2]>,
 }
@@ -40,7 +46,7 @@ struct Params {
     energy: f32,
     kick: f32,
     beat: f32,
-    beat_phase: f32,
+    beat_pos: f32,
     impact: f32,
     centroid: f32,
     flatness: f32,
@@ -140,7 +146,7 @@ fn mandala(p: &Params, x: f32, y: f32) -> (f32, f32) {
     let sector = TAU / p.folds as f32;
     let u = fold_angle(theta, p.folds) / (sector * 0.5);
     let petal = (u * PI * 0.5).cos();
-    let pulse = (p.beat_phase * TAU).sin();
+    let pulse = (p.beat_pos * TAU).sin();
     // The rim and webbing are geometry, not only pigment. Low bands widen the
     // bloom, high bands tighten the inner rings, and the beat gives a visible
     // breathing step instead of a recolour.
@@ -383,7 +389,7 @@ fn shatter(p: &Params, x: f32, y: f32) -> (f32, f32) {
     let sf = pos - pos.floor();
     let u = (sf * 2.0 - 1.0).abs();
     let rings = 2.5 + p.bass * 2.0 + (p.rings - 1.0) * 2.0;
-    let stagger = hash2(si, 5) * 0.8 + p.beat_phase * 0.25;
+    let stagger = hash2(si, 5) * 0.8 + p.beat_pos * 0.25;
     let rr = r * rings + stagger;
     let ri = rr.floor();
     let rf = rr - ri;
@@ -472,6 +478,7 @@ impl Params {
             kick: unit(audio.kick),
             beat: unit(audio.beat),
             beat_phase,
+            beat_pos: renderer.beat.position(),
             impact: renderer.impact,
             centroid: unit(audio.centroid),
             flatness: unit(audio.flatness),
@@ -522,6 +529,7 @@ impl Renderer {
             .rem_euclid(4096.0);
         self.spin = (self.spin + dt * (0.07 + self.envelopes[0] * 0.32 + unit(audio.beat) * 0.22))
             .rem_euclid(TAU * 64.0);
+        self.beat.advance(dt, audio);
     }
 
     fn field(&self, p: &Params, x: f32, y: f32) -> (f32, f32) {
@@ -562,7 +570,7 @@ impl Renderer {
                 let wx = ((x - area.x) as f32 + 0.5 - area.width as f32 * 0.5) * scale;
                 let rx = wx * cs - wy * sn;
                 let ry = wx * sn + wy * cs;
-                let sa = ((rx + ry) * frequency + p.t * 0.55 + p.beat_phase * 0.5).sin();
+                let sa = ((rx + ry) * frequency + p.t * 0.55 + p.beat_pos * 0.5).sin();
                 let sb = ((rx - ry) * frequency - p.t * 0.42).sin();
                 let a = ((sa.abs() - threshold) / span).clamp(0.0, 1.0);
                 let b = ((sb.abs() - threshold) / span).clamp(0.0, 1.0);

@@ -14,8 +14,10 @@ fn unit(v: f32) -> f32 {
 pub struct Renderer {
     last_time: Option<f32>,
     rotation: f32,
-    previous_attack: f32,
-    punch: f32,
+    previous_strike: [f32; 4],
+    /// One decaying attack envelope per transient band: low, low-mid,
+    /// presence, air.
+    strike: [f32; 4],
 }
 
 impl Renderer {
@@ -30,18 +32,19 @@ impl Renderer {
             .map_or(1.0 / 60.0, |last| (time - last).clamp(0.0, 0.1));
         self.last_time = Some(time);
         self.rotation = (self.rotation + dt * (0.24 + unit(audio.mid) * 0.18)).rem_euclid(TAU);
-        let attack = unit(audio.kick).max(unit(audio.onset)).max(
-            audio
-                .transients
-                .iter()
-                .copied()
-                .map(unit)
-                .fold(0.0, f32::max),
-        );
-        self.punch = (self.punch - dt / 0.18)
-            .max(0.0)
-            .max((attack - self.previous_attack).max(0.0));
-        self.previous_attack = attack;
+        // Each band keeps its own envelope. Folding them into one maximum let a
+        // hat drive the mass that only a kick should move.
+        let attacks = [
+            unit(audio.kick).max(unit(audio.transients[0])),
+            unit(audio.transients[1]),
+            unit(audio.transients[2]),
+            unit(audio.transients[3]),
+        ];
+        for (channel, attack) in attacks.into_iter().enumerate() {
+            let rise = (attack - self.previous_strike[channel]).max(0.0);
+            self.strike[channel] = (self.strike[channel] - dt / 0.18).max(0.0).max(rise);
+            self.previous_strike[channel] = attack;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -75,26 +78,33 @@ impl Renderer {
         }
     }
 
-    // A closed trefoil with four longitudinal rails and transverse ribs.
+    // A closed trefoil with four longitudinal rails and transverse ribs. Each
+    // transient band owns one part of it, so a low-mid attack cannot stand in
+    // for a kick.
     fn sculpture(&self, bands: &[f32; 32], audio: &Reactivity) -> [[[f32; 3]; 4]; 72] {
         let (s, c) = self.rotation.sin_cos();
         let (ts, tc) = (0.48 + self.rotation.sin() * 0.52).sin_cos();
+        let [low, body, presence, air] = self.strike;
         std::array::from_fn(|i| {
             let u = i as f32 / 72.0 * TAU;
             let r = 0.53 + 0.18 * (3.0 * u).cos();
-            let bulge = 1.0 + unit(audio.bass) * 0.18 + self.punch * 0.12;
+            // Low attacks swell the whole knot; nothing above the bass moves it.
+            let bulge = 1.0 + unit(audio.bass) * 0.18 + low * 0.12;
             std::array::from_fn(|rail| {
-                let a = rail as f32 * TAU / 4.0 + u;
-                let rib = 0.055 + unit(bands[i * 32 / 72]) * 0.035 + unit(audio.treble) * 0.018;
-                let fracture = if i % 6 == 0 {
-                    unit(audio.treble) * 0.075
-                } else {
-                    0.0
-                };
+                // Presence attacks fan the four rails apart along the knot.
+                let a = rail as f32 * TAU / 4.0 + u + presence * 0.22;
+                // Low-mid attacks thicken and deepen the transverse ribs.
+                let rib = 0.055
+                    + unit(bands[i * 32 / 72]) * 0.035
+                    + unit(audio.treble) * 0.018
+                    + body * 0.030;
+                // Air attacks fray the seams between ribs.
+                let fracture = if i % 6 == 0 { air * 0.075 } else { 0.0 };
                 let x = (r + rib * a.cos() + fracture) * (2.0 * u).cos() * bulge;
                 let y = (r + rib * a.cos() + fracture) * (2.0 * u).sin() * bulge;
-                let z =
-                    0.25 * (3.0 * u).sin() + rib * a.sin() + self.punch * 0.07 * (5.0 * u).cos();
+                let z = 0.25 * (3.0 * u).sin()
+                    + rib * a.sin() * (1.0 + body * 0.5)
+                    + low * 0.07 * (5.0 * u).cos();
                 let rx = x * c + z * s;
                 let rz = z * c - x * s;
                 [rx, y * tc - rz * ts, y * ts + rz * tc]
@@ -176,8 +186,8 @@ impl Renderer {
         };
         for i in 0..72 {
             for rail in 0..4 {
-                // Treble opens small seams without destroying the underlying knot.
-                if !(unit(audio.treble) > 0.55 && i % 12 == 3 && rail % 2 == 0) {
+                // Air attacks tear small seams without destroying the knot.
+                if !(self.strike[3] > 0.4 && i % 12 == 3 && rail % 2 == 0) {
                     line(
                         vertices[i][rail],
                         vertices[(i + 1) % 72][rail],
@@ -200,9 +210,10 @@ impl Renderer {
         let bass = unit(audio.bass);
         let mid = unit(audio.mid);
         let high = unit(audio.treble);
-        let split = 0.48 + bass * 0.12 - mid * 0.08;
-        let lift = self.punch * 0.055;
-        let seam = 0.035;
+        let [low, body, presence, air] = self.strike;
+        let split = 0.48 + bass * 0.12 - mid * 0.08 + body * 0.03;
+        let lift = low * 0.055;
+        let seam = 0.035 + presence * 0.02;
         let cross = 0.39 + mid * 0.15;
         [
             [0.10 - lift, 0.14 + lift, split - 0.10, 0.52 + bass * 0.08],
@@ -214,9 +225,9 @@ impl Renderer {
                 0.29 - mid * 0.08,
             ],
             [0.10, 0.73 + lift, 0.42 + unit(bands[5]) * 0.16, 0.09],
-            [0.73 - lift, 0.73 - lift, 0.13 + high * 0.03, 0.13],
+            [0.73 - lift, 0.73 - lift, 0.13 + air * 0.03, 0.13],
             [0.055, 0.14, 0.018, 0.31 + mid * 0.16],
-            [0.73, cross + seam, 0.13, 0.045 + high * 0.05],
+            [0.73, cross + seam, 0.13, 0.045 + air * 0.05],
         ]
     }
 
@@ -423,19 +434,113 @@ mod tests {
         }
     }
 
-    #[test]
-    fn transient_has_short_bounded_memory() {
+    /// One frame after a single attacked band, with everything else quiet.
+    fn struck(transients: [f32; 4]) -> Renderer {
         let mut renderer = Renderer::default();
+        renderer.advance(0.0, &Reactivity::default());
         renderer.advance(
-            0.0,
+            1.0 / 60.0,
             &Reactivity {
-                kick: 1.0,
+                transients,
                 ..Reactivity::default()
             },
         );
-        assert!(renderer.punch > 0.9);
-        renderer.advance(0.1, &Reactivity::default());
+        renderer
+    }
+
+    #[test]
+    fn strike_envelopes_decay_per_channel() {
+        let mut renderer = Renderer::default();
+        renderer.advance(0.0, &Reactivity::default());
+        renderer.advance(
+            0.1,
+            &Reactivity {
+                kick: 0.9,
+                transients: [0.0, 0.6, 0.3, 1.0],
+                ..Reactivity::default()
+            },
+        );
+        assert_eq!(renderer.strike, [0.9, 0.6, 0.3, 1.0]);
         renderer.advance(0.2, &Reactivity::default());
-        assert_eq!(renderer.punch, 0.0);
+        renderer.advance(0.3, &Reactivity::default());
+        assert_eq!(renderer.strike, [0.0; 4]);
+    }
+
+    #[test]
+    fn each_transient_band_moves_its_own_geometry() {
+        let quiet = struck([0.0; 4]).sculpture(&[0.4; 32], &Reactivity::default());
+        let shapes: Vec<_> = (0..4)
+            .map(|channel| {
+                let mut transients = [0.0; 4];
+                transients[channel] = 1.0;
+                struck(transients).sculpture(&[0.4; 32], &Reactivity::default())
+            })
+            .collect();
+        for (channel, shape) in shapes.iter().enumerate() {
+            assert_ne!(
+                *shape, quiet,
+                "transient band {channel} left the sculpture unchanged"
+            );
+            for (other, rival) in shapes.iter().enumerate().skip(channel + 1) {
+                assert_ne!(
+                    shape, rival,
+                    "transient bands {channel} and {other} share one geometry"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hi_hat_attacks_do_not_move_the_bass_mass() {
+        let quiet = struck([0.0; 4]).sculpture(&[0.4; 32], &Reactivity::default());
+        let hat = struck([0.0, 0.0, 0.0, 1.0]).sculpture(&[0.4; 32], &Reactivity::default());
+        let kick = struck([1.0, 0.0, 0.0, 0.0]).sculpture(&[0.4; 32], &Reactivity::default());
+        // Air only frays the seams every sixth sample; the rest of the knot
+        // must stay exactly where a quiet frame left it.
+        for (i, (air, rest)) in hat.iter().zip(&quiet).enumerate() {
+            if !i.is_multiple_of(6) {
+                assert_eq!(air, rest, "an air attack displaced vertex {i}");
+            }
+        }
+        assert!(
+            kick.iter().zip(&quiet).all(|(loud, rest)| loud != rest),
+            "a low attack must swell the whole knot"
+        );
+    }
+
+    #[test]
+    fn tile_layout_answers_each_band_separately() {
+        let bands = [0.4; 32];
+        let quiet = struck([0.0; 4]).composition(&bands, &Reactivity::default());
+        let layouts: Vec<_> = (0..4)
+            .map(|channel| {
+                let mut transients = [0.0; 4];
+                transients[channel] = 1.0;
+                struck(transients).composition(&bands, &Reactivity::default())
+            })
+            .collect();
+        for (channel, layout) in layouts.iter().enumerate() {
+            assert_ne!(
+                *layout, quiet,
+                "transient band {channel} left the tiles unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn strike_geometry_is_deterministic_and_bounded() {
+        for transients in [[0.0; 4], [1.0; 4], [0.0, 0.0, 0.0, 1.0]] {
+            let first = struck(transients).sculpture(&[0.8; 32], &Reactivity::default());
+            let second = struck(transients).sculpture(&[0.8; 32], &Reactivity::default());
+            assert_eq!(first, second);
+            for vertex in first.iter().flatten() {
+                for axis in vertex {
+                    assert!(
+                        axis.is_finite() && axis.abs() < 2.0,
+                        "vertex {axis} escaped"
+                    );
+                }
+            }
+        }
     }
 }

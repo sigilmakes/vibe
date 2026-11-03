@@ -3,7 +3,10 @@
 //!
 //! Static city geometry is precomputed; windows, lights, vehicles, and signals
 //! are deterministic functions of time and the live audio state.
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{BeatClock, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
 
@@ -191,7 +194,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.05 + u * 0.35,
         _ => 0.58 + u * 0.30,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16).rem_euclid(1.0)
 }
 
 #[derive(Clone, Copy)]
@@ -271,6 +274,8 @@ pub struct Renderer {
     /// Completed beat count, used where a scene should step once per beat.
     beat: u32,
     last_beat_phase: f32,
+    /// Continuous beat position for colour drift that must not snap.
+    beat_clock: BeatClock,
 }
 
 impl Renderer {
@@ -321,6 +326,7 @@ impl Renderer {
             .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.08));
         self.last_time = Some(now);
         self.advance_clock(dt, audio);
+        self.beat_clock.advance(dt, audio);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
             return;
@@ -371,7 +377,12 @@ impl Renderer {
                 let hue = if tint >= 0.0 {
                     (tint + unit(audio.centroid) * 0.10).rem_euclid(1.0)
                 } else {
-                    hue_for(mode, u, v, audio)
+                    // Beat position drifts the tint without a wrap; the
+                    // envelope adds a short accent on the attack.
+                    (hue_for(mode, u, v, audio)
+                        + self.beat_clock.position() * 0.05
+                        + unit(audio.beat) * 0.02)
+                        .rem_euclid(1.0)
                 };
                 let bright = (level * (0.62 + energy * 0.30)).clamp(0.03, 1.0);
                 cell.set_char(self.canvas.mark[index]);

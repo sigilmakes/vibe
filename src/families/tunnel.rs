@@ -5,7 +5,7 @@
 
 use crate::{
     palette::Theme,
-    visuals::{approach_hue, Reactivity},
+    visuals::{approach_hue, BeatClock, Reactivity},
 };
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
@@ -33,6 +33,8 @@ pub struct Renderer {
     phase: f32,
     /// Abstract travel distance, wrapped to a period shared by every pattern.
     scroll: f32,
+    /// Continuous beat position, so beat-synced motion does not snap on the wrap.
+    beat: BeatClock,
     /// Bass, mid, treble, kick, onset, centroid, flatness.
     env: [f32; ENV],
     /// Smoothed chroma hue, so noise does not flicker the palette.
@@ -131,6 +133,7 @@ impl Renderer {
         // No modular reset: scroll feeds sines with many different rates, so a
         // wrap would snap every ring and rail at once.
         self.scroll += dt * (0.5 + unit(audio.energy) * 1.5 + self.env[3] * 0.4);
+        self.beat.advance(dt, audio);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -157,11 +160,7 @@ impl Renderer {
         let attack = self.attack;
         let energy = unit(audio.energy);
         let beat = unit(audio.beat);
-        let beat_phase = if audio.locked_beat_phase().is_finite() {
-            audio.locked_beat_phase().rem_euclid(1.0)
-        } else {
-            0.0
-        };
+        let beat_pos = self.beat.position();
         let transient = audio
             .transients
             .iter()
@@ -191,7 +190,7 @@ impl Renderer {
                         let depth = 1.0 / (r + 0.06);
                         let z = depth * 2.2 + scroll * 1.7;
                         let spokes = 12.0 + (treble * 10.0).round();
-                        let u = th / TAU * spokes + beat_phase * 0.5;
+                        let u = th / TAU * spokes + beat_pos * 0.5;
                         let du = (u - u.round()).abs();
                         let spoke = (1.0 - du * 2.0).clamp(0.0, 1.0).powf(3.0);
                         let dz = (z - z.round()).abs();
@@ -495,7 +494,7 @@ impl Renderer {
                     }
                     8 => {
                         let th = py.atan2(px);
-                        let ang = t * 0.5 + scroll * 0.25 + beat_phase * 0.5;
+                        let ang = t * 0.5 + scroll * 0.25 + beat_pos * 0.5;
                         // A drop collapses the lane: every square shrinks
                         // toward the vanishing point, then expands again.
                         let pulse = (1.0 + kick * 0.13 + beat * 0.06) * (1.0 - 0.4 * attack);
@@ -560,7 +559,7 @@ impl Renderer {
                         let r = px.hypot(py).max(1e-3);
                         let th = py.atan2(px);
                         let depth = 1.0 / (r + 0.07);
-                        let twist = th * 2.0 + depth * 5.0 - scroll * 2.0 + beat_phase * 0.5;
+                        let twist = th * 2.0 + depth * 5.0 - scroll * 2.0 + beat_pos * 0.5;
                         let sep = 0.4 + 0.5 * bass + 0.3 * mid;
                         let wobble = 0.35 * (depth * 2.0 + scroll * 0.5).sin() * sep;
                         let strand = |phase: f32| {
