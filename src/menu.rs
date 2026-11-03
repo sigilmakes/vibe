@@ -356,8 +356,8 @@ impl Menu {
                     self.move_selection(1, pages);
                     Effect::None
                 }
-                KeyCode::Left => self.step_row(-1, pages),
-                KeyCode::Right => self.step_row(1, pages),
+                KeyCode::Left => self.arrow(-1, pages),
+                KeyCode::Right => self.arrow(1, pages),
                 KeyCode::Enter => self.activate(pages),
                 _ => Effect::None,
             }
@@ -387,6 +387,28 @@ impl Menu {
         if let Some(row) = page.visible_rows().nth(next) {
             self.selected[depth] = row.id;
             self.last_index[depth] = next;
+        }
+    }
+
+    /// Left and Right open and leave submenus; on value rows they step the
+    /// value as before.
+    fn arrow(&mut self, direction: isize, pages: &[Page]) -> Effect {
+        let submenu = self
+            .selected_row(pages)
+            .and_then(|row| (row.kind == RowKind::Submenu).then_some(row.submenu.clone()));
+        if let Some(target) = submenu {
+            if direction < 0 {
+                if self.stack.len() > 1 {
+                    self.stack.pop();
+                    self.selected.pop();
+                    self.last_index.pop();
+                }
+            } else {
+                self.descend(target, pages);
+            }
+            Effect::None
+        } else {
+            self.step_row(direction, pages)
         }
     }
 
@@ -660,7 +682,11 @@ fn build_controls() -> Page {
             Row::readonly(ids::CONTROL_M, "m", "open / close menu"),
             Row::readonly(ids::CONTROL_ARROWS, "↑ / ↓", "move"),
             Row::readonly(ids::CONTROL_ENTER, "Enter", "select / edit"),
-            Row::readonly(ids::CONTROL_LEFT_RIGHT, "← / →", "change value / scene"),
+            Row::readonly(
+                ids::CONTROL_LEFT_RIGHT,
+                "← / →",
+                "back / open; change value",
+            ),
             Row::readonly(ids::CONTROL_ESC, "Esc", "back / close"),
             Row::readonly(ids::CONTROL_Q, "q", "quit"),
             Row::readonly(ids::CONTROL_CTRL_C, "Ctrl-C", "quit"),
@@ -756,6 +782,31 @@ mod tests {
         assert_eq!(
             menu.handle_key(press(KeyCode::Esc), &pages),
             Effect::CloseMenu
+        );
+    }
+
+    #[test]
+    fn left_and_right_open_and_leave_submenus_and_still_step_values() {
+        let mut menu = Menu::new();
+        let pages = default_pages(false);
+        menu.rebuild(&pages);
+
+        // Right opens the selected submenu; Left returns.
+        assert_eq!(menu.handle_key(press(KeyCode::Right), &pages), Effect::None);
+        assert_eq!(title(&menu, &pages), "Scenes");
+        assert_eq!(menu.handle_key(press(KeyCode::Left), &pages), Effect::None);
+        assert_eq!(title(&menu, &pages), "Vibe");
+
+        // Value rows keep using Left and Right to step.
+        menu.handle_key(press(KeyCode::Down), &pages); // Audio
+        menu.handle_key(press(KeyCode::Right), &pages);
+        assert_eq!(title(&menu, &pages), "Audio");
+        assert_eq!(
+            menu.handle_key(press(KeyCode::Right), &pages),
+            Effect::Changed {
+                id: ids::DEMO,
+                value: "on".into()
+            }
         );
     }
 
