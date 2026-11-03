@@ -161,17 +161,19 @@ impl Renderer {
         mid_band: f32,
         high: f32,
     ) {
+        let attack = unit(audio.onset).max(unit(audio.transients[0]));
         self.credit +=
             dt * match style {
                 1 => 48.0,
                 6 => 18.0,
                 _ => 28.0,
-            } * (0.45
+            } * (0.18
                 + unit(audio.energy) * 1.8
-                + unit(audio.mid) * 0.9
+                + unit(audio.mid) * 0.6
                 + mid_band * 0.8
                 + low * 0.5
-                + high * 0.4);
+                + high * 0.4
+                + attack * 1.2);
         let steps = (self.credit as usize).min(64);
         self.credit -= steps as f32;
         for _ in 0..steps {
@@ -417,14 +419,20 @@ impl Renderer {
         };
         match style {
             0 | 1 | 2 | 6 => {
-                let wind = self.clock.sin() * (0.025 + unit(audio.bass) * 0.045);
-                for s in &self.segments {
-                    let bend = |mut p: [f32; 2]| {
-                        if style == 6 {
-                            p[0] += wind * (0.94 - p[1]).max(0.0).powi(2);
-                        }
-                        p
+                let wind = self.clock.sin()
+                    * (0.006 + unit(audio.bass) * 0.020 + unit(audio.kick) * 0.030);
+                let shiver = unit(audio.treble) * 0.004;
+                let bend = |mut p: [f32; 2], depth: usize| {
+                    let height = if style == 2 {
+                        p[1]
+                    } else {
+                        (0.94 - p[1]).max(0.0)
                     };
+                    p[0] +=
+                        (wind + (self.clock * 2.7 + depth as f32).sin() * shiver) * height.powi(2);
+                    p
+                };
+                for s in &self.segments {
                     let glyph = match style {
                         0 => '•',
                         1 => '·',
@@ -432,22 +440,22 @@ impl Renderer {
                         _ => ' ',
                     };
                     canvas.line(
-                        bend(s.a),
-                        bend(s.b),
+                        bend(s.a, s.depth),
+                        bend(s.b, s.depth),
                         glyph,
                         0.12 + s.depth as f32 * 0.045,
                         0.45 + s.depth as f32 * 0.035,
                     );
                     if style == 6 && s.depth >= 6 {
-                        canvas.point(bend(s.b), '♣', 0.34, 0.65);
+                        canvas.point(bend(s.b, s.depth), '♣', 0.34, 0.65);
                     }
                     if style == 0 && s.depth > 2 {
-                        canvas.point(s.b, '●', 0.08 + s.depth as f32 * 0.03, 0.65);
+                        canvas.point(bend(s.b, s.depth), '●', 0.08 + s.depth as f32 * 0.03, 0.65);
                     }
                 }
                 for t in &self.tips {
                     canvas.point(
-                        t.p,
+                        bend(t.p, t.depth),
                         if style == 1 {
                             '∘'
                         } else if style == 2 {
@@ -789,6 +797,29 @@ mod tests {
                 cells(&base),
                 cells(&high_run),
                 "style {style} ignores high bands"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_growth_and_sway_follow_attacks() {
+        let quiet = Reactivity::default();
+        let loud = Reactivity {
+            energy: 0.8,
+            bass: 0.8,
+            mid: 0.6,
+            treble: 0.5,
+            onset: 1.0,
+            kick: 1.0,
+            transients: [1.0, 0.0, 0.5, 0.4],
+            ..Reactivity::default()
+        };
+        for style in [0, 1, 2, 6] {
+            let (quiet_renderer, _) = run(style, &quiet);
+            let (loud_renderer, _) = run(style, &loud);
+            assert!(
+                loud_renderer.segments.len() > quiet_renderer.segments.len(),
+                "style {style} should grow more on attacks"
             );
         }
     }

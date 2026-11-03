@@ -322,6 +322,9 @@ pub struct Renderer {
     pads: Vec<Pad>,
     links: Vec<Link>,
     last_time: Option<f32>,
+    beat_index: usize,
+    last_beat_phase: f32,
+    route_phase: f32,
 }
 
 impl Renderer {
@@ -343,7 +346,24 @@ impl Renderer {
         } else {
             self.last_time.unwrap_or(0.0)
         };
+        let dt = self
+            .last_time
+            .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.08));
         self.last_time = Some(now);
+        // Count beat wraps so repeated kicks visit successive blocks instead of
+        // relighting the block chosen by the wall clock.
+        let phase = audio.locked_beat_phase();
+        if audio.tempo_confidence >= 0.25 {
+            if phase + 0.5 < self.last_beat_phase {
+                self.beat_index = self.beat_index.wrapping_add(1);
+            }
+            self.last_beat_phase = phase;
+        } else {
+            self.last_beat_phase = 0.0;
+        }
+        self.route_phase = (self.route_phase
+            + dt * (0.25 + unit(audio.mid) * 0.5 + unit(audio.treble) * 0.45))
+            .rem_euclid(1.0);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
             return;
@@ -1037,31 +1057,34 @@ impl Renderer {
                     self.canvas.plot(cx, cy + 1, '│', 0.12 + strike * 0.3);
                 }
                 let span = (x1 - x0).max(1) as f32;
-                let p = (t * (0.35 + unit(audio.bass) * 0.3) + bx as f32 * 0.21 + by as f32 * 0.37)
-                    .rem_euclid(1.0);
+                let p = (self.route_phase + bx as f32 * 0.21 + by as f32 * 0.37).rem_euclid(1.0);
                 self.canvas
                     .dot(x0 as f32 + span * p, y1 as f32, '●', 0.35 + value * 0.35);
                 let vspan = (y1 - y0).max(1) as f32;
-                let q = (t * 0.33 + bx as f32 * 0.31 + by as f32 * 0.11).rem_euclid(1.0);
+                let q =
+                    (self.route_phase * 0.82 + bx as f32 * 0.31 + by as f32 * 0.11).rem_euclid(1.0);
                 self.canvas
                     .dot(x1 as f32, y0 as f32 + vspan * q, '●', 0.3 + value * 0.35);
             }
         }
         let kick = unit(audio.kick);
+        let count = cols * rows;
+        if kick > 0.12 {
+            let previous = (self.beat_index + count - 1) % count;
+            let trail = 0.18 + kick * 0.20;
+            plot_block(&mut self.canvas, &xs, &ys, cols, previous, '░', trail);
+        }
         if kick > 0.25 {
-            let count = cols * rows;
-            let index = ((t.abs() * 0.8) as usize) % count;
-            let bx = index % cols;
-            let by = index / cols;
-            let x0 = xs[bx];
-            let x1 = xs[bx + 1];
-            let y0 = ys[by];
-            let y1 = ys[by + 1];
-            for y in y0 + 1..y1 {
-                for x in x0 + 1..x1 {
-                    self.canvas.plot(x, y, '▓', 0.65 + kick * 0.2);
-                }
-            }
+            let index = self.beat_index % count;
+            plot_block(
+                &mut self.canvas,
+                &xs,
+                &ys,
+                cols,
+                index,
+                '▓',
+                0.65 + kick * 0.2,
+            );
         }
         // The tempo lock draws a scan row across the die; the decaying beat
         // envelope controls its brightness, so it sweeps on the beat without
@@ -1072,6 +1095,28 @@ impl Renderer {
             let y = ys[row];
             for x in 0..w as i32 {
                 self.canvas.plot(x, y, '═', level);
+            }
+        }
+    }
+}
+
+fn plot_block(
+    canvas: &mut Canvas,
+    xs: &[i32],
+    ys: &[i32],
+    cols: usize,
+    index: usize,
+    mark: char,
+    level: f32,
+) {
+    let bx = index % cols;
+    let by = index / cols;
+    if let (Some(&x0), Some(&x1), Some(&y0), Some(&y1)) =
+        (xs.get(bx), xs.get(bx + 1), ys.get(by), ys.get(by + 1))
+    {
+        for y in y0 + 1..y1 {
+            for x in x0 + 1..x1 {
+                canvas.plot(x, y, mark, level);
             }
         }
     }
@@ -1298,5 +1343,43 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn floorplan_kick_routes_to_successive_blocks() {
+        let area = Rect::new(0, 0, 100, 36);
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(area);
+        let mut visited = std::collections::HashSet::new();
+        for frame in 0..180 {
+            let t = frame as f32 / 60.0;
+            let phase = (t / 0.5).fract();
+            let kick = (-phase * 7.0).exp();
+            let audio = Reactivity {
+                kick,
+                beat: kick,
+                transients: [kick, 0.0, 0.0, 0.0],
+                beat_phase: phase,
+                tempo_confidence: 1.0,
+                ..Reactivity::default()
+            };
+            renderer.draw(
+                &mut buf,
+                area,
+                t,
+                9,
+                0,
+                &[0.5; 32],
+                &audio,
+                &Theme::default(),
+            );
+            if kick > 0.8 {
+                visited.insert(renderer.beat_index % 20);
+            }
+        }
+        assert!(
+            visited.len() >= 4,
+            "kicks should visit several floorplan blocks, saw {visited:?}"
+        );
+        assert!(renderer.route_phase > 0.0);
     }
 }
