@@ -1023,9 +1023,14 @@ fn build_scenes(
         ),
     ];
     if auto.mode != "off" {
+        let timing = if auto.mode == "timer" {
+            "Interval"
+        } else {
+            "Fallback after"
+        };
         rows.push(Row::number_with_unit(
             ids::AUTO_TRANSITION,
-            "Transition time",
+            timing,
             auto.transition_secs,
             TRANSITION_SPEC,
             "s",
@@ -1037,12 +1042,14 @@ fn build_scenes(
         if !active.is_empty() {
             scopes.push("Playlist");
         }
-        rows.push(Row::choice(
-            ids::AUTO_WITHIN,
-            "Advance within",
-            &scopes,
-            within_display(&auto.within),
-        ));
+        if scopes.len() > 1 {
+            rows.push(Row::choice(
+                ids::AUTO_WITHIN,
+                "Advance within",
+                &scopes,
+                within_display(&auto.within),
+            ));
+        }
     }
     Page {
         id: PageId::Scenes,
@@ -1856,7 +1863,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_advance_details_are_hidden_while_off_and_use_seconds() {
+    fn auto_advance_details_are_hidden_while_off_and_named_by_mode() {
         let config = config::Config::default();
         let pages = build_pages(&config, 0, false, "", "");
         let scenes = find_page(&pages, PageId::Scenes).unwrap();
@@ -1893,8 +1900,7 @@ mod tests {
                 "Filter…",
                 "Playlists…",
                 "Auto-advance",
-                "Transition time",
-                "Advance within",
+                "Interval",
             ]
         );
         let transition = scenes
@@ -1903,14 +1909,24 @@ mod tests {
             .unwrap();
         assert_eq!(transition.value, "20");
         assert_eq!(transition.unit, Some("s"));
-        assert_eq!(
-            scenes
-                .visible_rows()
-                .find(|row| row.id == ids::AUTO_WITHIN)
-                .unwrap()
-                .value,
-            "All"
-        );
+        assert!(!scenes.visible_rows().any(|row| row.id == ids::AUTO_WITHIN));
+
+        // Phrases use the same value as a fallback, not an interval.
+        config.auto_advance.mode = "phrases".into();
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        let labels: Vec<&str> = scenes
+            .visible_rows()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert!(labels.contains(&"Fallback after"));
+        assert!(!labels.contains(&"Interval"));
+
+        // The scope row appears once there is somewhere else to advance within.
+        config.scenes.favourites = vec!["Julia".into()];
+        let pages = build_pages(&config, 0, false, "", "");
+        let scenes = find_page(&pages, PageId::Scenes).unwrap();
+        assert!(scenes.visible_rows().any(|row| row.id == ids::AUTO_WITHIN));
     }
 
     #[test]
@@ -1919,11 +1935,7 @@ mod tests {
         config.auto_advance.mode = "timer".into();
         let pages = build_pages(&config, 0, false, "", "");
         let scenes = find_page(&pages, PageId::Scenes).unwrap();
-        let within = scenes
-            .visible_rows()
-            .find(|row| row.id == ids::AUTO_WITHIN)
-            .unwrap();
-        assert_eq!(within.choices, ["All"]);
+        assert!(!scenes.visible_rows().any(|row| row.id == ids::AUTO_WITHIN));
 
         config.scenes.favourites = vec!["Julia".into()];
         let pages = build_pages(&config, 0, false, "", "");
@@ -1945,5 +1957,26 @@ mod tests {
             .find(|row| row.id == ids::AUTO_WITHIN)
             .unwrap();
         assert_eq!(within.choices, ["All", "Favourites", "Playlist"]);
+    }
+
+    #[test]
+    fn advance_within_cycles_when_a_scope_exists() {
+        let mut config = config::Config::default();
+        config.auto_advance.mode = "timer".into();
+        config.scenes.favourites = vec!["Julia".into()];
+        let pages = build_pages(&config, 0, false, "", "");
+        let mut menu = Menu::new();
+        menu.rebuild(&pages);
+        menu.handle_key(press(KeyCode::Enter), &pages); // Scenes
+        for _ in 0..5 {
+            menu.handle_key(press(KeyCode::Down), &pages); // Advance within
+        }
+        assert_eq!(
+            menu.handle_key(press(KeyCode::Right), &pages),
+            Effect::Changed {
+                id: ids::AUTO_WITHIN,
+                value: "Favourites".into()
+            }
+        );
     }
 }

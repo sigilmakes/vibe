@@ -1537,18 +1537,19 @@ mod tests {
                 .collect()
         };
         assert!(labels(&mut app).contains(&"Auto-advance".to_owned()));
-        assert!(!labels(&mut app).contains(&"Transition time".to_owned()));
+        assert!(!labels(&mut app).contains(&"Interval".to_owned()));
         for _ in 0..3 {
             app.handle_key(press(KeyCode::Down));
         }
         app.handle_key(press(KeyCode::Right));
         assert_eq!(app.config.auto_advance.mode, "phrases");
-        assert!(labels(&mut app).contains(&"Transition time".to_owned()));
-        assert!(labels(&mut app).contains(&"Advance within".to_owned()));
+        assert!(labels(&mut app).contains(&"Fallback after".to_owned()));
+        // No favourites or active playlist, so there is only one scope.
+        assert!(!labels(&mut app).contains(&"Advance within".to_owned()));
         app.handle_key(press(KeyCode::Right));
         app.handle_key(press(KeyCode::Right));
         assert_eq!(app.config.auto_advance.mode, "off");
-        assert!(!labels(&mut app).contains(&"Transition time".to_owned()));
+        assert!(!labels(&mut app).contains(&"Fallback after".to_owned()));
     }
 
     #[test]
