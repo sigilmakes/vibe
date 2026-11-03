@@ -21,3 +21,4 @@ pub mod weather;
 pub mod terrain;
 pub mod textile;
 pub mod orbital;
+pub mod city;

@@ -2,7 +2,7 @@
 
 Fun lil rust CLI music visualiser for linux using ratatui :>
 
-Vibe has 100 visualisers so far, and it fits your terminal colours perfectly!
+Vibe has 200 visualisers so far, and it fits your terminal colours perfectly!
 
 ![Lorentz Attractor](screenshots/4.png)
 ![Field](screenshots/2.png)

@@ -51,6 +51,7 @@ enum Family {
     Terrain,
     Textile,
     Orbital,
+    City,
 }
 
 /// Tag vocabulary shared by every scene. Filters match against these.
@@ -105,6 +106,7 @@ const fn scene_tags(family: Family, local: usize) -> &'static [&'static str] {
         Family::Terrain => &["structure", "organic", "calm"],
         Family::Textile => &["structure", "geometric", "minimal"],
         Family::Orbital => &["geometric", "calm", "dark"],
+        Family::City => &["structure", "geometric", "dense"],
     }
 }
 
@@ -119,7 +121,7 @@ const ORIGINAL_FAMILIES: [(Family, usize); 7] = [
     (Family::Chaos, 2),
 ];
 
-const NEW_FAMILIES: [(Family, &[&str]); 17] = [
+const NEW_FAMILIES: [(Family, &[&str]); 18] = [
     (Family::Curves, crate::families::curves::NAMES),
     (Family::Waves, crate::families::waves::NAMES),
     (Family::Cells, crate::families::cells::NAMES),
@@ -137,9 +139,10 @@ const NEW_FAMILIES: [(Family, &[&str]); 17] = [
     (Family::Terrain, crate::families::terrain::NAMES),
     (Family::Textile, crate::families::textile::NAMES),
     (Family::Orbital, crate::families::orbital::NAMES),
+    (Family::City, crate::families::city::NAMES),
 ];
 
-const SCENE_COUNT: usize = 190;
+const SCENE_COUNT: usize = 200;
 
 #[derive(Clone, Copy)]
 struct SceneEntry {
@@ -332,6 +335,7 @@ pub struct Renderer {
     terrain: Option<crate::families::terrain::Renderer>,
     textile: Option<crate::families::textile::Renderer>,
     orbital: Option<crate::families::orbital::Renderer>,
+    city: Option<crate::families::city::Renderer>,
     glyphs: Option<crate::families::glyphs::Renderer>,
     sculptures: Option<crate::families::sculptures::Renderer>,
     flocks: Option<crate::families::flocks::Renderer>,
@@ -507,6 +511,10 @@ impl Renderer {
                 .draw(buf, area, time, local, palette, bands, audio, theme),
             Family::Orbital => self
                 .orbital
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::City => self
+                .city
                 .get_or_insert_with(Default::default)
                 .draw(buf, area, time, local, palette, bands, audio, theme),
         }
@@ -1452,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_one_hundred_unique_names() {
+    fn catalog_has_two_hundred_unique_names() {
         let names: std::collections::HashSet<_> = SCENES.iter().copied().collect();
         assert_eq!(SCENES.len(), SCENE_COUNT);
         assert_eq!(names.len(), SCENES.len());
@@ -1619,6 +1627,7 @@ mod tests {
         check_family!(terrain, Terrain);
         check_family!(textile, Textile);
         check_family!(orbital, Orbital);
+        check_family!(city, City);
         assert_eq!(offset, SCENES.len());
     }
 
@@ -1648,6 +1657,7 @@ mod tests {
             assert!(renderer.terrain.is_none());
             assert!(renderer.textile.is_none());
             assert!(renderer.orbital.is_none());
+            assert!(renderer.city.is_none());
             assert!(renderer.chaos.is_none());
             assert!(renderer.fractals.is_none());
             assert!(renderer.spectrum.is_none());
