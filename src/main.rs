@@ -509,7 +509,6 @@ fn main() -> io::Result<()> {
                         view.reactivity,
                         &input.theme,
                     );
-                    ui::draw(frame, view.analysis, &view.status(), &input.theme);
                     if let Some(menu) = &view.menu {
                         ui::menu(frame, menu, &input.theme);
                     }

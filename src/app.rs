@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::{audio, config, flow, menu, now_playing, palette, state, ui, visuals};
+use crate::{audio, config, flow, menu, now_playing, palette, state, visuals};
 
 /// Starting state for an interactive session. The CLI loads and seeds the
 /// config and resolves the scene before constructing an `App`.
@@ -32,39 +32,19 @@ pub struct View<'a> {
     pub palette: usize,
     pub bands: &'a [f32; 32],
     pub reactivity: &'a visuals::Reactivity,
-    pub analysis: bool,
     pub menu: Option<menu::MenuView>,
     pub fps: u32,
     pub color_depth: palette::ColorDepth,
     pub glyphs: palette::GlyphMode,
     pub follow_theme: bool,
-    audio: &'a audio::AudioState,
-    sensitivity: f32,
-}
-
-impl View<'_> {
-    pub fn status(&self) -> ui::Status<'_> {
-        ui::Status {
-            sensitivity: self.sensitivity,
-            bass: self.audio.bass,
-            mid: self.audio.mid,
-            treble: self.audio.treble,
-            onset: self.audio.onset,
-            kick: self.audio.kick,
-            beat: self.audio.beat,
-            bpm: self.audio.bpm,
-            tempo_confidence: self.audio.tempo_confidence,
-            bands: &self.audio.bands,
-        }
-    }
 }
 
 const CONFIG_DEBOUNCE: Duration = Duration::from_millis(250);
 
-/// Interactive session state: the scene, the in-memory config, the analysis
-/// overlay, and live audio. Menu edits change the config in place, mark it
-/// dirty, and are debounced to disk; the state file is written when the scene
-/// changes and on exit.
+/// Interactive session state: the scene, the in-memory config, the menu, and
+/// live audio. Menu edits change the config in place, mark it dirty, and are
+/// debounced to disk; the state file is written when the scene changes and on
+/// exit.
 pub struct App {
     scene: usize,
     config: config::Config,
@@ -76,7 +56,6 @@ pub struct App {
     save_errors: Vec<String>,
     config_path: PathBuf,
     state_path: Option<PathBuf>,
-    analysis: bool,
     menu: Option<menu::Menu>,
     demo: bool,
     link: Option<audio::AudioLink>,
@@ -85,6 +64,7 @@ pub struct App {
     devices_at: Option<Instant>,
     now_playing: Option<now_playing::NowPlaying>,
     now_playing_at: Option<Instant>,
+    audio_status: (bool, Option<String>),
     bands: [f32; 32],
     reactivity: visuals::Reactivity,
     pages: Vec<menu::Page>,
@@ -105,7 +85,6 @@ impl App {
             save_errors: Vec::new(),
             config_path: options.config_path,
             state_path: options.state_path,
-            analysis: false,
             menu: None,
             demo: options.demo,
             link: None,
@@ -114,6 +93,7 @@ impl App {
             devices_at: None,
             now_playing: None,
             now_playing_at: None,
+            audio_status: (false, None),
             bands: [0.0; 32],
             reactivity: visuals::Reactivity::default(),
             pages: Vec::new(),
@@ -147,6 +127,9 @@ impl App {
                 .map(|link| link.snapshot(Instant::now()))
                 .unwrap_or_default()
         };
+        if self.audio_page_open() {
+            self.poll_audio_status();
+        }
         let gain = self.config.appearance.sensitivity;
         self.bands = self.audio.bands.map(|band| (band * gain).clamp(0.0, 1.0));
         self.reactivity = reactivity(&self.audio, gain);
@@ -156,19 +139,16 @@ impl App {
             palette: self.palette_index(),
             bands: &self.bands,
             reactivity: &self.reactivity,
-            analysis: self.analysis,
             menu,
             fps: self.config.appearance.fps,
             color_depth: self.color_depth(),
             glyphs: self.glyphs(),
             follow_theme: self.config.appearance.follow_theme,
-            audio: &self.audio,
-            sensitivity: gain,
         }
     }
 
     /// Advance the auto-advance policy. Call once per frame after `view` so the
-    /// policy sees the latest audio snapshot. Menu and Analysis views pause it.
+    /// policy sees the latest audio snapshot. An open menu pauses it.
     pub fn tick(&mut self, now: f32) {
         let signal = flow::Signal {
             energy: self.audio.energy,
@@ -177,7 +157,7 @@ impl App {
             connected: self.audio.connected,
             silent_for: self.audio.silent_for,
         };
-        if self.menu.is_some() || self.analysis || self.config.auto_advance.mode == "off" {
+        if self.menu.is_some() || self.config.auto_advance.mode == "off" {
             self.auto.hold(now, signal);
             return;
         }
@@ -216,6 +196,14 @@ impl App {
         self.now_playing_at = Some(now);
         if current != self.now_playing {
             self.now_playing = current;
+            self.rebuild_pages();
+        }
+    }
+
+    fn poll_audio_status(&mut self) {
+        let status = (self.audio.connected, self.audio.error.clone());
+        if status != self.audio_status {
+            self.audio_status = status;
             self.rebuild_pages();
         }
     }
@@ -298,10 +286,6 @@ impl App {
                     self.menu = None;
                     self.flush_config();
                 }
-                menu::Effect::OpenAnalysis => {
-                    self.menu = None;
-                    self.analysis = true;
-                }
                 menu::Effect::SelectScene(scene) => {
                     self.menu = None;
                     self.set_scene(scene);
@@ -329,19 +313,6 @@ impl App {
             }
             self.sync_audio_menu();
             self.rebuild_pages();
-            return Flow::Continue;
-        }
-        if self.analysis {
-            match key.code {
-                KeyCode::Esc => self.analysis = false,
-                KeyCode::Char('q') => return Flow::Quit,
-                KeyCode::Char('m') => {
-                    self.analysis = false;
-                    self.menu = Some(menu::Menu::new());
-                    self.rebuild_pages();
-                }
-                _ => {}
-            }
             return Flow::Continue;
         }
         match key.code {
@@ -402,8 +373,11 @@ impl App {
             self.demo,
             &self.active_playlist,
             search,
-            &self.devices,
-            now_playing.as_deref(),
+            &menu::AudioView {
+                devices: &self.devices,
+                now_playing: now_playing.as_deref(),
+                state: &self.audio,
+            },
         );
         if let Some(menu) = &mut self.menu {
             menu.rebuild(&self.pages);
@@ -1199,25 +1173,6 @@ mod tests {
     }
 
     #[test]
-    fn status_reads_raw_analyser_bands_not_the_scaled_visual_input() {
-        let mut app = demo_app();
-        app.config.appearance.sensitivity = 2.0;
-        let view = app.view(4.2);
-        let status = view.status();
-        assert_eq!(status.sensitivity, 2.0);
-        for (raw, shown) in view.audio.bands.iter().zip(status.bands) {
-            assert_eq!(raw, shown, "analysis overlay shows scaled bands");
-        }
-        assert!(
-            view.bands
-                .iter()
-                .zip(view.audio.bands.iter())
-                .any(|(a, b)| a > b),
-            "sensitivity did not scale the scene input"
-        );
-    }
-
-    #[test]
     fn demo_audio_exercises_stereo_and_a_moving_chroma() {
         let a = demo_audio(1.0);
         let b = demo_audio(3.0);
@@ -1265,44 +1220,6 @@ mod tests {
         assert_eq!(app.scene, 0);
         app.handle_key(press(KeyCode::Right));
         assert_eq!(app.scene, 1);
-    }
-
-    #[test]
-    fn analysis_is_reached_from_the_root_menu() {
-        let mut app = demo_app();
-        app.handle_key(press(KeyCode::Char('m')));
-        let view = app.view(0.0);
-        assert!(view.menu.is_some());
-        assert_eq!(
-            view.menu.as_ref().unwrap().path.last().map(String::as_str),
-            Some("Vibe")
-        );
-
-        for _ in 0..3 {
-            app.handle_key(press(KeyCode::Down));
-        }
-        app.handle_key(press(KeyCode::Enter));
-        let view = app.view(0.0);
-        assert!(view.analysis);
-        assert!(view.menu.is_none());
-
-        app.handle_key(press(KeyCode::Esc));
-        assert!(!app.view(0.0).analysis);
-    }
-
-    #[test]
-    fn menu_opens_over_analysis() {
-        let mut app = demo_app();
-        app.handle_key(press(KeyCode::Char('m')));
-        for _ in 0..3 {
-            app.handle_key(press(KeyCode::Down));
-        }
-        app.handle_key(press(KeyCode::Enter));
-        assert!(app.view(0.0).analysis);
-        app.handle_key(press(KeyCode::Char('m')));
-        let view = app.view(0.0);
-        assert!(!view.analysis);
-        assert!(view.menu.is_some());
     }
 
     #[test]
@@ -1709,29 +1626,21 @@ mod tests {
     }
 
     #[test]
-    fn menu_and_analysis_pause_auto_advance() {
-        for analysis in [false, true] {
-            let mut options = demo_options();
-            options.config.auto_advance = timer(5.0, "all");
-            let mut app = App::new(options);
-            frame(&mut app, 0.0);
-            app.handle_key(press(KeyCode::Char('m')));
-            if analysis {
-                for _ in 0..3 {
-                    app.handle_key(press(KeyCode::Down));
-                }
-                app.handle_key(press(KeyCode::Enter));
-            }
-            frame(&mut app, 20.0);
-            assert_eq!(app.scene, 0);
-            app.handle_key(press(KeyCode::Esc));
-            frame(&mut app, 20.0);
-            assert_eq!(app.scene, 0);
-            frame(&mut app, 24.9);
-            assert_eq!(app.scene, 0);
-            frame(&mut app, 25.0);
-            assert_eq!(app.scene, 1);
-        }
+    fn menu_pauses_auto_advance() {
+        let mut options = demo_options();
+        options.config.auto_advance = timer(5.0, "all");
+        let mut app = App::new(options);
+        frame(&mut app, 0.0);
+        app.handle_key(press(KeyCode::Char('m')));
+        frame(&mut app, 20.0);
+        assert_eq!(app.scene, 0);
+        app.handle_key(press(KeyCode::Esc));
+        frame(&mut app, 20.0);
+        assert_eq!(app.scene, 0);
+        frame(&mut app, 24.9);
+        assert_eq!(app.scene, 0);
+        frame(&mut app, 25.0);
+        assert_eq!(app.scene, 1);
     }
 
     #[test]
@@ -1860,11 +1769,11 @@ mod tests {
         options.config.audio.rate = 1_000;
         options.config.audio.channels = 65_535;
         let mut app = App::new(options);
-        let (fps, sensitivity, energy, bands_finite) = {
+        let sensitivity = app.config.appearance.sensitivity;
+        let (fps, energy, bands_finite) = {
             let view = app.view(1.0);
             (
                 view.fps,
-                view.sensitivity,
                 view.reactivity.energy,
                 view.bands.iter().all(|value| value.is_finite()),
             )

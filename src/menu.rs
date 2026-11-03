@@ -35,7 +35,6 @@ pub mod ids {
     pub const SCENES: RowId = RowId::new(1);
     pub const AUDIO: RowId = RowId::new(2);
     pub const APPEARANCE: RowId = RowId::new(3);
-    pub const ANALYSIS: RowId = RowId::new(4);
     pub const CONTROLS: RowId = RowId::new(5);
 
     pub const CURRENT_SCENE: RowId = RowId::new(10);
@@ -59,6 +58,7 @@ pub mod ids {
     pub const COLOR_DEPTH: RowId = RowId::new(33);
     pub const GLYPHS: RowId = RowId::new(34);
     pub const SENSITIVITY: RowId = RowId::new(35);
+    pub const AUDIO_STATUS: RowId = RowId::new(36);
 
     pub const CONTROL_M: RowId = RowId::new(40);
     pub const CONTROL_ARROWS: RowId = RowId::new(41);
@@ -292,7 +292,6 @@ pub enum Effect {
     None,
     Quit,
     CloseMenu,
-    OpenAnalysis,
     SelectScene(usize),
     ToggleFavourite(usize),
     ClearTags,
@@ -756,9 +755,7 @@ impl Menu {
                 Effect::None
             }
             RowKind::Action => {
-                if id == ids::ANALYSIS {
-                    Effect::OpenAnalysis
-                } else if id == ids::DEVICES_REFRESH {
+                if id == ids::DEVICES_REFRESH {
                     Effect::RefreshDevices
                 } else if id == ids::TAGS_CLEAR {
                     Effect::ClearTags
@@ -928,6 +925,13 @@ const SENSITIVITY_SPEC: NumSpec = NumSpec {
     decimals: 2,
 };
 
+/// Session data that the Audio page shows beyond the config.
+pub struct AudioView<'a> {
+    pub devices: &'a [audio::AudioDevice],
+    pub now_playing: Option<&'a str>,
+    pub state: &'a audio::AudioState,
+}
+
 /// Build all pages from the current config, scene, and session state.
 #[cfg(test)]
 pub fn build_pages(
@@ -937,19 +941,29 @@ pub fn build_pages(
     active_playlist: &str,
     search: &str,
 ) -> Vec<Page> {
-    build_pages_with_audio(config, scene, demo, active_playlist, search, &[], None)
+    build_pages_with_audio(
+        config,
+        scene,
+        demo,
+        active_playlist,
+        search,
+        &AudioView {
+            devices: &[],
+            now_playing: None,
+            state: &audio::AudioState::default(),
+        },
+    )
 }
 
-/// Build all pages with the cached audio devices and now-playing text used by
-/// the Audio page.
+/// Build all pages with the audio devices, now-playing text, and live capture
+/// state used by the Audio page.
 pub fn build_pages_with_audio(
     config: &config::Config,
     scene: usize,
     demo: bool,
     active_playlist: &str,
     search: &str,
-    devices: &[audio::AudioDevice],
-    now_playing: Option<&str>,
+    audio_view: &AudioView<'_>,
 ) -> Vec<Page> {
     let scene_name = visuals::SCENES.get(scene).copied().unwrap_or_default();
     let mut pages = vec![
@@ -964,7 +978,13 @@ pub fn build_pages_with_audio(
         build_scene_picker(&config.scenes, scene, search),
         build_filter(&config.scenes),
         build_tags(&config.scenes),
-        build_audio(&config.audio, demo, devices, now_playing),
+        build_audio(
+            &config.audio,
+            demo,
+            audio_view.devices,
+            audio_view.now_playing,
+            audio_view.state,
+        ),
         build_appearance(&config.appearance),
         build_controls(),
     ];
@@ -985,7 +1005,6 @@ fn build_root() -> Page {
             Row::submenu(ids::SCENES, "Scenes", "", PageId::Scenes),
             Row::submenu(ids::AUDIO, "Audio", "", PageId::Audio),
             Row::submenu(ids::APPEARANCE, "Appearance", "", PageId::Appearance),
-            Row::action(ids::ANALYSIS, "Analysis"),
             Row::submenu(ids::CONTROLS, "Controls", "", PageId::Controls),
         ],
         initial: None,
@@ -1319,14 +1338,30 @@ pub fn target_kind(source: &str) -> Option<&'static str> {
     }
 }
 
+fn connection_label(state: &audio::AudioState) -> String {
+    if let Some(error) = state.error.as_deref().filter(|error| !error.is_empty()) {
+        format!("error: {error}")
+    } else if state.connected {
+        "connected".to_owned()
+    } else {
+        "waiting for samples".to_owned()
+    }
+}
+
 fn build_audio(
     audio: &config::AudioConfig,
     demo: bool,
     devices: &[audio::AudioDevice],
     now_playing: Option<&str>,
+    state: &audio::AudioState,
 ) -> Page {
     let mut rows = vec![Row::toggle(ids::DEMO, "Demo mode", demo)];
     if !demo {
+        rows.push(Row::readonly(
+            ids::AUDIO_STATUS,
+            "Status",
+            &connection_label(state),
+        ));
         if let Some(now_playing) = now_playing.filter(|text| !text.is_empty()) {
             rows.push(Row::readonly(ids::NOW_PLAYING, "Now playing", now_playing));
         }
@@ -1458,14 +1493,11 @@ mod tests {
     }
 
     #[test]
-    fn root_page_lists_the_five_top_level_entries() {
+    fn root_page_lists_the_four_top_level_entries() {
         let pages = default_pages(false);
         let root = find_page(&pages, PageId::Root).unwrap();
         let labels: Vec<&str> = root.visible_rows().map(|row| row.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["Scenes", "Audio", "Appearance", "Analysis", "Controls"]
-        );
+        assert_eq!(labels, ["Scenes", "Audio", "Appearance", "Controls"]);
     }
 
     #[test]
@@ -1763,7 +1795,7 @@ mod tests {
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
-        for _ in 0..5 {
+        for _ in 0..6 {
             menu.handle_key(press(KeyCode::Down), &pages);
         }
         assert_eq!(menu.handle_key(press(KeyCode::Enter), &pages), Effect::None);
@@ -1794,10 +1826,10 @@ mod tests {
         menu.rebuild(&pages);
         menu.handle_key(press(KeyCode::Down), &pages);
         menu.handle_key(press(KeyCode::Enter), &pages);
-        for _ in 0..5 {
+        for _ in 0..6 {
             menu.handle_key(press(KeyCode::Down), &pages);
         }
-        assert_eq!(menu.view(&pages).rows[5].label, "Command");
+        assert_eq!(menu.view(&pages).rows[6].label, "Command");
 
         config.audio.source = "file".into();
         let pages = build_pages(&config, 0, false, "", "");
@@ -2094,6 +2126,21 @@ mod tests {
         );
     }
 
+    fn audio_pages(config: &config::Config, state: &audio::AudioState) -> Vec<Page> {
+        build_pages_with_audio(
+            config,
+            0,
+            false,
+            "",
+            "",
+            &AudioView {
+                devices: &[],
+                now_playing: None,
+                state,
+            },
+        )
+    }
+
     fn audio_device(kind: &'static str, name: &str) -> audio::AudioDevice {
         audio::AudioDevice {
             kind,
@@ -2114,7 +2161,19 @@ mod tests {
         ];
         let mut config = config::Config::default();
         config.audio.target = "sink.analog".into();
-        let pages = build_pages_with_audio(&config, 0, false, "", "", &devices, Some("A - B"));
+        let state = audio::AudioState::default();
+        let pages = build_pages_with_audio(
+            &config,
+            0,
+            false,
+            "",
+            "",
+            &AudioView {
+                devices: &devices,
+                now_playing: Some("A - B"),
+                state: &state,
+            },
+        );
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let source = audio
             .visible_rows()
@@ -2150,7 +2209,18 @@ mod tests {
 
         config.audio.target.clear();
         config.audio.source = "microphone".into();
-        let pages = build_pages_with_audio(&config, 0, false, "", "", &devices, None);
+        let pages = build_pages_with_audio(
+            &config,
+            0,
+            false,
+            "",
+            "",
+            &AudioView {
+                devices: &devices,
+                now_playing: None,
+                state: &state,
+            },
+        );
         let audio = find_page(&pages, PageId::Audio).unwrap();
         let target = audio
             .visible_rows()
@@ -2162,11 +2232,43 @@ mod tests {
     }
 
     #[test]
+    fn audio_page_reports_capture_state_in_a_row() {
+        let config = config::Config::default();
+        let mut state = audio::AudioState::default();
+        let pages = audio_pages(&config, &state);
+        let audio_page = find_page(&pages, PageId::Audio).unwrap();
+        let status = audio_page
+            .visible_rows()
+            .find(|row| row.id == ids::AUDIO_STATUS)
+            .unwrap();
+        assert_eq!(status.kind, RowKind::ReadOnly);
+        assert_eq!(status.value, "waiting for samples");
+
+        state.connected = true;
+        let pages = audio_pages(&config, &state);
+        let audio_page = find_page(&pages, PageId::Audio).unwrap();
+        let status = audio_page
+            .visible_rows()
+            .find(|row| row.id == ids::AUDIO_STATUS)
+            .unwrap();
+        assert_eq!(status.value, "connected");
+
+        state.error = Some("pipewire exited".into());
+        let pages = audio_pages(&config, &state);
+        let audio_page = find_page(&pages, PageId::Audio).unwrap();
+        let status = audio_page
+            .visible_rows()
+            .find(|row| row.id == ids::AUDIO_STATUS)
+            .unwrap();
+        assert_eq!(status.value, "error: pipewire exited");
+    }
+
+    #[test]
     fn command_and_file_sources_hide_reconnect_and_targets() {
         for source in ["command", "file"] {
             let mut config = config::Config::default();
             config.audio.source = source.into();
-            let pages = build_pages_with_audio(&config, 0, false, "", "", &[], None);
+            let pages = audio_pages(&config, &audio::AudioState::default());
             let audio = find_page(&pages, PageId::Audio).unwrap();
             let visible: Vec<RowId> = audio.visible_rows().map(|row| row.id).collect();
             assert!(!visible.contains(&ids::TARGET));
