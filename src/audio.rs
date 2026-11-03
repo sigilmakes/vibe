@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -189,7 +190,8 @@ impl SourceInfo {
 #[derive(Clone, Debug, Default)]
 pub struct AudioState {
     pub bands: [f32; 32],
-    /// Recent signed waveform, normalized by the loudness reference.
+    /// Recent signed waveform, normalized by the loudness reference and the
+    /// sine crest factor, so steady material fills [-1, 1] without clipping.
     pub waveform: [f32; 32],
     pub beat: f32,
     /// Fraction of the current beat, in [0, 1).
@@ -213,6 +215,8 @@ pub struct AudioState {
     pub flatness: f32,
     /// Side/mid energy ratio in [0, 1]. Zero for mono or identical channels,
     /// about 0.5 for uncorrelated stereo, and near 1 for anti-phase material.
+    /// Read from the raw channels, so material that cancels in the mono
+    /// downmix still reports a width.
     pub width: f32,
     /// Right-minus-left loudness balance in [-1, 1]; zero when centred.
     pub balance: f32,
@@ -238,6 +242,7 @@ pub struct Capture {
     child: Option<Child>,
     shared: Arc<Mutex<AudioState>>,
     started: Instant,
+    stop: Arc<AtomicBool>,
 }
 
 struct OpenedSource {
@@ -630,6 +635,8 @@ impl Capture {
         let worker_stderr = Arc::clone(&stderr);
         let worker_info = source;
         let format = config.format;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
             .name("audio-capture".into())
             .spawn(move || {
@@ -637,6 +644,11 @@ impl Capture {
                 let mut bytes = vec![0_u8; HOP * format.frame_bytes()];
                 let mut samples = [0.0_f32; HOP];
                 loop {
+                    // A dropped capture stops a looping file reader, which
+                    // otherwise keeps decoding into state nobody reads.
+                    if worker_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Err(error) = reader.read_exact(&mut bytes) {
                         let detail = stderr_text(&worker_stderr);
                         let base = if error.kind() == io::ErrorKind::UnexpectedEof {
@@ -682,6 +694,7 @@ impl Capture {
             child,
             shared: state,
             started,
+            stop,
         })
     }
 
@@ -718,11 +731,13 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // Killing the writer releases the detached reader without joining it.
+        // Killing the writer releases a reader blocked on a pipe; a file reader
+        // sees the stop flag within one hop.
     }
 }
 
@@ -1016,6 +1031,7 @@ struct Analyzer {
     attack_cooldown: [f32; 4],
     state: AudioState,
     reference: f32,
+    primed: bool,
     quiet_time: f32,
     dt: f32,
     sample_rate: f32,
@@ -1037,19 +1053,24 @@ impl Analyzer {
             .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FRAMES as f32).cos())
             .collect();
         // Bands above Nyquist collapse to an empty range instead of indexing
-        // past the FFT output when the source rate is low.
+        // past the FFT output when the source rate is low. Below about 120 Hz
+        // the log edges are narrower than one FFT bin, so each range starts
+        // where the previous one ended: every band owns distinct bins instead
+        // of three adjacent bass bands reading the same bin.
         let nyquist_bin = FRAMES / 2;
         let mut ranges = [(0, 0); BANDS];
+        let mut previous_end = 1;
         for (i, range) in ranges.iter_mut().enumerate() {
             let low = LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / BANDS as f32);
             let high = LOW_HZ * (HIGH_HZ / LOW_HZ).powf((i + 1) as f32 / BANDS as f32);
-            let start = (low * FRAMES as f32 / sample_rate).ceil() as usize;
-            let end = (high * FRAMES as f32 / sample_rate).ceil() as usize;
-            *range = if start >= nyquist_bin {
-                (nyquist_bin, nyquist_bin)
-            } else {
-                (start.max(1), end.max(start + 1).min(nyquist_bin))
-            };
+            let start = ((low * FRAMES as f32 / sample_rate).ceil() as usize)
+                .max(previous_end)
+                .min(nyquist_bin);
+            let end = ((high * FRAMES as f32 / sample_rate).ceil() as usize)
+                .max(start + 1)
+                .min(nyquist_bin);
+            *range = (start, end);
+            previous_end = end;
         }
         Self {
             fft,
@@ -1065,6 +1086,7 @@ impl Analyzer {
             attack_cooldown: [0.0; 4],
             state: AudioState::default(),
             reference: 0.1,
+            primed: false,
             quiet_time: 0.0,
             dt,
             sample_rate,
@@ -1166,7 +1188,11 @@ impl Analyzer {
             self.quiet_time + self.dt
         };
         self.state.silent_for = self.quiet_time;
-        let (width, balance) = if audible {
+        // Stereo metrics come from the raw channels, so they are gated on the
+        // channel energy rather than the mono downmix. Anti-phase material
+        // cancels in the downmix but still has a width.
+        let channel_energy = (stereo.left + stereo.right) * 0.5;
+        let (width, balance) = if channel_energy > NOISE_GATE * NOISE_GATE {
             (stereo.width(), stereo.balance())
         } else {
             (0.0, 0.0)
@@ -1174,7 +1200,14 @@ impl Analyzer {
         self.state.width = follow(self.state.width, width, 0.15, 0.4, self.dt);
         self.state.balance = follow(self.state.balance, balance, 0.1, 0.3, self.dt);
         // Freeze adaptation below the gate: silence must never turn into extra gain.
+        // The first audible hop seeds the reference instead of easing down from
+        // 0.1, which otherwise leaves the display over- or under-driven for
+        // several seconds after every start and every source change.
         if audible {
+            if !self.primed {
+                self.reference = rms.clamp(REF_MIN, REF_MAX);
+                self.primed = true;
+            }
             self.reference = follow(
                 self.reference,
                 rms.clamp(REF_MIN, REF_MAX),
@@ -1189,6 +1222,10 @@ impl Analyzer {
         self.state.energy = follow(self.state.energy, target, 0.045, 0.3, self.dt);
         self.state.rms = rms.clamp(0.0, 1.0);
         self.state.peak = peak.clamp(0.0, 1.0);
+        // The reference is an RMS, so a sine at the reference level would peak
+        // at 1.414 and clip. Scale by the sine crest factor so the trace shows
+        // its real shape and only genuine transients touch the rails.
+        let trace_scale = self.reference * std::f32::consts::SQRT_2;
         for (point, chunk) in self
             .state
             .waveform
@@ -1196,7 +1233,7 @@ impl Analyzer {
             .zip(samples.as_chunks::<{ HOP / 32 }>().0)
         {
             *point =
-                (chunk.iter().sum::<f32>() / chunk.len() as f32 / self.reference).clamp(-1.0, 1.0);
+                (chunk.iter().sum::<f32>() / chunk.len() as f32 / trace_scale).clamp(-1.0, 1.0);
         }
         self.fft
             .process_with_scratch(&mut self.buffer, &mut self.scratch);
@@ -1359,7 +1396,10 @@ impl Rhythm {
         if !self.frames.is_multiple_of(24) || self.history.len() < (4.0 / self.dt) as usize {
             return;
         }
-        let min_lag = (60.0 / (260.0 * self.dt)).floor() as usize;
+        // At coarse hops (< ~2.2 kHz sources) the 260 BPM lag rounds to zero,
+        // which would underflow the score window. One hop is the finest period
+        // the estimator can represent.
+        let min_lag = ((60.0 / (260.0 * self.dt)).floor() as usize).max(1);
         let max_lag = (60.0 / (60.0 * self.dt)).ceil() as usize;
         let n = self.history.len();
         let mut correlations = vec![[0.0_f32; 2]; max_lag * 2 + 3];
@@ -1466,7 +1506,8 @@ impl Rhythm {
             // Fold recent novelty onto the estimated period to find a beat
             // anchor; tempo alone has no information about beat phase.
             let period = 60.0 / (self.bpm.unwrap() * self.dt);
-            let bins = period.round() as usize;
+            // A very coarse hop can round the period below one bin.
+            let bins = (period.round() as usize).max(1);
             let mut folded = vec![0.0; bins];
             for (age, v) in self
                 .history
@@ -1495,6 +1536,7 @@ mod tests {
             child: None,
             shared: Arc::new(Mutex::new(state)),
             started: Instant::now(),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1588,6 +1630,7 @@ mod tests {
             child: None,
             shared: Arc::new(Mutex::new(AudioState::default())),
             started: Instant::now() - Duration::from_secs(1),
+            stop: Arc::new(AtomicBool::new(false)),
         };
         let state = capture.snapshot();
         assert!(state.error.is_some());
@@ -2319,6 +2362,188 @@ mod tests {
             state = analyzer.analyze(&frame_at(frame, 440.0, 0.2));
         }
         assert!(state.silent_for < 0.2);
+    }
+
+    #[test]
+    fn every_band_owns_distinct_bins_and_the_ranges_tile() {
+        for rate in [44_100_usize, 48_000, 96_000, 192_000] {
+            let analyzer = Analyzer::with_sample_rate(rate);
+            for pair in analyzer.ranges.windows(2) {
+                assert_eq!(
+                    pair[0].1, pair[1].0,
+                    "bands must tile without gaps or overlap at {rate} Hz: {:?}",
+                    analyzer.ranges
+                );
+            }
+            let mut used = std::collections::BTreeSet::new();
+            for &(start, end) in &analyzer.ranges {
+                assert!(end <= FRAMES / 2, "band beyond Nyquist at {rate} Hz");
+                for bin in start..end {
+                    assert!(
+                        used.insert(bin),
+                        "bin {bin} drives more than one band at {rate} Hz"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_bass_bands_do_not_show_the_same_bin() {
+        let mut analyzer = Analyzer::new();
+        let mut state = AudioState::default();
+        for frame in 0..40 {
+            state = analyzer.analyze(&frame_at(frame, 70.0, 0.4));
+        }
+        let bass = &state.bands[..4];
+        assert!(
+            bass.windows(2).any(|pair| (pair[0] - pair[1]).abs() > 0.01),
+            "70 Hz looks identical in all four bass bands: {bass:?}"
+        );
+    }
+
+    #[test]
+    fn coarse_hops_do_not_panic_the_tempo_tracker() {
+        for rate in [2_000_usize, 1_000, 500, 1] {
+            let mut analyzer = Analyzer::with_sample_rate(rate);
+            let dt = HOP as f32 / rate as f32;
+            let frames = (20.0 / dt).max(120.0) as usize;
+            for frame in 0..frames {
+                let samples: [f32; HOP] = std::array::from_fn(|i| {
+                    let t = (frame * HOP + i) as f32 / rate as f32;
+                    let age = t % 0.5;
+                    0.4 * (-age / 0.04).exp() * (std::f32::consts::TAU * 100.0 * t).sin()
+                });
+                let state = analyzer.analyze(&samples);
+                assert!(state.energy.is_finite() && state.novelty.is_finite());
+                assert!(
+                    (0.0..=1.0).contains(&state.beat_phase),
+                    "phase {} at {rate} Hz",
+                    state.beat_phase
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn waveform_trace_shows_a_sine_instead_of_clipping_it() {
+        let mut analyzer = Analyzer::new();
+        let mut low = AudioState::default();
+        for frame in 0..200 {
+            low = analyzer.analyze(&frame_at(frame, 100.0, 0.4));
+        }
+        let peak = low.waveform.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        assert!((0.9..=1.0).contains(&peak), "100 Hz peak {peak}");
+
+        let mut fast = Analyzer::new();
+        let mut high = AudioState::default();
+        for frame in 0..200 {
+            high = fast.analyze(&frame_at(frame, 1000.0, 0.4));
+        }
+        assert!(
+            high.waveform.iter().all(|v| v.abs() < 0.99),
+            "a steady tone is railed: {:?}",
+            &high.waveform[..8]
+        );
+    }
+
+    #[test]
+    fn reference_seeds_on_the_first_audible_hop_instead_of_drifting_for_seconds() {
+        let mut analyzer = Analyzer::new();
+        let mut early = 0.0;
+        for frame in 0..100 {
+            early = analyzer.analyze(&frame_at(frame, 500.0, 0.02)).energy;
+        }
+        let mut settled = early;
+        for frame in 100..3000 {
+            settled = analyzer.analyze(&frame_at(frame, 500.0, 0.02)).energy;
+        }
+        assert!(
+            (early - settled).abs() < 0.05,
+            "quiet audio takes seconds to reach its gain: {early} vs {settled}"
+        );
+    }
+
+    #[test]
+    fn anti_phase_stereo_keeps_its_width_through_the_mono_downmix() {
+        let format = PcmFormat {
+            rate: 48_000,
+            channels: 2,
+            sample: SampleFormat::F32,
+        };
+        let mut bytes = Vec::with_capacity(HOP * 8);
+        for i in 0..HOP {
+            let value = 0.5 * (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin();
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&(-value).to_le_bytes());
+        }
+        let mut samples = [0.0_f32; HOP];
+        let stereo = decode_pcm(&bytes, format, &mut samples);
+        assert!((stereo.width() - 1.0).abs() < 1e-6);
+        assert_eq!(
+            samples[0], 0.0,
+            "anti-phase material cancels in the downmix"
+        );
+
+        let mut analyzer = Analyzer::new();
+        let mut state = AudioState::default();
+        for _ in 0..40 {
+            state = analyzer.analyze_with(&samples, stereo);
+        }
+        assert!(state.width > 0.9, "anti-phase width {}", state.width);
+        assert!(state.balance.abs() < 0.05);
+        assert_eq!(state.energy, 0.0, "the downmix itself is silent");
+    }
+
+    #[test]
+    fn dropping_a_capture_stops_its_reader() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-stop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("pcm.raw");
+        let pcm: Vec<u8> = (0..HOP)
+            .flat_map(|i| {
+                let value = 0.25 * (i as f32 * 0.1).sin();
+                value.to_le_bytes().into_iter().chain(value.to_le_bytes())
+            })
+            .collect();
+        std::fs::write(&path, pcm).unwrap();
+
+        let capture = Capture::start(CaptureConfig {
+            backend: Backend::File(path),
+            target: None,
+            format: PcmFormat::default(),
+            loop_file: true,
+        })
+        .unwrap();
+        let weak = Arc::downgrade(&capture.shared);
+        for _ in 0..100 {
+            if capture.snapshot().connected {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            capture.snapshot().connected,
+            "looping file never produced a block"
+        );
+        drop(capture);
+        let mut stopped = false;
+        for _ in 0..100 {
+            if weak.upgrade().is_none() {
+                stopped = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(stopped, "the capture reader thread outlived its Capture");
     }
 
     #[test]
