@@ -151,6 +151,8 @@ pub struct Row {
     pub kind: RowKind,
     pub value: String,
     pub visible: bool,
+    /// Headers are visible but cannot receive the cursor.
+    pub selectable: bool,
     pub choices: Vec<String>,
     pub num: Option<NumSpec>,
     pub submenu: Option<PageId>,
@@ -164,6 +166,7 @@ impl Row {
             kind,
             value,
             visible: true,
+            selectable: true,
             choices: Vec::new(),
             num: None,
             submenu: None,
@@ -216,6 +219,13 @@ impl Row {
     fn readonly(id: RowId, label: &str, value: &str) -> Self {
         Self::new(id, label, RowKind::ReadOnly, value.to_owned())
     }
+
+    fn header(id: RowId, label: &str) -> Self {
+        Self {
+            selectable: false,
+            ..Self::new(id, label, RowKind::ReadOnly, String::new())
+        }
+    }
 }
 
 fn bool_value(on: bool) -> String {
@@ -245,6 +255,10 @@ pub struct Page {
 impl Page {
     pub fn visible_rows(&self) -> impl Iterator<Item = &Row> {
         self.rows.iter().filter(|row| row.visible)
+    }
+
+    pub fn selectable_rows(&self) -> impl Iterator<Item = &Row> {
+        self.visible_rows().filter(|row| row.selectable)
     }
 }
 
@@ -410,17 +424,17 @@ impl Menu {
             let Some(page) = find_page(pages, self.stack[depth].clone()) else {
                 continue;
             };
-            let visible: Vec<&Row> = page.visible_rows().collect();
-            if visible.is_empty() {
+            let selectable: Vec<&Row> = page.selectable_rows().collect();
+            if selectable.is_empty() {
                 self.last_index[depth] = 0;
                 continue;
             }
             let selected = self.selected[depth];
-            let index = visible
+            let index = selectable
                 .iter()
                 .position(|row| row.id == selected)
-                .unwrap_or_else(|| self.last_index[depth].min(visible.len() - 1));
-            self.selected[depth] = visible[index].id;
+                .unwrap_or_else(|| self.last_index[depth].min(selectable.len() - 1));
+            self.selected[depth] = selectable[index].id;
             self.last_index[depth] = index;
         }
         self.sync_last_scene(pages);
@@ -476,14 +490,14 @@ impl Menu {
                 }
             })
             .collect();
+        let selected = self
+            .selected
+            .last()
+            .copied()
+            .and_then(|id| page.visible_rows().position(|row| row.id == id));
         MenuView {
             path: page.path.clone(),
-            selected: self
-                .last_index
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .min(rows.len().saturating_sub(1)),
+            selected: selected.unwrap_or(0).min(rows.len().saturating_sub(1)),
             rows,
         }
     }
@@ -553,20 +567,20 @@ impl Menu {
     fn selected_row<'a>(&self, pages: &'a [Page]) -> Option<&'a Row> {
         let page = self.current_page(pages)?;
         let index = *self.last_index.last()?;
-        page.visible_rows().nth(index)
+        page.selectable_rows().nth(index)
     }
 
     fn move_selection(&mut self, delta: isize, pages: &[Page]) {
         let Some(page) = self.current_page(pages) else {
             return;
         };
-        let count = page.visible_rows().count();
+        let count = page.selectable_rows().count();
         if count == 0 {
             return;
         }
         let depth = self.stack.len() - 1;
         let next = (self.last_index[depth] as isize + delta).rem_euclid(count as isize) as usize;
-        let Some(row) = page.visible_rows().nth(next) else {
+        let Some(row) = page.selectable_rows().nth(next) else {
             return;
         };
         let id = row.id;
@@ -757,12 +771,18 @@ impl Menu {
             return;
         };
         let page = find_page(pages, target.clone());
-        let initial = page
-            .and_then(|page| page.initial)
-            .or_else(|| page.and_then(|page| page.visible_rows().next().map(|row| row.id)));
+        let initial = page.and_then(|page| {
+            page.initial
+                .filter(|id| page.selectable_rows().any(|row| row.id == *id))
+                .or_else(|| page.selectable_rows().next().map(|row| row.id))
+        });
+        let index = page
+            .zip(initial)
+            .and_then(|(page, id)| page.selectable_rows().position(|row| row.id == id))
+            .unwrap_or(0);
         self.stack.push(target);
         self.selected.push(initial.unwrap_or(RowId::new(0)));
-        self.last_index.push(0);
+        self.last_index.push(index);
     }
 }
 
@@ -1023,15 +1043,14 @@ fn build_confirm_delete(playlist: &config::Playlist) -> Page {
             "Delete".into(),
         ],
         rows: vec![
-            Row::readonly(
+            Row::header(
                 ids::CONFIRM_PROMPT,
                 &format!("Delete \"{}\"?", playlist.name),
-                "",
             ),
             Row::action(ids::CONFIRM_DELETE, "Delete"),
             Row::action(ids::CONFIRM_CANCEL, "Cancel"),
         ],
-        initial: None,
+        initial: Some(ids::CONFIRM_CANCEL),
     }
 }
 
@@ -1654,6 +1673,22 @@ mod tests {
         assert_eq!(labels, ["Delete \"Chill\"?", "Delete", "Cancel"]);
         assert!(page.visible_rows().any(|row| row.id == ids::CONFIRM_DELETE));
         assert!(page.visible_rows().any(|row| row.id == ids::CONFIRM_CANCEL));
+        assert!(
+            !page
+                .visible_rows()
+                .find(|row| row.id == ids::CONFIRM_PROMPT)
+                .unwrap()
+                .selectable
+        );
+
+        let mut menu = Menu::new();
+        menu.rebuild(&pages);
+        menu.descend(Some(PageId::ConfirmDelete("Chill".into())), &pages);
+        let view = menu.view(&pages);
+        assert_eq!(view.rows[view.selected].label, "Cancel");
+        menu.handle_key(press(KeyCode::Up), &pages);
+        let view = menu.view(&pages);
+        assert_eq!(view.rows[view.selected].label, "Delete");
     }
 
     #[test]
