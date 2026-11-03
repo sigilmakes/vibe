@@ -27,6 +27,25 @@ fn unit(x: f32) -> f32 {
     }
 }
 
+/// A contour tangent from a field gradient. The gradient is normal to the
+/// nodal line, so the line glyph runs across it.
+fn gradient_glyph(gx: f32, gy: f32) -> char {
+    let ax = gx.abs();
+    let ay = gy.abs();
+    if !ax.is_finite() || !ay.is_finite() || ax + ay < 1e-6 {
+        return '·';
+    }
+    if ay > ax * 1.8 {
+        '─'
+    } else if ax > ay * 1.8 {
+        '│'
+    } else if gx * gy > 0.0 {
+        '╱'
+    } else {
+        '╲'
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Front {
     x: f32,
@@ -234,8 +253,20 @@ impl Renderer {
                         // Free-edge rectangular plate Chladni degeneracy pair.
                         let v = xx.c[2] * yy.c[5] - xx.c[5] * yy.c[2]
                             + harmony[0] * (xx.c[3] * yy.c[6] - xx.c[6] * yy.c[3]) * 0.6
-                            + front * 0.18;
-                        (v, (0.10 - v.abs()).max(0.0) * 7.0, '·')
+                            + front * 0.34;
+                        // The eigenmode gradient is normal to its nodal line, so
+                        // the contour tangent picks the straight line glyph.
+                        let gx = -2.0 * PI * xx.s[2] * yy.c[5]
+                            + 5.0 * PI * xx.s[5] * yy.c[2]
+                            + harmony[0]
+                                * 0.6
+                                * (-3.0 * PI * xx.s[3] * yy.c[6] + 6.0 * PI * xx.s[6] * yy.c[3]);
+                        let gy = -5.0 * PI * xx.c[2] * yy.s[5]
+                            + 2.0 * PI * xx.c[5] * yy.s[2]
+                            + harmony[0]
+                                * 0.6
+                                * (-6.0 * PI * xx.c[3] * yy.s[6] + 3.0 * PI * xx.c[6] * yy.s[3]);
+                        (v, (0.16 - v.abs()).max(0.0) * 4.5, gradient_glyph(gx, gy))
                     }
                     4 => {
                         let gx = xx.u * (NX - 1) as f32;
@@ -313,17 +344,70 @@ impl Renderer {
                         )
                     }
                     _ => {
+                        // Phase Carpet: nodal contours carry straight line
+                        // glyphs; the rest of the field fills a braille density
+                        // ramp, with attacks thickening the local pile.
                         let re = xx.c[4] * yy.c[3] + (0.3 + harmony[0]) * xx.s[6] * yy.s[5];
                         let im = xx.s[4] * yy.s[3] - (0.3 + harmony[2]) * xx.c[6] * yy.c[5];
-                        let v = re * t.cos() - im * t.sin() + front * 0.2;
+                        let ct = t.cos();
+                        let st = t.sin();
+                        let v = re * ct - im * st + front * 0.2;
                         let amp = re.hypot(im);
-                        let s = (0.16 - v.abs()).max(0.0) * 4.0 * amp.min(1.0);
-                        (v, s, if re * im > 0.0 { '⠂' } else { '⠐' })
+                        let gx = (-4.0 * PI * xx.s[4] * yy.c[3]
+                            + (0.3 + harmony[0]) * 6.0 * PI * xx.c[6] * yy.s[5])
+                            * ct
+                            - (4.0 * PI * xx.c[4] * yy.s[3]
+                                + (0.3 + harmony[2]) * 6.0 * PI * xx.s[6] * yy.c[5])
+                                * st;
+                        let gy = (-3.0 * PI * xx.c[4] * yy.s[3]
+                            + (0.3 + harmony[0]) * 5.0 * PI * xx.s[6] * yy.c[5])
+                            * ct
+                            - (3.0 * PI * xx.s[4] * yy.c[3]
+                                + (0.3 + harmony[2]) * 5.0 * PI * xx.c[6] * yy.s[5])
+                                * st;
+                        const RAMP: [char; 6] = ['⠁', '⠉', '⠋', '⠛', '⠟', '⠿'];
+                        let drive = amp.min(1.0) * (0.55 + energy * 0.45) + front.abs() * 0.6;
+                        let glyph = if v.abs() < 0.18 && gx.abs() + gy.abs() > 1e-4 {
+                            gradient_glyph(gx, gy)
+                        } else {
+                            RAMP[((drive * 4.8) as usize).min(RAMP.len() - 1)]
+                        };
+                        let s = (0.18 - v.abs()).max(0.0) * 3.6 * amp.min(1.0)
+                            + amp.min(1.0) * (0.14 + energy * 0.10)
+                            + front.abs() * 0.12;
+                        (v, s, glyph)
                     }
+                };
+                let px = visible.x + i as u16;
+                let py = visible.y + j as u16;
+                // The Chladni plate has a visible rectangular rim. It is drawn
+                // only at the requested area edge, never as overlay text.
+                let (field, strength, glyph) = if mode == 3 {
+                    let last_x = area.x.saturating_add(area.width.saturating_sub(1));
+                    let last_y = area.y.saturating_add(area.height.saturating_sub(1));
+                    let left = px == area.x;
+                    let right = px == last_x;
+                    let top = py == area.y;
+                    let bottom = py == last_y;
+                    if left || right || top || bottom {
+                        let glyph = match (top, bottom, left, right) {
+                            (true, _, true, _) if area.width > 1 && area.height > 1 => '┌',
+                            (true, _, _, true) if area.width > 1 && area.height > 1 => '┐',
+                            (_, true, true, _) if area.width > 1 && area.height > 1 => '└',
+                            (_, true, _, true) if area.width > 1 && area.height > 1 => '┘',
+                            (_, _, true, _) | (_, _, _, true) => '│',
+                            _ => '─',
+                        };
+                        (0.0, 0.30 + energy * 0.16, glyph)
+                    } else {
+                        (field, strength, glyph)
+                    }
+                } else {
+                    (field, strength, glyph)
                 };
                 let band = unit(bands[(xx.u * 31.0) as usize]);
                 let bright = (strength * (0.55 + energy * 0.35 + band * 0.1)).clamp(0.0, 1.0);
-                let cell = &mut buf[(visible.x + i as u16, visible.y + j as u16)];
+                let cell = &mut buf[(px, py)];
                 cell.reset();
                 cell.set_bg(theme.sample(palette, 0.0, 0.0));
                 cell.set_char(if bright > 0.045 { glyph } else { ' ' });
@@ -450,6 +534,135 @@ mod tests {
             let (harmonic, _) = snapshot(mode, &chord);
             assert_ne!(base, harmonic, "harmony does not change geometry {mode}");
         }
+    }
+
+    const W: usize = 80;
+    const H: usize = 30;
+
+    fn painted(mode: usize, audio: &Reactivity) -> Buffer {
+        let area = Rect::new(0, 0, W as u16, H as u16);
+        let mut buf = Buffer::empty(area);
+        let mut renderer = Renderer::default();
+        for frame in 0..60 {
+            renderer.draw(
+                &mut buf,
+                area,
+                frame as f32 / 60.0,
+                mode,
+                0,
+                &[0.0; 32],
+                audio,
+                &Theme::default(),
+            );
+        }
+        buf
+    }
+
+    fn symbols(buf: &Buffer) -> Vec<String> {
+        buf.content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect()
+    }
+
+    fn glyphs(buf: &Buffer) -> Vec<char> {
+        buf.content
+            .iter()
+            .filter_map(|cell| {
+                let mut chars = cell.symbol().chars();
+                let ch = chars.next()?;
+                (ch != ' ' && chars.next().is_none()).then_some(ch)
+            })
+            .collect()
+    }
+
+    fn braille_stats(buf: &Buffer) -> (usize, usize) {
+        glyphs(buf).iter().fold((0, 0), |(cells, dots), &ch| {
+            let code = ch as u32;
+            if (0x2801..=0x28ff).contains(&code) {
+                (cells + 1, dots + (code - 0x2800).count_ones() as usize)
+            } else {
+                (cells, dots)
+            }
+        })
+    }
+
+    #[test]
+    fn chladni_plate_has_rim_nodal_lines_and_front_response() {
+        let quiet = Reactivity::default();
+        let buf = painted(3, &quiet);
+        let glyphs = glyphs(&buf);
+        for corner in ['┌', '┐', '└', '┘'] {
+            assert_eq!(
+                glyphs.iter().filter(|&&ch| ch == corner).count(),
+                1,
+                "plate rim is missing {corner}"
+            );
+        }
+        let coverage = glyphs.len() as f32 / (W * H) as f32;
+        assert!(
+            (0.10..0.60).contains(&coverage),
+            "plate ink coverage {coverage}"
+        );
+        for glyph in ['─', '│', '╱', '╲'] {
+            assert!(glyphs.contains(&glyph), "plate is missing nodal {glyph}");
+        }
+        let kick = Reactivity {
+            kick: 1.0,
+            onset: 1.0,
+            transients: [1.0; 4],
+            ..Reactivity::default()
+        };
+        let moved = symbols(&buf)
+            .iter()
+            .zip(symbols(&painted(3, &kick)))
+            .filter(|(a, b)| a.as_str() != b.as_str())
+            .count();
+        assert!(moved > 10, "fronts moved only {moved} plate cells");
+        assert_eq!(symbols(&buf), symbols(&painted(3, &quiet)));
+    }
+
+    #[test]
+    fn phase_carpet_uses_braille_density_and_transient_thickening() {
+        let quiet = Reactivity::default();
+        let buf = painted(9, &quiet);
+        let (braille_cells, dots) = braille_stats(&buf);
+        assert!(
+            braille_cells > 400,
+            "carpet has only {braille_cells} braille cells"
+        );
+        assert!(
+            dots as f32 / braille_cells as f32 > 2.0,
+            "braille ramp averages {:.2} dots per cell",
+            dots as f32 / braille_cells as f32
+        );
+        let distinct: std::collections::HashSet<_> = glyphs(&buf)
+            .into_iter()
+            .filter(|&ch| (0x2801..=0x28ff).contains(&(ch as u32)))
+            .collect();
+        assert!(distinct.len() >= 2, "density ramp has no steps");
+        let lines = ['─', '│', '╱', '╲']
+            .iter()
+            .filter(|glyph| glyphs(&buf).contains(glyph))
+            .count();
+        assert!(lines >= 2, "phase contours have no line glyphs");
+        let coverage = glyphs(&buf).len() as f32 / (W * H) as f32;
+        assert!(coverage > 0.40, "carpet ink coverage {coverage}");
+        let kick = Reactivity {
+            kick: 1.0,
+            onset: 1.0,
+            transients: [1.0; 4],
+            ..Reactivity::default()
+        };
+        let (_, hit_dots) = braille_stats(&painted(9, &kick));
+        assert!(hit_dots > dots, "attacks do not thicken the carpet");
+        let moved = symbols(&buf)
+            .iter()
+            .zip(symbols(&painted(9, &kick)))
+            .filter(|(a, b)| a.as_str() != b.as_str())
+            .count();
+        assert!(moved > 40, "attacks moved only {moved} carpet cells");
+        assert_eq!(symbols(&buf), symbols(&painted(9, &quiet)));
     }
 
     #[test]

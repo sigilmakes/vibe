@@ -294,31 +294,102 @@ impl Renderer {
                 }
             }
             6 => {
-                // Punctuation in interrupted registers, with hanging commas and
-                // clustered rests. No staff border or textual labels.
-                for register in 0..5 {
-                    for group in 0..9 {
-                        let u = 0.09 + group as f32 * 0.095;
-                        let gate = (group * 7 + register * 11) % 5;
-                        if gate == 0 {
+                // Broken Score: faint staff and bar lines, then noteheads with
+                // stems that grow on attacks and beams that follow the melody.
+                let staff_top = 0.26;
+                let staff_gap = 0.065;
+                let staff_bottom = staff_top + staff_gap * 4.0;
+                let left = 1.0;
+                let right = w - 2.0;
+                for line in 0..5 {
+                    let y = h * (staff_top + line as f32 * staff_gap);
+                    let mut x = left;
+                    while x <= right {
+                        page.mark(x, y, '─', 0.55, 0.13 + mid * 0.06);
+                        x += 1.0;
+                    }
+                }
+                for bar in [0.08_f32, 0.30, 0.52, 0.74, 0.96] {
+                    let x = w * bar;
+                    let mut y = h * staff_top;
+                    while y <= h * staff_bottom {
+                        page.mark(x, y, '│', 0.55, 0.12 + mid * 0.05);
+                        y += 1.0;
+                    }
+                }
+                // Precompute notes so beams can sit behind the noteheads.
+                type Note = Option<(f32, f32, usize, f32)>;
+                let mut notes: [[Note; 5]; 12] = [[None; 5]; 12];
+                for (group, row) in notes.iter_mut().enumerate() {
+                    let u = 0.11 + group as f32 * 0.065;
+                    let x = w * u + (t * 0.35 + group as f32).sin() * 0.8;
+                    for (register, note) in row.iter_mut().enumerate() {
+                        if (group * 7 + register * 11) % 5 == 0 {
                             continue;
                         }
-                        let x = w * u + (t + register as f32).sin() * 1.5;
-                        let y = h * (0.15 + register as f32 * 0.17)
-                            + wave(audio.waveform[group * 3]) * h * 0.035;
+                        let line = h * (staff_top + register as f32 * staff_gap);
+                        let sway = wave(audio.waveform[group * 2]) * h * 0.025;
                         let hit = self.attacks[register % 4];
-                        let glyph = [';', ':', ',', '·', '!'][gate];
+                        *note = Some((x, line + sway, 2 + (hit * 3.0).round() as usize, hit));
+                    }
+                }
+                for pair in notes.windows(2) {
+                    for (previous, current) in pair[0].iter().zip(&pair[1]) {
+                        let (Some((px, py, pstem, _)), Some((x, y, stem, hit))) =
+                            (*previous, *current)
+                        else {
+                            continue;
+                        };
+                        let (x0, y0) = (px, py - pstem as f32);
+                        let (x1, y1) = (x, y - stem as f32);
+                        let dy = y1 - y0;
+                        let glyph = if dy.abs() < 0.5 {
+                            '─'
+                        } else if dy > 0.0 {
+                            '╲'
+                        } else {
+                            '╱'
+                        };
+                        let mut bx = x0 + 1.0;
+                        while bx < x1 {
+                            let by = y0 + dy * (bx - x0) / (x1 - x0).max(1.0);
+                            page.mark(bx, by, glyph, 0.5, 0.30 + hit * 0.25);
+                            bx += 1.0;
+                        }
+                    }
+                }
+                for row in &notes {
+                    for (register, note) in row.iter().enumerate() {
+                        let Some((x, y, stem, hit)) = *note else {
+                            continue;
+                        };
+                        for step in 1..=stem {
+                            page.mark(
+                                x,
+                                y - step as f32,
+                                '│',
+                                register as f32 * 0.12,
+                                0.38 + hit * 0.30,
+                            );
+                        }
+                    }
+                }
+                for (group, row) in notes.iter().enumerate() {
+                    for (register, note) in row.iter().enumerate() {
+                        let Some((x, y, _, hit)) = *note else {
+                            continue;
+                        };
                         page.mark(
                             x,
-                            y - hit * 2.0,
-                            glyph,
-                            register as f32 * 0.18,
-                            0.55 + hit * 0.4,
+                            y,
+                            if (group * 7 + register * 11) % 2 == 0 {
+                                '●'
+                            } else {
+                                '○'
+                            },
+                            register as f32 * 0.12 + group as f32 * 0.02,
+                            0.55 + hit * 0.35,
                         );
-                        page.mark(x + 1.0, y, '.', register as f32 * 0.18, 0.35 + energy * 0.4);
-                        if gate == 2 {
-                            page.mark(x + 3.0, y + 1.0, '\'', 0.8, 0.5);
-                        }
                     }
                 }
             }
@@ -578,6 +649,91 @@ mod tests {
             .filter(|(a, b)| a.symbol() != b.symbol())
             .count();
         assert!(changed <= 12, "phase wrap displaced {changed} helix cells");
+    }
+
+    fn painted(audio: &Reactivity) -> Buffer {
+        let area = Rect::new(0, 0, 80, 28);
+        let mut buf = Buffer::empty(area);
+        let mut renderer = Renderer::default();
+        for frame in 0..60 {
+            renderer.draw(
+                &mut buf,
+                area,
+                frame as f32 / 60.0,
+                6,
+                0,
+                &[0.0; 32],
+                audio,
+                &Theme::default(),
+            );
+        }
+        buf
+    }
+
+    fn glyph_counts(buf: &Buffer) -> std::collections::HashMap<char, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for cell in &buf.content {
+            if let Some(ch) = cell.symbol().chars().next() {
+                if ch != ' ' {
+                    *counts.entry(ch).or_default() += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    fn symbols(buf: &Buffer) -> Vec<String> {
+        buf.content
+            .iter()
+            .map(|cell| cell.symbol().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn broken_score_draws_staff_stems_and_beams() {
+        let quiet = Reactivity::default();
+        let buf = painted(&quiet);
+        let counts = glyph_counts(&buf);
+        let ink: usize = counts.values().sum();
+        let coverage = ink as f32 / (80 * 28) as f32;
+        assert!(
+            (0.15..0.50).contains(&coverage),
+            "score ink coverage {coverage}"
+        );
+        assert!(
+            counts.get(&'─').copied().unwrap_or(0) > 200,
+            "staff and beams are too thin"
+        );
+        assert!(
+            counts.get(&'│').copied().unwrap_or(0) > 50,
+            "stems are too short"
+        );
+        let heads = counts.get(&'●').copied().unwrap_or(0) + counts.get(&'○').copied().unwrap_or(0);
+        assert!(heads >= 40, "only {heads} noteheads");
+        for punctuation in [';', ':', ',', '!'] {
+            assert_eq!(
+                counts.get(&punctuation),
+                None,
+                "score still uses {punctuation}"
+            );
+        }
+        let hit = Reactivity {
+            transients: [1.0; 4],
+            ..Reactivity::default()
+        };
+        let struck = painted(&hit);
+        let struck_counts = glyph_counts(&struck);
+        assert!(
+            struck_counts.get(&'│').copied().unwrap_or(0) > counts.get(&'│').copied().unwrap_or(0),
+            "attacks do not lengthen stems"
+        );
+        let moved = symbols(&buf)
+            .iter()
+            .zip(symbols(&struck))
+            .filter(|(a, b)| a.as_str() != b.as_str())
+            .count();
+        assert!(moved > 100, "attacks moved only {moved} score cells");
+        assert_eq!(symbols(&buf), symbols(&painted(&quiet)));
     }
 
     #[test]
