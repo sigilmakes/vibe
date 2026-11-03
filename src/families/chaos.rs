@@ -314,8 +314,10 @@ impl Garden {
 
 #[derive(Default)]
 pub struct Renderer {
-    storm: Storm,
-    garden: Garden,
+    // Each world precomputes its own history. Build only the world on screen:
+    // one shared frame budget should not pay for the unused style.
+    storm: Option<Storm>,
+    garden: Option<Garden>,
     last_time: [Option<f32>; 2],
     sound: [[f32; 3]; 2],
     attack: [f32; 2],
@@ -369,17 +371,23 @@ impl Renderer {
         };
         self.attack[style] = attack;
         if style == 0 {
-            self.storm.advance(dt, self.sound[style], hit);
+            self.storm
+                .get_or_insert_with(Default::default)
+                .advance(dt, self.sound[style], hit);
         } else {
-            self.garden.advance(dt, self.sound[style], hit);
+            self.garden
+                .get_or_insert_with(Default::default)
+                .advance(dt, self.sound[style], hit);
         }
         if area.width == 0 || area.height == 0 || area.intersection(buf.area).is_empty() {
             return;
         }
         if style == 0 {
-            self.storm.render(buf, area, palette, theme);
-        } else {
-            self.garden.render(buf, area, palette, theme);
+            if let Some(storm) = &self.storm {
+                storm.render(buf, area, palette, theme);
+            }
+        } else if let Some(garden) = &self.garden {
+            garden.render(buf, area, palette, theme);
         }
     }
 }
@@ -519,7 +527,29 @@ mod tests {
                 }
             }
         }
-        assert!(renderer.storm.camera < 0.1);
+        assert!(
+            renderer
+                .storm
+                .as_ref()
+                .expect("style 0 builds the storm")
+                .camera
+                < 0.1
+        );
+    }
+
+    #[test]
+    fn only_the_drawn_world_is_initialized() {
+        let area = Rect::new(0, 0, 40, 12);
+        let theme = Theme::default();
+        let audio = Reactivity::default();
+        for (style, storm, garden) in [(0, true, false), (1, false, true)] {
+            let mut renderer = Renderer::default();
+            assert!(renderer.storm.is_none() && renderer.garden.is_none());
+            let mut buf = Buffer::empty(area);
+            renderer.draw(&mut buf, area, 0.0, style, 0, &[0.0; 32], &audio, &theme);
+            assert_eq!(renderer.storm.is_some(), storm, "style {style}");
+            assert_eq!(renderer.garden.is_some(), garden, "style {style}");
+        }
     }
 
     #[test]
