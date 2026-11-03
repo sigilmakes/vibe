@@ -109,7 +109,7 @@ struct Args {
     /// Path to a config file (defaults to $XDG_CONFIG_HOME/vibe/config.toml)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
-    /// List visualisations and terminal-derived palettes
+    /// List visualisations and palettes, one per line, then exit
     #[arg(long)]
     list: bool,
     /// Analyze live audio for 1–60 seconds, then print features (default: 12)
@@ -133,18 +133,44 @@ fn config_path(args: &Args) -> PathBuf {
     })
 }
 
+/// Case-insensitive name match. ASCII names match without allocating; accented
+/// names (for example "Macramé Knots") fall back to Unicode lowercasing.
+fn same_name(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right) || left.to_lowercase() == right.to_lowercase()
+}
+
 fn choice(name: Option<&str>, choices: &[&str], kind: &str) -> io::Result<usize> {
     match name {
         None => Ok(0),
         Some(name) => choices
             .iter()
-            .position(|c| c.eq_ignore_ascii_case(name))
+            .position(|c| same_name(c, name))
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown {kind} '{name}'; choose: {}", choices.join(", ")),
-                )
+                io::Error::new(io::ErrorKind::InvalidInput, unknown(kind, name, choices))
             }),
+    }
+}
+
+/// Error text for an unknown name. The catalogue is too long to print on one
+/// line, so offer a few close names and point at the full listing.
+fn unknown(kind: &str, name: &str, choices: &[&str]) -> String {
+    let needle = name.trim().to_lowercase();
+    let close: Vec<&str> = choices
+        .iter()
+        .copied()
+        .filter(|choice| {
+            let candidate = choice.to_lowercase();
+            needle.len() >= 2 && (candidate.contains(&needle) || needle.contains(&candidate))
+        })
+        .take(3)
+        .collect();
+    if close.is_empty() {
+        format!("unknown {kind} '{name}'; run `vibe --list` for the full catalogue")
+    } else {
+        format!(
+            "unknown {kind} '{name}'; did you mean: {}?",
+            close.join(", ")
+        )
     }
 }
 
@@ -155,11 +181,25 @@ fn starting_scene(explicit: Option<&str>, saved: Option<&str>) -> io::Result<usi
     if let Some(index) = saved.and_then(|name| {
         visuals::SCENES
             .iter()
-            .position(|scene| scene.eq_ignore_ascii_case(name))
+            .position(|scene| same_name(scene, name))
     }) {
         return Ok(index);
     }
     choice(Some(DEFAULT_SCENE), visuals::SCENES, "visualisation")
+}
+
+/// `--list` output: one entry per line so a long catalogue stays readable and
+/// each name can be copied straight into `--scene`.
+fn catalogue() -> String {
+    let mut out = format!("Visualisations ({}):\n", visuals::SCENES.len());
+    for scene in visuals::SCENES {
+        out.push_str(&format!("  {scene}\n"));
+    }
+    out.push_str(&format!("Palettes ({}):\n", palette::PALETTES.len()));
+    for name in palette::PALETTES {
+        out.push_str(&format!("  {name}\n"));
+    }
+    out
 }
 
 fn color_depth_name(depth: palette::ColorDepth) -> &'static str {
@@ -292,8 +332,7 @@ fn main() -> io::Result<()> {
     use clap::Parser;
     let args = Args::parse();
     if args.list {
-        println!("Visualisations: {}", visuals::SCENES.join(", "));
-        println!("Palettes: {}", palette::PALETTES.join(", "));
+        print!("{}", catalogue());
         return Ok(());
     }
     if args.list_audio {
@@ -520,6 +559,45 @@ mod tests {
         let override_scene = starting_scene(args.scene.as_deref(), Some("Julia")).unwrap();
         assert_eq!(visuals::SCENES[override_scene], "Waveform Scope");
         assert!(starting_scene(Some("missing scene"), Some("Julia")).is_err());
+    }
+
+    #[test]
+    fn unknown_names_get_short_actionable_errors() {
+        let message = unknown("visualisation", "nope", visuals::SCENES);
+        assert!(message.len() < 160, "{message}");
+        assert!(message.contains("--list"), "{message}");
+
+        let close = unknown("visualisation", "jul", visuals::SCENES);
+        assert_eq!(close, "unknown visualisation 'jul'; did you mean: Julia?");
+        assert!(unknown("visualisation", "wave", visuals::SCENES).contains("Waveform Scope"));
+    }
+
+    #[test]
+    fn catalogue_prints_one_entry_per_line() {
+        let listing = catalogue();
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(
+            lines.first().copied(),
+            Some(format!("Visualisations ({}):", visuals::SCENES.len()).as_str())
+        );
+        assert!(lines.iter().all(|line| line.chars().count() <= 40));
+        for scene in visuals::SCENES {
+            assert!(lines.contains(&format!("  {scene}").as_str()), "{scene}");
+        }
+        for name in palette::PALETTES {
+            assert!(lines.contains(&format!("  {name}").as_str()), "{name}");
+        }
+    }
+
+    #[test]
+    fn accented_scene_names_match_case_insensitively() {
+        let scene = visuals::SCENES
+            .iter()
+            .position(|name| *name == "Macramé Knots")
+            .unwrap();
+        assert!(same_name("Macramé Knots", "MACRAMÉ KNOTS"));
+        assert_eq!(starting_scene(None, Some("MACRAMÉ KNOTS")).unwrap(), scene);
+        assert_eq!(starting_scene(Some("macramé knots"), None).unwrap(), scene);
     }
 
     #[test]

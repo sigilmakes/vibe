@@ -181,7 +181,7 @@ pub fn menu(frame: &mut Frame, menu: &MenuView, theme: &Theme) {
     let selected = menu.selected.min(menu.rows.len().saturating_sub(1));
     let first = selected.saturating_sub(capacity.saturating_sub(1));
     let mut lines = vec![Line::styled(
-        clip(format!(" {}", menu.path.join(" / ")), width as usize),
+        title_line(&menu.path, first, capacity, menu.rows.len(), width),
         Style::default()
             .fg(color(theme.ansi[12]))
             .add_modifier(Modifier::BOLD),
@@ -190,6 +190,23 @@ pub fn menu(frame: &mut Frame, menu: &MenuView, theme: &Theme) {
         lines.push(row_line(row, index == selected, width, theme));
     }
     overlay(frame, area, lines, theme);
+}
+
+/// Title line for the menu popup. When the row list is taller than the popup,
+/// the visible range is right-aligned so a long catalogue still shows where the
+/// cursor sits and that more rows exist below.
+fn title_line(path: &[String], first: usize, capacity: usize, total: usize, width: u16) -> String {
+    let lead = format!(" {}", path.join(" / "));
+    if total <= capacity {
+        return clip(lead, width as usize);
+    }
+    let counter = format!("{}–{}/{total}", first + 1, (first + capacity).min(total));
+    let used = lead.chars().count() + counter.chars().count();
+    let pad = (width as usize).saturating_sub(used).max(1);
+    clip(
+        format!("{lead}{}{counter}", " ".repeat(pad)),
+        width as usize,
+    )
 }
 
 fn row_line(row: &MenuRowView, active: bool, width: u16, theme: &Theme) -> Line<'static> {
@@ -384,6 +401,51 @@ mod tests {
             .unwrap();
         assert!(text(terminal.backend().buffer()).contains("Transition time"));
         assert!(text(terminal.backend().buffer()).contains("20 s"));
+    }
+
+    fn menu_rows(labels: &[&str]) -> Vec<MenuRowView> {
+        labels
+            .iter()
+            .map(|label| MenuRowView {
+                label: (*label).to_owned(),
+                value: String::new(),
+                unit: None,
+                kind: RowKind::Action,
+                editing: false,
+            })
+            .collect()
+    }
+
+    fn render_menu(rows: Vec<MenuRowView>, selected: usize, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let view = MenuView {
+            path: vec!["Vibe".into(), "Scenes".into(), "Visualisation".into()],
+            rows,
+            selected,
+        };
+        terminal
+            .draw(|frame| menu(frame, &view, &Theme::default()))
+            .unwrap();
+        text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn long_lists_show_the_visible_range_and_scroll_to_selection() {
+        let labels: Vec<String> = (0..201).map(|index| format!("Scene {index}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let top = render_menu(menu_rows(&labels), 0, 80, 24);
+        assert!(top.contains("1–23/201"), "{top}");
+        assert!(top.contains("Scene 0"));
+        assert!(!top.contains("Scene 200"));
+
+        let bottom = render_menu(menu_rows(&labels), 200, 80, 24);
+        assert!(bottom.contains("179–201/201"), "{bottom}");
+        assert!(bottom.contains("› Scene 200"));
+        assert!(!bottom.contains("Scene 0"));
+
+        // A list that fits the popup has no range to report.
+        let short = render_menu(menu_rows(&["One", "Two", "Three"]), 1, 80, 24);
+        assert!(!short.contains('–'), "{short}");
     }
 
     #[test]

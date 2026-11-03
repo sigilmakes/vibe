@@ -1518,6 +1518,57 @@ mod tests {
     }
 
     #[test]
+    fn every_scene_is_listed_and_findable_by_name() {
+        let config = config::Config::default();
+        let pages = build_pages(&config, 0, false, "", "");
+        let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+        let listed: Vec<usize> = picker
+            .visible_rows()
+            .filter_map(|row| scene_index(row.id))
+            .collect();
+        assert_eq!(listed, (0..visuals::SCENES.len()).collect::<Vec<_>>());
+
+        for (index, name) in visuals::SCENES.iter().enumerate() {
+            for query in [(*name).to_owned(), name.to_lowercase()] {
+                let pages = build_pages(&config, 0, false, "", &query);
+                let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+                let found: Vec<usize> = picker
+                    .visible_rows()
+                    .filter_map(|row| scene_index(row.id))
+                    .collect();
+                assert!(found.contains(&index), "{name} not found by {query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_tag_matches_scenes_and_every_scene_carries_a_tag() {
+        let mut config = config::Config::default();
+        config.scenes.filter = "tags".into();
+        let mut covered = vec![false; visuals::SCENES.len()];
+        for tag in visuals::TAGS {
+            config.scenes.filter_tags = vec![(*tag).to_owned()];
+            let pages = build_pages(&config, 0, false, "", "");
+            let picker = find_page(&pages, PageId::ScenePicker).unwrap();
+            let found: Vec<usize> = picker
+                .visible_rows()
+                .filter_map(|row| scene_index(row.id))
+                .collect();
+            assert!(!found.is_empty(), "tag {tag} matches no scene");
+            for index in found {
+                covered[index] = true;
+            }
+        }
+        let uncovered: Vec<&str> = covered
+            .iter()
+            .enumerate()
+            .filter(|(_, seen)| !**seen)
+            .map(|(index, _)| visuals::SCENES[index])
+            .collect();
+        assert!(uncovered.is_empty(), "no tag filter reaches {uncovered:?}");
+    }
+
+    #[test]
     fn filter_page_reports_mode_tag_count_and_matches() {
         let mut config = config::Config::default();
         config.scenes.filter = "tags".into();
