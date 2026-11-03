@@ -329,6 +329,14 @@ fn hash(x: i32, y: i32) -> f32 {
     (n ^ (n >> 16)) as f32 / u32::MAX as f32
 }
 
+/// Rasterisation steps for a tail. A tail cannot cross more cells than the
+/// visible canvas holds, and the cap keeps a huge (but finite) envelope from
+/// turning this into a multi-billion-iteration loop.
+fn tail_steps(tangent: [f32; 2], visible: Rect) -> usize {
+    (tangent[0].abs().max(tangent[1].abs()).ceil().max(1.0) as usize)
+        .min(visible.width as usize + visible.height as usize + 2)
+}
+
 fn line_glyph(tangent: [f32; 2]) -> char {
     let slope = tangent[1] / (tangent[0] + 0.00001);
     if slope.abs() < 0.4 {
@@ -782,11 +790,7 @@ impl Renderer {
             let head = cell_position(point);
             let tail = cell_position(tail);
             let tangent = [head[0] - tail[0], head[1] - tail[1]];
-            let steps = tangent[0]
-                .abs()
-                .max(tangent[1].abs())
-                .ceil()
-                .clamp(1.0, 4096.0) as usize;
+            let steps = tail_steps(tangent, visible);
             for i in 0..steps {
                 let u = i as f32 / steps as f32;
                 plot(
@@ -1878,5 +1882,30 @@ mod tests {
         }
         assert!(renderer.impacts.len() <= 32);
         assert!(renderer.impacts.len() > 8);
+    }
+    #[test]
+    fn swarm_caps_tail_steps_for_extreme_audio() {
+        // A finite but huge envelope used to make the tail rasteriser iterate
+        // for billions of steps and freeze the frame loop.
+        let area = Rect::new(0, 0, 40, 20);
+        let theme = crate::palette::Theme::default();
+        let audio = Reactivity {
+            energy: 1e30,
+            bass: 1e30,
+            mid: 1e30,
+            treble: 1e30,
+            onset: 1e30,
+            kick: 1e30,
+            beat: 1e30,
+            transients: [1e30; 4],
+            ..Reactivity::default()
+        };
+        assert!(tail_steps([1e30, 1e30], area) <= area.width as usize + area.height as usize + 2);
+        assert_eq!(tail_steps([0.0, 0.0], area), 1);
+        assert_eq!(tail_steps([3.2, -1.0], area), 4);
+
+        let mut buffer = Buffer::empty(area);
+        Renderer::default().draw(&mut buffer, area, 1.0, 6, 0, &[1e30; 32], &audio, &theme);
+        assert_eq!(buffer.content.len(), area.area() as usize);
     }
 }

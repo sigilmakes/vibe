@@ -114,6 +114,8 @@ impl App {
         app.prune_scenes();
         app.prune_playlists();
         app.prune_auto_advance();
+        app.prune_appearance();
+        app.prune_audio();
         app.rebuild_pages();
         if !app.demo {
             app.connect();
@@ -922,6 +924,51 @@ impl App {
         }
     }
 
+    /// Canonicalise display settings. A hand-edited config file can set a
+    /// frame rate of zero (an infinite frame budget) or a non-finite gain,
+    /// which would otherwise panic the frame loop or poison every visual.
+    fn prune_appearance(&mut self) {
+        let before = self.config.appearance.clone();
+        if !(1..=240).contains(&self.config.appearance.fps) {
+            self.config.appearance.fps = 60;
+        }
+        let sensitivity = self.config.appearance.sensitivity;
+        self.config.appearance.sensitivity = if sensitivity.is_finite() {
+            sensitivity.clamp(0.25, 3.0)
+        } else {
+            1.0
+        };
+        if self.config.appearance != before {
+            self.mark_config_dirty();
+        }
+    }
+
+    /// Keep capture parameters inside the range the CLI and menu offer.
+    /// Out-of-range values would size the capture buffer and analyser
+    /// history far beyond what those controls allow.
+    fn prune_audio(&mut self) {
+        use clap::ValueEnum;
+        let before = self.config.audio.clone();
+        if !matches!(
+            self.config.audio.source.as_str(),
+            "auto" | "pipewire" | "pulse" | "microphone" | "command" | "file"
+        ) {
+            self.config.audio.source = "auto".into();
+        }
+        if audio::SampleFormat::from_str(&self.config.audio.format, true).is_err() {
+            self.config.audio.format = audio::SampleFormat::F32.name().into();
+        }
+        if !(8_000..=192_000).contains(&self.config.audio.rate) {
+            self.config.audio.rate = 48_000;
+        }
+        if !(1..=32).contains(&self.config.audio.channels) {
+            self.config.audio.channels = 2;
+        }
+        if self.config.audio != before {
+            self.mark_config_dirty();
+        }
+    }
+
     /// Canonicalise auto-advance settings and drop scopes that are no longer
     /// available (for example Playlist without an active playlist).
     fn prune_auto_advance(&mut self) {
@@ -952,6 +999,8 @@ impl App {
         self.prune_scenes();
         self.prune_playlists();
         self.prune_auto_advance();
+        self.prune_appearance();
+        self.prune_audio();
         if !self.config_dirty {
             return;
         }
@@ -1742,5 +1791,60 @@ mod tests {
         assert!(!app.config.audio.auto_reconnect);
         app.apply_change(menu::ids::AUTO_RECONNECT, "on");
         assert!(app.config.audio.auto_reconnect);
+    }
+
+    #[test]
+    fn malformed_config_is_canonicalised_before_the_frame_loop() {
+        let mut options = demo_options();
+        options.config.appearance.fps = 0;
+        options.config.appearance.sensitivity = f32::NAN;
+        options.config.audio.source = "nonsense".into();
+        options.config.audio.format = "s24le".into();
+        options.config.audio.rate = 1_000;
+        options.config.audio.channels = 65_535;
+        let mut app = App::new(options);
+        let (fps, sensitivity, energy, bands_finite) = {
+            let view = app.view(1.0);
+            (
+                view.fps,
+                view.sensitivity,
+                view.reactivity.energy,
+                view.bands.iter().all(|value| value.is_finite()),
+            )
+        };
+
+        // `main` derives the frame budget as `1.0 / fps`; zero would panic.
+        assert_eq!(fps, 60);
+        let _ = std::time::Duration::from_secs_f32(1.0 / fps as f32);
+        assert_eq!(sensitivity, 1.0);
+        assert_eq!(app.config.audio.source, "auto");
+        assert_eq!(app.config.audio.format, "f32le");
+        assert_eq!(app.config.audio.rate, 48_000);
+        assert_eq!(app.config.audio.channels, 2);
+        assert!(energy.is_finite());
+        assert!(bands_finite);
+        assert!(app.config_dirty, "canonicalised values should be rewritten");
+    }
+
+    #[test]
+    fn appearance_edits_from_config_are_clamped_to_the_menu_range() {
+        for (fps, sensitivity, want_fps, want_sensitivity) in [
+            (0, 0.1, 60, 0.25),
+            (241, -1.0, 60, 0.25),
+            (30, f32::INFINITY, 30, 1.0),
+            (120, 2.0, 120, 2.0),
+            (1, 3.5, 1, 3.0),
+            (240, 0.25, 240, 0.25),
+        ] {
+            let mut options = demo_options();
+            options.config.appearance.fps = fps;
+            options.config.appearance.sensitivity = sensitivity;
+            let mut app = App::new(options);
+            assert_eq!(app.view(0.0).fps, want_fps, "fps {fps}");
+            assert_eq!(
+                app.config.appearance.sensitivity, want_sensitivity,
+                "sensitivity {sensitivity}"
+            );
+        }
     }
 }

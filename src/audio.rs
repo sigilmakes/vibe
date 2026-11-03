@@ -85,17 +85,20 @@ impl PcmFormat {
         self.channels as usize * self.sample.bytes()
     }
 
+    /// Reject formats the CLI and menu do not offer. `rate` and `channels`
+    /// come from the config file, where a malformed value would otherwise
+    /// size the capture buffer, the novelty history, and the lag search.
     pub fn validate(self) -> io::Result<Self> {
-        if self.rate == 0 {
+        if !(8_000..=192_000).contains(&self.rate) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "audio sample rate must be greater than zero",
+                "audio sample rate must be between 8000 and 192000 Hz",
             ));
         }
-        if self.channels == 0 {
+        if !(1..=32).contains(&self.channels) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "audio channel count must be greater than zero",
+                "audio channel count must be between 1 and 32",
             ));
         }
         Ok(self)
@@ -587,13 +590,19 @@ fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) -> Ster
                         / 2_147_483_648.0
                 }
             };
-            if value.is_finite() {
-                sum += value;
-                match channel {
-                    0 => left = value,
-                    1 => right_value = Some(value),
-                    _ => {}
-                }
+            // Float PCM is nominally within [-1, 1]. Clipping here keeps
+            // out-of-range samples from overflowing the FFT and turns
+            // non-finite samples into silence instead of propagating NaN.
+            let value = if value.is_finite() {
+                value.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            sum += value;
+            match channel {
+                0 => left = value,
+                1 => right_value = Some(value),
+                _ => {}
             }
         }
         *sample = sum / channels as f32;
@@ -1133,7 +1142,9 @@ impl Analyzer {
             log_sum += power.max(1e-20).ln();
         }
         // Fixed numerical floor, never an adaptive gain for quiet noise.
-        if total <= 1e-12 {
+        // Non-finite power must not reach the ratio features; the caller
+        // sanitises PCM, and this keeps a future input path honest.
+        if !total.is_finite() || total <= 1e-12 {
             return;
         }
         self.state.centroid =
@@ -1411,11 +1422,10 @@ impl Rhythm {
         if !self.frames.is_multiple_of(24) || self.history.len() < (4.0 / self.dt) as usize {
             return;
         }
-        // At coarse hops (< ~2.2 kHz sources) the 260 BPM lag rounds to zero,
-        // which would underflow the score window. One hop is the finest period
-        // the estimator can represent.
+        // At very low sample rates the fastest tempo spans less than one hop.
+        // Keep at least one lag on each side so the curvature taps exist.
         let min_lag = ((60.0 / (260.0 * self.dt)).floor() as usize).max(1);
-        let max_lag = (60.0 / (60.0 * self.dt)).ceil() as usize;
+        let max_lag = ((60.0 / (60.0 * self.dt)).ceil() as usize).max(min_lag + 1);
         let n = self.history.len();
         let mut correlations = vec![[0.0_f32; 2]; max_lag * 2 + 3];
         for channel in 0..2 {
@@ -2641,5 +2651,124 @@ mod tests {
         assert!(text.contains("auto_null"));
         assert!(text.contains("48000 Hz"));
         assert!(text.contains("f32le"));
+    }
+
+    #[test]
+    fn pcm_format_rejects_rates_and_channel_counts_outside_the_supported_range() {
+        let valid = PcmFormat {
+            rate: 48_000,
+            channels: 2,
+            sample: SampleFormat::F32,
+        };
+        assert!(valid.validate().is_ok());
+        for rate in [0, 1_000, 7_999, 192_001, u32::MAX] {
+            assert!(
+                PcmFormat { rate, ..valid }.validate().is_err(),
+                "rate {rate} should be rejected"
+            );
+        }
+        for channels in [0, 33, 65_535] {
+            assert!(
+                PcmFormat { channels, ..valid }.validate().is_err(),
+                "channels {channels} should be rejected"
+            );
+        }
+        for (rate, channels) in [(8_000, 1), (192_000, 32)] {
+            assert!(PcmFormat {
+                rate,
+                channels,
+                sample: SampleFormat::S16
+            }
+            .validate()
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn decode_pcm_clips_out_of_range_and_non_finite_samples() {
+        let format = PcmFormat::default();
+        for sample in [
+            f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            1e38,
+            -2.5,
+        ] {
+            let bytes: Vec<u8> = (0..HOP)
+                .flat_map(|_| sample.to_le_bytes().into_iter().chain(sample.to_le_bytes()))
+                .collect();
+            let mut samples = [0.0_f32; HOP];
+            let stats = decode_pcm(&bytes, format, &mut samples);
+            assert!(
+                samples
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() <= 1.0),
+                "{sample}: {:?}",
+                &samples[..4]
+            );
+            assert!(stats.left.is_finite() && stats.right.is_finite() && stats.cross.is_finite());
+            assert!((0.0..=1.0).contains(&stats.width()));
+            assert!((-1.0..=1.0).contains(&stats.balance()));
+        }
+    }
+
+    #[test]
+    fn analyzer_features_stay_finite_for_out_of_range_pcm() {
+        let format = PcmFormat::default();
+        for sample in [f32::MAX, 1e38, f32::INFINITY, f32::NAN] {
+            let bytes: Vec<u8> = (0..HOP)
+                .flat_map(|_| sample.to_le_bytes().into_iter().chain(sample.to_le_bytes()))
+                .collect();
+            let mut analyzer = Analyzer::new();
+            for _ in 0..24 {
+                let mut samples = [0.0_f32; HOP];
+                let stats = decode_pcm(&bytes, format, &mut samples);
+                let state = analyzer.analyze_with(&samples, stats);
+                assert!(state.energy.is_finite() && (0.0..=1.0).contains(&state.energy));
+                assert!(state.bass.is_finite() && (0.0..=1.0).contains(&state.bass));
+                assert!(state.mid.is_finite() && (0.0..=1.0).contains(&state.mid));
+                assert!(state.treble.is_finite() && (0.0..=1.0).contains(&state.treble));
+                assert!(state.onset.is_finite() && (0.0..=1.0).contains(&state.onset));
+                assert!(state.kick.is_finite() && (0.0..=1.0).contains(&state.kick));
+                assert!(state.novelty.is_finite() && (0.0..=1.0).contains(&state.novelty));
+                assert!(state.beat.is_finite() && (0.0..=1.0).contains(&state.beat));
+                assert!(state.centroid.is_finite() && (0.0..=1.0).contains(&state.centroid));
+                assert!(state.flatness.is_finite() && (0.0..=1.0).contains(&state.flatness));
+                assert!((0.0..=1.0).contains(&state.width));
+                assert!((-1.0..=1.0).contains(&state.balance));
+                assert!(state.bpm.is_none_or(f32::is_finite));
+                assert!(state.tempo_confidence.is_finite());
+                assert!((0.0..=1.0).contains(&state.tempo_confidence));
+                assert!(state.beat_phase.is_finite() && (0.0..=1.0).contains(&state.beat_phase));
+                assert!(state.bands.iter().all(|value| (0.0..=1.0).contains(value)));
+                assert!(state.waveform.iter().all(|value| value.abs() <= 1.0));
+                assert!(state.chroma.iter().all(|value| (0.0..=1.0).contains(value)));
+                assert!(state
+                    .transients
+                    .iter()
+                    .all(|value| (0.0..=1.0).contains(value)));
+            }
+        }
+    }
+
+    #[test]
+    fn low_sample_rates_keep_the_rhythm_tracker_safe() {
+        for rate in [1usize, 100, 1_000, 2_000, 2_218, 2_219, 8_000] {
+            let mut analyzer = Analyzer::with_sample_rate(rate);
+            for frame in 0..600 {
+                let samples: [f32; HOP] = std::array::from_fn(|i| {
+                    let t = (frame * HOP + i) as f32 / rate as f32;
+                    let phase = t % 0.5;
+                    if phase < 0.05 {
+                        0.4 * (-phase / 0.02).exp()
+                    } else {
+                        0.01 * (std::f32::consts::TAU * 5.0 * t).sin()
+                    }
+                });
+                let state = analyzer.analyze(&samples);
+                assert!(state.bpm.is_none_or(f32::is_finite), "rate {rate}");
+            }
+        }
     }
 }
