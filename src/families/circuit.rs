@@ -136,6 +136,12 @@ fn point_along(pts: &[[f32; 2]], s: f32) -> [f32; 2] {
 }
 
 fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
+    let chroma_hue = audio
+        .chroma
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map_or(0.0, |(index, _)| index as f32 / 12.0);
     let base = match mode {
         0 => 0.05 + u * 0.18 + v * 0.08,
         1 => 0.55 + u * 0.22,
@@ -148,7 +154,9 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.60 + u * 0.30,
         _ => 0.15 + u * 0.20 + v * 0.20,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
+    let pitch = if mode == 9 { chroma_hue * 0.18 } else { 0.0 };
+    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05 + pitch)
+        .rem_euclid(1.0)
 }
 
 struct Net {
@@ -904,8 +912,22 @@ impl Renderer {
         let rows = (h / 8).clamp(2, 5);
         let fw = w as f32;
         let fh = h as f32;
+        // Treat the die as three signal domains: power (low bands), routing
+        // (mid bands), and clocks (high bands). Every block belongs to one
+        // domain, so a bass-only track does not resize the whole floorplan the
+        // same way as a cymbal-heavy one.
+        let low: f32 = bands[..10].iter().copied().map(unit).sum::<f32>() / 10.0;
+        let mid_band: f32 = bands[10..21].iter().copied().map(unit).sum::<f32>() / 11.0;
+        let high: f32 = bands[21..].iter().copied().map(unit).sum::<f32>() / 11.0;
         let weights: Vec<f32> = (0..cols)
-            .map(|c| 1.0 + unit(bands[(c * 7 + 1) % 32]) * 1.5 + unit(audio.energy) * 0.5)
+            .map(|c| {
+                let domain = match c % 3 {
+                    0 => low,
+                    1 => mid_band,
+                    _ => high,
+                };
+                1.0 + unit(bands[(c * 7 + 1) % 32]) * 1.2 + domain * 0.8 + unit(audio.energy) * 0.3
+            })
             .collect();
         let mut xs: Vec<i32> = Vec::with_capacity(cols + 1);
         xs.push(0);
@@ -919,7 +941,14 @@ impl Renderer {
         }
         xs.push(w as i32 - 1);
         let row_weights: Vec<f32> = (0..rows)
-            .map(|r| 1.0 + unit(bands[(r * 11 + 5) % 32]) * 1.4 + unit(audio.energy) * 0.4)
+            .map(|r| {
+                let domain = match r % 3 {
+                    0 => low,
+                    1 => mid_band,
+                    _ => high,
+                };
+                1.0 + unit(bands[(r * 11 + 5) % 32]) * 1.1 + domain * 0.6 + unit(audio.energy) * 0.3
+            })
             .collect();
         let mut ys: Vec<i32> = Vec::with_capacity(rows + 1);
         ys.push(0);
@@ -941,8 +970,19 @@ impl Renderer {
                 if x1 < x0 || y1 < y0 {
                     continue;
                 }
-                let value = unit(bands[(bx * 5 + by * 11) % 32] * 0.7 + audio.energy * 0.3);
-                let edge = 0.22 + value * 0.25;
+                let domain = match (bx + by) % 3 {
+                    0 => low,
+                    1 => mid_band,
+                    _ => high,
+                };
+                let band = unit(bands[(bx * 5 + by * 11) % 32]);
+                let value = unit(
+                    band * 0.52
+                        + domain * 0.26
+                        + unit(audio.energy) * 0.14
+                        + unit(audio.mid) * 0.08,
+                );
+                let edge = 0.18 + value * 0.30 + unit(audio.bass) * 0.04;
                 for x in x0..=x1 {
                     self.canvas.plot(x, y0, '─', edge);
                     self.canvas.plot(x, y1, '─', edge);
@@ -955,7 +995,10 @@ impl Renderer {
                 self.canvas.plot(x1, y0, '┐', edge + 0.1);
                 self.canvas.plot(x0, y1, '└', edge + 0.1);
                 self.canvas.plot(x1, y1, '┘', edge + 0.1);
-                let stride = (1.0 + (1.0 - value) * 3.0).round().max(1.0) as i32;
+                let spread = audio.spread();
+                let stride = ((1.0 + (1.0 - value) * 3.0) * (0.8 + spread * 0.5))
+                    .round()
+                    .max(1.0) as i32;
                 let glyph = ['·', '░', '▒', '╱'][(bx * 7 + by * 13) % 4];
                 for y in y0 + 1..y1 {
                     for x in x0 + 1..x1 {
@@ -965,8 +1008,37 @@ impl Renderer {
                         self.canvas.plot(x, y, glyph, 0.08 + value * 0.3);
                     }
                 }
+                // A horizontal rail inside each block carries its domain level;
+                // clock dots along the bottom edge use the high band and air
+                // transients instead of the global kick.
+                let rail_y = (y0 + y1) / 2;
+                let rail_end =
+                    (x0 + ((x1 - x0) as f32 * (0.25 + value * 0.55)).round() as i32).min(x1 - 1);
+                for x in x0 + 1..=rail_end {
+                    self.canvas.plot(x, rail_y, '─', 0.10 + value * 0.32);
+                }
+                let clock_count = 1 + (unit(audio.treble) * 3.0) as i32;
+                for clock in 0..clock_count {
+                    let phase = (t * (0.22 + unit(audio.treble) * 0.55)
+                        + clock as f32 / clock_count as f32)
+                        .rem_euclid(1.0);
+                    let x = x0 + ((x1 - x0) as f32 * phase).round() as i32;
+                    self.canvas
+                        .plot(x, y1, '●', 0.18 + unit(audio.transients[2]) * 0.45);
+                }
+                let strike = unit(audio.transients[(bx + by) % 4]);
+                if strike > 0.18 {
+                    let cx = (x0 + x1) / 2;
+                    let cy = (y0 + y1) / 2;
+                    self.canvas.plot(cx, cy, '╋', 0.25 + strike * 0.55);
+                    self.canvas.plot(cx - 1, cy, '─', 0.12 + strike * 0.3);
+                    self.canvas.plot(cx + 1, cy, '─', 0.12 + strike * 0.3);
+                    self.canvas.plot(cx, cy - 1, '│', 0.12 + strike * 0.3);
+                    self.canvas.plot(cx, cy + 1, '│', 0.12 + strike * 0.3);
+                }
                 let span = (x1 - x0).max(1) as f32;
-                let p = (t * 0.4 + bx as f32 * 0.21 + by as f32 * 0.37).rem_euclid(1.0);
+                let p = (t * (0.35 + unit(audio.bass) * 0.3) + bx as f32 * 0.21 + by as f32 * 0.37)
+                    .rem_euclid(1.0);
                 self.canvas
                     .dot(x0 as f32 + span * p, y1 as f32, '●', 0.35 + value * 0.35);
                 let vspan = (y1 - y0).max(1) as f32;
@@ -989,6 +1061,17 @@ impl Renderer {
                 for x in x0 + 1..x1 {
                     self.canvas.plot(x, y, '▓', 0.65 + kick * 0.2);
                 }
+            }
+        }
+        // The tempo lock draws a scan row across the die; the decaying beat
+        // envelope controls its brightness, so it sweeps on the beat without
+        // flashing on every off-beat transient.
+        if audio.tempo_confidence >= 0.25 {
+            let row = ((audio.locked_beat_phase() * rows as f32) as usize).min(rows - 1);
+            let level = 0.12 + unit(audio.beat) * 0.48;
+            let y = ys[row];
+            for x in 0..w as i32 {
+                self.canvas.plot(x, y, '═', level);
             }
         }
     }
@@ -1047,6 +1130,49 @@ mod tests {
             assert!(!images.contains(&image), "duplicate scene {mode}");
             images.push(image);
         }
+    }
+
+    #[test]
+    fn die_floorplan_uses_spectral_stereo_and_attack_signals() {
+        let area = Rect::new(0, 0, 80, 24);
+        let theme = Theme::default();
+        let render = |audio: &Reactivity, bands: &[f32; 32]| {
+            let mut renderer = Renderer::default();
+            let mut buf = Buffer::empty(area);
+            for frame in 0..60 {
+                renderer.draw(
+                    &mut buf,
+                    area,
+                    frame as f32 / 60.0,
+                    9,
+                    0,
+                    bands,
+                    audio,
+                    &theme,
+                );
+            }
+            buf.content
+                .iter()
+                .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+                .collect::<Vec<_>>()
+        };
+        let quiet = Reactivity::default();
+        let low_bands: [f32; 32] = std::array::from_fn(|i| if i < 10 { 0.9 } else { 0.0 });
+        let high_bands: [f32; 32] = std::array::from_fn(|i| if i >= 21 { 0.9 } else { 0.0 });
+        let active = Reactivity {
+            mid: 0.9,
+            treble: 0.9,
+            bass: 0.8,
+            transients: [0.2, 0.9, 0.9, 0.9],
+            beat: 0.9,
+            beat_phase: 0.4,
+            tempo_confidence: 1.0,
+            chroma: std::array::from_fn(|i| if i == 7 { 1.0 } else { 0.0 }),
+            ..Reactivity::default()
+        };
+        assert_ne!(render(&quiet, &[0.0; 32]), render(&quiet, &low_bands));
+        assert_ne!(render(&quiet, &[0.0; 32]), render(&quiet, &high_bands));
+        assert_ne!(render(&quiet, &[0.0; 32]), render(&active, &[0.0; 32]));
     }
 
     #[test]

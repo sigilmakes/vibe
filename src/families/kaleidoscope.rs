@@ -131,12 +131,22 @@ fn mandala(p: &Params, x: f32, y: f32) -> (f32, f32) {
     let u = fold_angle(theta, p.folds) / (sector * 0.5);
     let petal = (u * PI * 0.5).cos();
     let pulse = (p.beat_phase * TAU).sin();
-    let rim = 0.62 + 0.16 * petal + p.bass * 0.08 + p.chroma_mag * 0.04 + p.beat * 0.03 * pulse;
+    // The rim and webbing are geometry, not only pigment. Low bands widen the
+    // bloom, high bands tighten the inner rings, and the beat gives a visible
+    // breathing step instead of a recolour.
+    let rim = 0.62
+        + 0.16 * petal
+        + p.bass * 0.09
+        + p.energy * 0.05
+        + p.bands[0] * 0.07
+        + p.bands[7] * 0.05
+        + p.beat * 0.05 * pulse;
     let ring = (-((r - rim) * 10.0).powi(2)).exp();
     let inside = (1.0 - r / (rim + 0.06)).clamp(0.0, 1.0);
-    let webbing = ((r * 21.0 - p.t * 2.0 + u * 3.0).sin() * 0.5 + 0.5) * inside;
+    let webbing = ((r * 21.0 - p.t * (2.0 + p.bands[3] * 1.8) + u * 3.0).sin() * 0.5 + 0.5)
+        * inside;
     let spokes = (-(u * u) * 130.0).exp() * inside;
-    let heart = (-r * r * 80.0).exp() * (0.75 + p.impact * 0.5);
+    let heart = (-r * r * 80.0).exp() * (0.75 + p.impact * 0.5 + p.kick * 0.1);
     let veil = 0.05 + 0.11 * (u * PI).sin() * inside;
     let v = ring * 0.9 + webbing * 0.5 + spokes * 0.45 + heart + veil;
     let pigment = 0.05 + u * 0.36 + r * 0.2 + p.chroma_angle * 0.04;
@@ -731,6 +741,23 @@ mod tests {
                 "style {style} ({name}) changed only {changed} cells with audio"
             );
         }
+    }
+
+    #[test]
+    fn mandala_geometry_changes_with_audio() {
+        let area = Rect::new(0, 0, 80, 30);
+        let quiet = render(0, Reactivity::default(), area, 60);
+        let loud = render(0, loud(), area, 60);
+        let changed = quiet
+            .content
+            .iter()
+            .zip(&loud.content)
+            .filter(|(a, b)| a.symbol() != b.symbol())
+            .count();
+        assert!(
+            changed > 10,
+            "Mandala Bloom changed only {changed} glyphs with audio"
+        );
     }
 
     #[test]

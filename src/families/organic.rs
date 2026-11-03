@@ -69,6 +69,20 @@ fn random(seed: &mut u32) -> f32 {
     *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
     (*seed >> 8) as f32 / 16777216.0
 }
+
+/// Mean of a band range, clamped so a malformed snapshot cannot poison a
+/// simulation. Low/mid/high map to the three signal domains the family uses.
+fn band_mean(bands: &[f32; 32], start: usize, end: usize) -> f32 {
+    bands[start..end].iter().copied().map(unit).sum::<f32>() / (end - start) as f32
+}
+
+fn spectral(bands: &[f32; 32]) -> (f32, f32, f32) {
+    (
+        band_mean(bands, 0, 10),
+        band_mean(bands, 10, 21),
+        band_mean(bands, 21, 32),
+    )
+}
 impl Renderer {
     fn reset(&mut self, style: usize) {
         self.style = Some(style);
@@ -138,13 +152,26 @@ impl Renderer {
             }
         }
     }
-    fn grow(&mut self, style: usize, audio: &Reactivity, dt: f32) {
+    fn grow(
+        &mut self,
+        style: usize,
+        audio: &Reactivity,
+        dt: f32,
+        low: f32,
+        mid_band: f32,
+        high: f32,
+    ) {
         self.credit +=
             dt * match style {
                 1 => 48.0,
                 6 => 18.0,
                 _ => 28.0,
-            } * (0.45 + unit(audio.energy) * 1.8 + unit(audio.mid));
+            } * (0.45
+                + unit(audio.energy) * 1.8
+                + unit(audio.mid) * 0.9
+                + mid_band * 0.8
+                + low * 0.5
+                + high * 0.4);
         let steps = (self.credit as usize).min(64);
         self.credit -= steps as f32;
         for _ in 0..steps {
@@ -155,11 +182,13 @@ impl Renderer {
             let mut t = self.tips.swap_remove(index.min(self.tips.len() - 1));
             let noise = random(&mut self.rng) - 0.5;
             let length = if style == 6 {
-                0.12 * 0.74_f32.powi(t.depth as i32)
+                0.12 * 0.74_f32.powi(t.depth as i32) * (0.80 + high * 0.45)
             } else {
-                0.017
+                0.017 * (0.75 + low * 0.55 + high * 0.35)
             };
-            t.angle += noise * if style == 1 { 1.0 } else { 0.35 };
+            t.angle += noise
+                * if style == 1 { 1.0 } else { 0.35 }
+                * (0.72 + high * 0.55 + mid_band * 0.20);
             // Roots favor gravity; coral favors the light. Tree daughters diverge.
             if style == 2 {
                 t.angle += (PI * 0.5 - t.angle) * 0.07;
@@ -236,7 +265,10 @@ impl Renderer {
     }
     fn advance(&mut self, style: usize, dt: f32, audio: &Reactivity, bands: &[f32; 32]) {
         self.age += dt;
-        self.clock = (self.clock + dt * (0.4 + unit(audio.mid) * 0.65)).rem_euclid(TAU * 100.0);
+        let (low, mid_band, high) = spectral(bands);
+        self.clock = (self.clock
+            + dt * (0.4 + unit(audio.mid) * 0.65 + mid_band * 0.35 + high * 0.20))
+            .rem_euclid(TAU * 100.0);
         if self.age
             > match style {
                 1 => 30.0,
@@ -249,9 +281,10 @@ impl Renderer {
             self.reset(style);
         }
         match style {
-            0 | 1 | 2 | 6 => self.grow(style, audio, dt),
+            0 | 1 | 2 | 6 => self.grow(style, audio, dt, low, mid_band, high),
             4 => {
-                self.credit += dt * (360.0 + unit(audio.energy) * 1200.0);
+                self.credit +=
+                    dt * (360.0 + unit(audio.energy) * 1200.0 + high * 420.0 + low * 180.0);
                 let count = (self.credit as usize).min(220);
                 self.credit -= count as f32;
                 for _ in 0..count {
@@ -274,8 +307,8 @@ impl Renderer {
             }
             7 => {
                 for b in &mut self.blobs {
-                    b.p[0] += b.v[0] * dt * (1.0 + unit(audio.treble));
-                    b.p[1] += b.v[1] * dt * (1.0 + unit(audio.bass) * 3.0);
+                    b.p[0] += b.v[0] * dt * (1.0 + unit(audio.treble) + high * 0.6);
+                    b.p[1] += b.v[1] * dt * (1.0 + unit(audio.bass) * 3.0 + low * 1.2);
                     for axis in 0..2 {
                         if b.p[axis] < 0.06 || b.p[axis] > 0.94 {
                             b.p[axis] = b.p[axis].clamp(0.06, 0.94);
@@ -309,10 +342,11 @@ impl Renderer {
                                 + self.field[i + GRID_W]
                                 - 4.0 * c;
                             if style == 9 {
+                                let tension =
+                                    180.0 + unit(audio.bass) * 180.0 + low * 90.0 + high * 45.0;
+                                let damping = 1.8 + mid_band * 0.8;
                                 self.velocity[i] = (self.velocity[i]
-                                    + (lap * (180.0 + unit(audio.bass) * 180.0)
-                                        - self.velocity[i] * 1.8)
-                                        * h)
+                                    + (lap * tension - self.velocity[i] * damping) * h)
                                     .clamp(-12.0, 12.0);
                                 self.next[i] = (c + self.velocity[i] * h).clamp(-1.0, 1.0);
                             } else {
@@ -365,6 +399,7 @@ impl Renderer {
             return;
         }
         let visible = area.intersection(buf.area);
+        let (low, mid_band, high) = spectral(bands);
         let bg = theme.sample(palette, 0.0, 0.0);
         for y in visible.y..visible.bottom() {
             for x in visible.x..visible.right() {
@@ -426,20 +461,24 @@ impl Renderer {
                 }
             }
             3 => {
-                let extent = (self.age * (0.055 + unit(audio.energy) * 0.025)).min(0.88);
+                let extent = (self.age
+                    * (0.055 + unit(audio.energy) * 0.025 + low * 0.018 + high * 0.012))
+                    .min(0.88);
                 let count = (extent * 180.0) as usize;
                 let mut previous = [0.5, 0.96];
                 for i in 1..=count {
                     let t = i as f32 / 180.0;
                     let p = [
-                        0.5 + (t * 12.0 - self.clock).sin() * t * (0.17 + unit(audio.mid) * 0.1),
+                        0.5 + (t * 12.0 - self.clock).sin()
+                            * t
+                            * (0.17 + unit(audio.mid) * 0.1 + mid_band * 0.08),
                         0.96 - t,
                     ];
                     canvas.line(previous, p, ' ', 0.30, 0.65);
                     if i % 10 == 0 {
                         let side = if (i / 10) % 2 == 0 { 1.0 } else { -1.0 };
                         let leaf = [
-                            p[0] + side * (0.05 + unit(bands[i % 32]) * 0.045),
+                            p[0] + side * (0.05 + unit(bands[i % 32]) * 0.045 + high * 0.02),
                             p[1] - 0.025,
                         ];
                         canvas.line(p, leaf, '╱', 0.4, 0.55);
@@ -450,21 +489,23 @@ impl Renderer {
             }
             4 => {
                 for (i, p) in self.points.iter().enumerate() {
-                    let sway = self.clock.sin() * p[1] * 0.0015;
+                    let sway = self.clock.sin() * p[1] * (0.0015 + high * 0.0012);
                     canvas.point(
                         [0.5 + p[0] * 0.14 + sway, 0.94 - p[1] * 0.087],
                         if i % 7 == 0 { '⠿' } else { '⠂' },
                         0.31 + p[1] * 0.012,
-                        0.52 + unit(audio.treble) * 0.18,
+                        0.52 + unit(audio.treble) * 0.18 + high * 0.10,
                     );
                 }
             }
             5 => {
-                let n = (16.0 + self.age * (14.0 + unit(audio.energy) * 22.0)).min(620.0) as usize;
+                let n = (16.0
+                    + self.age * (14.0 + unit(audio.energy) * 22.0 + low * 10.0 + high * 8.0))
+                    .min(620.0) as usize;
                 // The golden angle packs each new floret between older florets.
                 let golden_angle = PI * (3.0 - 5.0_f32.sqrt());
                 for i in (0..n).rev() {
-                    let r = 0.016 * (i as f32).sqrt();
+                    let r = 0.016 * (i as f32).sqrt() * (0.85 + mid_band * 0.25);
                     let a = i as f32 * golden_angle + self.clock * 0.07;
                     let p = [0.5 + r * a.cos(), 0.5 + r * a.sin()];
                     canvas.point(
@@ -485,7 +526,12 @@ impl Renderer {
                 let blobs: Vec<_> = self
                     .blobs
                     .iter()
-                    .map(|b| (b.p, b.radius * (1.0 + unit(audio.bass) * 0.25)))
+                    .map(|b| {
+                        (
+                            b.p,
+                            b.radius * (1.0 + unit(audio.bass) * 0.25 + low * 0.15 + high * 0.10),
+                        )
+                    })
                     .collect();
                 for y in visible.y..visible.bottom() {
                     for x in visible.x..visible.right() {
@@ -537,7 +583,13 @@ impl Renderer {
                                 } else {
                                     '▓'
                                 };
-                                canvas.cell(x, y, mark, 0.6 + v * 0.2, (v.sqrt() * 1.4).min(0.8));
+                                canvas.cell(
+                                    x,
+                                    y,
+                                    mark,
+                                    0.6 + v * 0.2 + mid_band * 0.08,
+                                    (v.sqrt() * 1.4).min(0.8) + high * 0.08,
+                                );
                             }
                         } else {
                             let slope = self.field[gy * GRID_W + (gx + 1).min(GRID_W - 1)] - v;
@@ -632,7 +684,7 @@ impl Canvas<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn run(style: usize, audio: &Reactivity) -> (Renderer, Buffer) {
+    fn run_bands(style: usize, audio: &Reactivity, bands: &[f32; 32]) -> (Renderer, Buffer) {
         let mut r = Renderer::default();
         let mut b = Buffer::empty(Rect::new(0, 0, 80, 30));
         for i in 0..240 {
@@ -642,12 +694,16 @@ mod tests {
                 i as f32 / 30.0,
                 style,
                 0,
-                &[0.5; 32],
+                bands,
                 audio,
                 &Theme::default(),
             );
         }
         (r, b)
+    }
+
+    fn run(style: usize, audio: &Reactivity) -> (Renderer, Buffer) {
+        run_bands(style, audio, &[0.5; 32])
     }
     #[test]
     fn all_styles_clip_to_intersection() {
@@ -709,6 +765,34 @@ mod tests {
             assert_ne!(qs, symbols(&l), "no structural response in style {style}");
         }
     }
+    #[test]
+    fn every_style_responds_to_spectral_domains() {
+        let quiet = Reactivity::default();
+        let low: [f32; 32] = std::array::from_fn(|i| if i < 10 { 0.95 } else { 0.05 });
+        let high: [f32; 32] = std::array::from_fn(|i| if i >= 21 { 0.95 } else { 0.05 });
+        let cells = |b: &Buffer| {
+            b.content
+                .iter()
+                .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+                .collect::<Vec<_>>()
+        };
+        for style in 0..NAMES.len() {
+            let (_, base) = run_bands(style, &quiet, &[0.5; 32]);
+            let (_, low_run) = run_bands(style, &quiet, &low);
+            let (_, high_run) = run_bands(style, &quiet, &high);
+            assert_ne!(
+                cells(&base),
+                cells(&low_run),
+                "style {style} ignores low bands"
+            );
+            assert_ne!(
+                cells(&base),
+                cells(&high_run),
+                "style {style} ignores high bands"
+            );
+        }
+    }
+
     #[test]
     fn simulations_stay_finite_bounded_and_time_jumps_are_capped() {
         for style in 0..NAMES.len() {
