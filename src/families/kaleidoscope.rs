@@ -409,7 +409,7 @@ impl Params {
             energy: unit(audio.energy),
             kick: unit(audio.kick),
             beat: unit(audio.beat),
-            beat_phase: unit(audio.beat_phase),
+            beat_phase: unit(audio.locked_beat_phase()),
             impact: renderer.impact,
             centroid: unit(audio.centroid),
             flatness: unit(audio.flatness),

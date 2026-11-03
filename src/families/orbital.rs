@@ -437,7 +437,7 @@ impl Renderer {
         let l4 = [0.0, 0.83];
         let l5 = [0.0, -0.83];
         let levels = [-4.2_f32, -3.2, -2.55, -2.10, -1.80, -1.57, -1.39];
-        let trojan = t * 0.65 + unit(audio.beat_phase) * TAU;
+        let trojan = t * 0.65 + unit(audio.locked_beat_phase()) * TAU;
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
@@ -513,7 +513,7 @@ impl Renderer {
     ) {
         let sun_r = 0.60 + unit(audio.bass) * 0.05;
         let moon_r = 0.63 + unit(audio.mid) * 0.02;
-        let cycle = (t * 0.072 + unit(audio.beat_phase) * 0.12).fract();
+        let cycle = (t * 0.072 + unit(audio.locked_beat_phase()) * 0.12).fract();
         let mx = (cycle * 2.5 - 1.25) * sun_r;
         let my = -0.03 + 0.06 * (t * 0.31).sin();
         let energy = unit(audio.energy);
@@ -894,7 +894,7 @@ impl Renderer {
                     v * v * p0[1] + 2.0 * v * u * p1[1] + u * u * p2[1],
                 ]
             };
-            let progress = (t * 0.085 + unit(audio.beat_phase) * 0.15).fract();
+            let progress = (t * 0.085 + unit(audio.locked_beat_phase()) * 0.15).fract();
             let last = (progress * 90.0) as usize;
             for k in 0..last {
                 let u = k as f32 / 90.0;
@@ -923,7 +923,7 @@ impl Renderer {
         let (mx, my, mr) = (0.88_f32, -0.02_f32, 0.62_f32);
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
-        let lib = 0.22 * (t * 0.52 + unit(audio.beat_phase) * 0.6).sin();
+        let lib = 0.22 * (t * 0.52 + unit(audio.locked_beat_phase()) * 0.6).sin();
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
@@ -1045,7 +1045,7 @@ impl Renderer {
             1.58,
             2.08,
         ];
-        let pulse_r = unit(audio.beat_phase) * 2.35;
+        let pulse_r = unit(audio.locked_beat_phase()) * 2.35;
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {

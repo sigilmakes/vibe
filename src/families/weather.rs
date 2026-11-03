@@ -141,7 +141,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.14 + v * 0.30,
         _ => 0.18 + u * 0.28,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.beat_phase) * 0.05).rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
 }
 
 struct Cloud {
@@ -771,7 +771,7 @@ impl Renderer {
         let energy = unit(audio.energy);
         let treble = unit(audio.treble);
         let sweep =
-            t * (0.7 + energy * 1.1) + unit(audio.beat_phase) * TAU + unit(audio.centroid) * 2.0;
+            t * (0.7 + energy * 1.1) + unit(audio.locked_beat_phase()) * TAU + unit(audio.centroid) * 2.0;
         for j in 0..h {
             let v = j as f32 / fh;
             for i in 0..w {

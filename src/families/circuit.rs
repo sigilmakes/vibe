@@ -148,7 +148,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.60 + u * 0.30,
         _ => 0.15 + u * 0.20 + v * 0.20,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.beat_phase) * 0.05).rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
 }
 
 struct Net {
@@ -509,7 +509,7 @@ impl Renderer {
             }
         }
         // Clock distribution spine and taps.
-        let spine_x = ((0.04 + 0.92 * unit(audio.beat_phase)) * w as f32).round() as i32;
+        let spine_x = ((0.04 + 0.92 * unit(audio.locked_beat_phase())) * w as f32).round() as i32;
         let spine = 0.25 + unit(audio.beat) * 0.5;
         for y in 0..h as i32 {
             self.canvas.plot(spine_x, y, '┃', spine);
@@ -676,7 +676,7 @@ impl Renderer {
         let fw = w as f32;
         let fh = h as f32;
         let pulse =
-            (t * 1.3 + unit(audio.beat_phase) * 1.6 + unit(audio.bass) * 1.1).rem_euclid(6.2);
+            (t * 1.3 + unit(audio.locked_beat_phase()) * 1.6 + unit(audio.bass) * 1.1).rem_euclid(6.2);
         for b in &self.tree {
             let d = b.depth as f32;
             let ring = (-((d + 0.5 - pulse) * (d + 0.5 - pulse)) * 1.8).exp();
@@ -825,7 +825,7 @@ impl Renderer {
         );
         route.push([right, ys[row] as f32]);
         let s =
-            (t * (0.18 + unit(audio.bass) * 0.2) + unit(audio.beat_phase) * 0.5).rem_euclid(1.0);
+            (t * (0.18 + unit(audio.bass) * 0.2) + unit(audio.locked_beat_phase()) * 0.5).rem_euclid(1.0);
         for tail in 0..4 {
             let p = point_along(&route, (s - tail as f32 * 0.012).rem_euclid(1.0));
             self.canvas.dot(

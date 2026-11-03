@@ -139,8 +139,8 @@ impl Renderer {
         let [bass, mid, treble, kick, onset, centroid, flatness] = self.env;
         let energy = unit(audio.energy);
         let beat = unit(audio.beat);
-        let beat_phase = if audio.beat_phase.is_finite() {
-            audio.beat_phase.rem_euclid(1.0)
+        let beat_phase = if audio.locked_beat_phase().is_finite() {
+            audio.locked_beat_phase().rem_euclid(1.0)
         } else {
             0.0
         };

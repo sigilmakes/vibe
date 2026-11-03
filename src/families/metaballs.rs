@@ -239,7 +239,7 @@ impl Renderer {
                         let radius = 0.09
                             + 0.025 * unit(bands[(i * 3) % 32])
                             + 0.015 * mid
-                            + 0.012 * (audio.beat_phase * TAU + i as f32).sin();
+                            + 0.012 * (audio.locked_beat_phase() * TAU + i as f32).sin();
                         self.blobs.push(Blob::round(x, y, radius));
                     }
                 }
