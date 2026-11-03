@@ -837,7 +837,7 @@ fn volcanic_rift(s: &mut Scene<'_>) {
                 let h = (apex - v).max(0.0);
                 let centre = 0.5 + 0.10 * (h * 6.0 + s.t * 0.6).sin();
                 let width = 0.03 + h * 0.26;
-                let dens = (-((u - centre) / width).powi(2))
+                let dens = (-((u - centre) / width).powi(2)).exp()
                     * (0.4 + 0.8 * s.treble)
                     * (0.7 + 0.4 * s.kick)
                     * (1.0 - h * 0.35);
