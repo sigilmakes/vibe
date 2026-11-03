@@ -38,6 +38,12 @@ fn hash(x: i32, y: i32) -> f32 {
 pub struct Renderer {
     last_time: Option<f32>,
     clock: f32,
+    /// Bass-driven orbital precession shared by the comet and diagram scenes.
+    precession: f32,
+    /// Decaying attack envelope from the transient channels.
+    burst: f32,
+    /// Fraction of the encounter path the ship has flown.
+    ship: f32,
     xs: Vec<f32>,
     ys: Vec<f32>,
 }
@@ -53,8 +59,17 @@ impl Renderer {
             .last_time
             .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.05));
         self.last_time = Some(now);
+        let bass = unit(audio.bass);
         // Audio only scales the clock; every scene keeps its own fixed tempo.
-        self.clock += dt * (0.6 + unit(audio.energy) * 0.9 + unit(audio.bass) * 0.2);
+        self.clock += dt * (0.6 + unit(audio.energy) * 0.9 + bass * 0.2);
+        // Bass advances the orbit frame, so radius and precession answer the
+        // low end instead of leaving the diagrams fixed.
+        self.precession = (self.precession + dt * (0.02 + bass * 0.55)).rem_euclid(TAU);
+        let attack = unit(audio.transients[0])
+            .max(unit(audio.transients[1]))
+            .max(unit(audio.onset));
+        self.burst = (self.burst * (-dt * 2.6).exp()).max(attack);
+        self.ship = (self.ship + dt * (0.09 + unit(audio.energy) * 0.25)).fract();
     }
 
     fn project(&mut self, area: Rect, visible: Rect) {
@@ -126,6 +141,180 @@ fn sprinkle_stars(
 
 fn body_light(dx: f32, dy: f32, z: f32) -> f32 {
     (0.12 + 0.88 * (dx * -0.55 + dy * -0.45 + z * 0.70).max(0.0)).clamp(0.0, 1.0)
+}
+
+/// Heliocentric ellipse for the comet. `a` grows with bass, so the head's
+/// orbital radius answers the low end while `rot` carries the shared
+/// bass-driven precession.
+struct CometOrbit {
+    star: [f32; 2],
+    a: f32,
+    b: f32,
+    e: f32,
+    rot: f32,
+}
+
+impl CometOrbit {
+    fn new(bass: f32, precession: f32) -> Self {
+        let e: f32 = 0.55;
+        let a = 0.78 + unit(bass) * 0.16;
+        Self {
+            star: [0.60, 0.06],
+            a,
+            // Flatten the orbit so the anti-solar tail runs across the canvas
+            // instead of climbing out of the top.
+            b: a * 0.26,
+            e,
+            rot: 0.10 + precession,
+        }
+    }
+
+    fn anomaly(clock: f32) -> f32 {
+        clock * 0.5 + 1.1
+    }
+
+    fn focus(&self, anomaly: f32) -> [f32; 2] {
+        let x0 = self.a * (anomaly.cos() - self.e);
+        let y0 = self.b * anomaly.sin();
+        let (cr, sr) = (self.rot.cos(), self.rot.sin());
+        [
+            self.star[0] + x0 * cr - y0 * sr,
+            self.star[1] + x0 * sr + y0 * cr,
+        ]
+    }
+}
+
+/// Hyperbolic flyby around the assist planet. A stronger attack lowers the
+/// periapsis and raises the eccentricity, so the same ship visibly bends more
+/// around the planet instead of riding a fixed curve.
+struct AssistPath {
+    center: [f32; 2],
+    e: f32,
+    rp: f32,
+    p: f32,
+    span: f32,
+    theta: f32,
+}
+
+impl AssistPath {
+    fn new(burst: f32) -> Self {
+        let burst = unit(burst);
+        let e = 1.90 - burst * 0.70;
+        let rp = 0.52 - burst * 0.16;
+        Self {
+            center: [0.30, 0.05],
+            e,
+            rp,
+            p: rp * (1.0 + e),
+            span: (-1.0 / e).acos() * 0.80,
+            theta: -std::f32::consts::FRAC_PI_2,
+        }
+    }
+
+    /// Points along the flown path, `u` in [0, 1] from entry to exit.
+    fn point(&self, u: f32) -> [f32; 2] {
+        let nu = (u.clamp(0.0, 1.0) * 2.0 - 1.0) * self.span;
+        let r = self.p / (1.0 + self.e * nu.cos()).max(0.02);
+        let a = self.theta + nu;
+        [self.center[0] + r * a.cos(), self.center[1] + r * a.sin()]
+    }
+
+    fn periapsis(&self) -> [f32; 2] {
+        [
+            self.center[0] + self.rp * self.theta.cos(),
+            self.center[1] + self.rp * self.theta.sin(),
+        ]
+    }
+
+    /// Total turn between the incoming and outgoing asymptotes.
+    fn bend(&self) -> f32 {
+        2.0 * (1.0 / self.e).asin()
+    }
+}
+
+/// Two-body frame and five Lagrange points in world space. Bass sets the mass
+/// ratio and separation; precession rotates the whole diagram.
+struct Lagrange {
+    m2: f32,
+    sep: f32,
+    rot: f32,
+    x1: f32,
+    x2: f32,
+    l: [[f32; 2]; 5],
+}
+
+impl Lagrange {
+    fn new(bass: f32, precession: f32) -> Self {
+        let m2 = 0.30 + unit(bass) * 0.26;
+        let sep = 0.96 + unit(bass) * 0.20;
+        let x1 = -sep * m2 / (1.0 + m2);
+        let x2 = sep / (1.0 + m2);
+        let mid = (x1 + x2) * 0.5;
+        let drift = m2 - 0.30;
+        Self {
+            m2,
+            sep,
+            rot: precession,
+            x1,
+            x2,
+            l: [
+                [x2 - 0.20 - 0.08 * drift, 0.0],
+                [x2 + 0.17 + 0.06 * drift, 0.0],
+                [x1 - 0.56 - 0.10 * drift, 0.0],
+                [mid, sep * 0.866],
+                [mid, -sep * 0.866],
+            ],
+        }
+    }
+
+    fn to_body(&self, p: [f32; 2]) -> [f32; 2] {
+        let (cr, sr) = (self.rot.cos(), self.rot.sin());
+        [p[0] * cr + p[1] * sr, -p[0] * sr + p[1] * cr]
+    }
+
+    fn to_world(&self, p: [f32; 2]) -> [f32; 2] {
+        let (cr, sr) = (self.rot.cos(), self.rot.sin());
+        [p[0] * cr - p[1] * sr, p[0] * sr + p[1] * cr]
+    }
+
+    fn points_world(&self) -> [[f32; 2]; 5] {
+        self.l.map(|p| self.to_world(p))
+    }
+}
+
+/// Surface endpoints of the tidal bridge, from the moon's near face to the
+/// planet's near face.
+fn tidal_bridge(planet: [f32; 2], pr: f32, moon: [f32; 2], mr: f32) -> ([f32; 2], [f32; 2]) {
+    let mut dir = [planet[0] - moon[0], planet[1] - moon[1]];
+    let d = dir[0].hypot(dir[1]).max(0.001);
+    dir = [dir[0] / d, dir[1] / d];
+    (
+        [moon[0] + dir[0] * mr, moon[1] + dir[1] * mr],
+        [planet[0] - dir[0] * pr, planet[1] - dir[1] * pr],
+    )
+}
+
+/// The locked pair. Bass opens the moon's orbit, and the bodies share a
+/// flattened barycentric orbit so the diagram is not frozen in place.
+fn tidal_bodies(bass: f32, precession: f32) -> ([f32; 2], f32, [f32; 2], f32) {
+    let bass = unit(bass);
+    let pr = 1.28;
+    let mr = 0.62;
+    let gap = 0.28 + bass * 0.18;
+    let sep = pr + mr + gap;
+    let bary = [-0.11, 0.02];
+    let planet_share = mr / (pr + mr);
+    let moon_share = pr / (pr + mr);
+    let (cr, sr) = (precession.cos(), precession.sin());
+    let p = [
+        bary[0] - cr * sep * planet_share,
+        bary[1] - sr * sep * planet_share * 0.30,
+    ];
+    let m = [
+        bary[0] + cr * sep * moon_share,
+        bary[1] + sr * sep * moon_share * 0.30,
+    ];
+    (p, pr, m, mr)
 }
 
 struct Canvas<'a> {
@@ -430,27 +619,25 @@ impl Renderer {
         palette: usize,
         t: f32,
     ) {
-        let m2 = 0.30 + unit(audio.bass) * 0.26;
-        let x1 = -0.48_f32;
-        let x2 = 0.48_f32;
-        let l1 = [x2 - 0.20, 0.0];
-        let l2 = [x2 + 0.17, 0.0];
-        let l3 = [x1 - 0.56, 0.0];
-        let l4 = [0.0, 0.83];
-        let l5 = [0.0, -0.83];
+        let lg = Lagrange::new(unit(audio.bass), self.precession);
         let levels = [-4.2_f32, -3.2, -2.55, -2.10, -1.80, -1.57, -1.39];
+        let level_scale = 1.0 / lg.sep;
         let trojan = t * 0.65 + unit(audio.locked_beat_phase()) * TAU;
+        let trojan_r = 0.15 + self.burst * 0.15;
+        let trojan_count = 4 + (self.burst * 8.0) as usize;
+        let points = lg.points_world();
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
             for (i, &x) in xs.iter().enumerate() {
-                let r1 = ((x - x1).powi(2) + y * y + 0.015).sqrt();
-                let r2 = ((x - x2).powi(2) + y * y + 0.015).sqrt();
-                let r = (x * x + y * y).sqrt();
-                let u = -1.0 / r1 - m2 / r2 - 0.30 * r * r;
+                let b = lg.to_body([x, y]);
+                let r1 = ((b[0] - lg.x1).powi(2) + b[1] * b[1] + 0.015).sqrt();
+                let r2 = ((b[0] - lg.x2).powi(2) + b[1] * b[1] + 0.015).sqrt();
+                let r = (b[0] * b[0] + b[1] * b[1]).sqrt();
+                let u = -1.0 / r1 - lg.m2 / r2 - 0.30 * r * r;
                 let mut near = f32::MAX;
                 for level in levels {
-                    near = near.min((u - level).abs());
+                    near = near.min((u - level * level_scale).abs());
                 }
                 let contour = (-(near * 24.0).powi(2)).exp();
                 let mut mark = ' ';
@@ -461,7 +648,7 @@ impl Renderer {
                     light = 0.18 + contour * 0.52;
                     phase = 0.44 + (u * 0.05).fract() * 0.20;
                 }
-                for (k, p) in [l1, l2, l3, l4, l5].iter().enumerate() {
+                for (k, p) in points.iter().enumerate() {
                     let d = (x - p[0]).hypot(y - p[1]);
                     if d < 0.055 {
                         mark = '◇';
@@ -469,18 +656,18 @@ impl Renderer {
                         phase = 0.68 + k as f32 * 0.03;
                     }
                     if k >= 3 {
-                        let ring = (-((d - 0.15) / 0.022).powi(2)).exp();
+                        let ring = (-((d - trojan_r) / 0.022).powi(2)).exp();
                         if ring > light * 0.9 && ring > 0.05 {
                             mark = '·';
-                            light = ring * 0.55;
+                            light = ring * (0.35 + self.burst * 0.55);
                             phase = 0.60;
                         }
-                        for n in 0..4 {
-                            let a = trojan + n as f32 * TAU / 4.0 + k as f32;
-                            let q = [p[0] + a.cos() * 0.15, p[1] + a.sin() * 0.15];
+                        for n in 0..trojan_count {
+                            let a = trojan + n as f32 * TAU / trojan_count as f32 + k as f32;
+                            let q = [p[0] + a.cos() * trojan_r, p[1] + a.sin() * trojan_r];
                             if (x - q[0]).hypot(y - q[1]) < 0.022 {
                                 mark = '•';
-                                light = 0.78;
+                                light = 0.70 + self.burst * 0.25;
                                 phase = 0.64;
                             }
                         }
@@ -687,44 +874,35 @@ impl Renderer {
     ) {
         wash(buf, visible, palette, theme, 0.55, 0.012);
         sprinkle_stars(buf, visible, palette, theme, t, 0.8);
-        let energy = unit(audio.energy);
         let bass = unit(audio.bass);
-        let star = [0.45_f32, 0.10];
-        let a = 1.00_f32;
-        let e = 0.45_f32;
-        let b = a * (1.0 - e * e).sqrt();
-        let rot = 0.15_f32;
-        let cr = rot.cos();
-        let sr = rot.sin();
-        let focus = |anomaly: f32| -> [f32; 2] {
-            let x0 = a * (anomaly.cos() - e);
-            let y0 = b * anomaly.sin();
-            [star[0] + x0 * cr - y0 * sr, star[1] + x0 * sr + y0 * cr]
-        };
-        let anom = t * 0.35 + 1.1;
-        let head = focus(anom);
-        let mut away = [head[0] - star[0], head[1] - star[1]];
+        let treble = unit(audio.treble);
+        let orbit = CometOrbit::new(bass, self.precession);
+        let anom = CometOrbit::anomaly(t);
+        let head = orbit.focus(anom);
+        let mut away = [head[0] - orbit.star[0], head[1] - orbit.star[1]];
         let d = away[0].hypot(away[1]).max(0.001);
         away = [away[0] / d, away[1] / d];
         let perp = [-away[1], away[0]];
-        let len = 1.15 + energy * 0.8 + bass * 0.45;
+        // Treble sets the tail length; attacks add a short-lived extension.
+        let len = 0.55 + treble * 0.85 + self.burst * 0.30;
         let mut c = Canvas::new(buf, area, visible, palette, theme);
-        for k in 0..60 {
-            let p0 = focus(k as f32 / 60.0 * TAU);
-            let p1 = focus((k + 1) as f32 / 60.0 * TAU);
-            c.line(p0, p1, '·', 0.50, 0.16);
+        for k in 0..72 {
+            let p0 = orbit.focus(k as f32 / 72.0 * TAU);
+            let p1 = orbit.focus((k + 1) as f32 / 72.0 * TAU);
+            c.line(p0, p1, '·', 0.50, 0.15);
         }
-        for k in 1..=26 {
-            let past = focus(anom - k as f32 * 0.035);
-            let light = (1.0 - k as f32 / 26.0) * 0.45;
+        for k in 1..=24 {
+            let past = orbit.focus(anom - k as f32 * 0.045);
+            let light = (1.0 - k as f32 / 24.0) * 0.42;
             c.plot(past, '·', 0.34, light);
         }
-        for s in 0..5 {
-            let off = (s as f32 - 2.0) * 0.020;
+        // Ion tail: straight strands whose reach follows the high end.
+        for s in 0..6 {
+            let off = (s as f32 - 2.5) * 0.022;
             let mut prev = head;
-            for i in 1..=20 {
-                let u = i as f32 / 20.0;
-                let wiggle = (u * 13.0 - t * 4.0 + s as f32).sin() * 0.014 * u;
+            for i in 1..=26 {
+                let u = i as f32 / 26.0;
+                let wiggle = (u * 13.0 - t * 4.0 + s as f32).sin() * 0.016 * u * (0.4 + treble);
                 let p = [
                     head[0] + away[0] * u * len + perp[0] * (off * (0.4 + u) + wiggle),
                     head[1] + away[1] * u * len + perp[1] * (off * (0.4 + u) + wiggle),
@@ -733,47 +911,73 @@ impl Renderer {
                     prev,
                     p,
                     '·',
-                    0.55 + s as f32 * 0.02,
-                    (1.0 - u) * 0.60 + 0.05,
+                    0.55 + s as f32 * 0.015,
+                    (1.0 - u) * 0.58 + 0.07,
                 );
                 prev = p;
             }
         }
-        let bend = 0.55 + unit(audio.mid) * 0.25;
-        for s in 0..8 {
-            let off = (s as f32 - 3.5) * 0.018;
+        // Dust tail: shorter, wider, and more curved. Attacks fan it out.
+        let bend = 0.32 + unit(audio.mid) * 0.35 + self.burst * 0.50;
+        for s in 0..9 {
+            let off = (s as f32 - 4.0) * 0.026;
             let mut prev = head;
-            for i in 1..=18 {
-                let u = i as f32 / 18.0;
+            for i in 1..=20 {
+                let u = i as f32 / 20.0;
                 let p = [
-                    head[0] + away[0] * u * len * 0.78 + perp[0] * (u * u * bend + off),
-                    head[1] + away[1] * u * len * 0.78 + perp[1] * (u * u * bend + off),
+                    head[0] + away[0] * u * len * 0.70 + perp[0] * (u * u * bend + off),
+                    head[1] + away[1] * u * len * 0.70 + perp[1] * (u * u * bend + off),
                 ];
                 c.line(
                     prev,
                     p,
                     '·',
-                    0.24 + s as f32 * 0.015,
-                    (1.0 - u) * 0.40 + 0.04,
+                    0.24 + s as f32 * 0.012,
+                    (1.0 - u) * 0.34 + 0.05,
                 );
                 prev = p;
             }
         }
-        let burst = unit(audio.transients[0]).max(unit(audio.transients[1]));
-        c.circle(head, 0.13 + burst * 0.05, '·', 0.36, 0.26 + burst * 0.3);
-        c.circle(head, 0.065, '∘', 0.40, 0.55);
-        c.plot(head, '●', 0.55, 0.96);
-        c.plot(star, '✦', 0.12, 0.95);
-        c.circle(star, 0.045, '·', 0.14, 0.60);
-        c.circle(star, 0.085, '·', 0.14, 0.32);
-        let treble = unit(audio.treble);
+        for k in 0..48 {
+            let u = (hash(k, 13) * 0.85).powf(0.8);
+            let s = (hash(k, 29) - 0.5) * (0.08 + u * 0.14);
+            let p = [
+                head[0] + away[0] * u * len + perp[0] * s,
+                head[1] + away[1] * u * len + perp[1] * s,
+            ];
+            c.plot(p, '·', 0.46, (1.0 - u) * 0.22 + 0.04);
+        }
+        c.circle(
+            head,
+            0.09 + self.burst * 0.07,
+            '·',
+            0.34,
+            0.30 + self.burst * 0.35,
+        );
+        c.circle(head, 0.05, '∘', 0.40, 0.60);
+        if self.burst > 0.04 {
+            c.circle(
+                head,
+                0.14 + self.burst * 0.30,
+                '∘',
+                0.32,
+                0.18 + self.burst * 0.55,
+            );
+        }
+        c.plot(head, '●', 0.55, 0.97);
+        c.plot(orbit.star, '✦', 0.12, 0.95);
+        c.circle(orbit.star, 0.045, '·', 0.14, 0.60);
+        c.circle(orbit.star, 0.085, '·', 0.14, 0.32);
         for k in 0..8 {
             let a = k as f32 / 8.0 * TAU + t * 0.06;
             c.line(
-                [star[0] + a.cos() * 0.04, star[1] + a.sin() * 0.04],
                 [
-                    star[0] + a.cos() * (0.10 + treble * 0.05),
-                    star[1] + a.sin() * (0.10 + treble * 0.05),
+                    orbit.star[0] + a.cos() * 0.04,
+                    orbit.star[1] + a.sin() * 0.04,
+                ],
+                [
+                    orbit.star[0] + a.cos() * (0.10 + treble * 0.05),
+                    orbit.star[1] + a.sin() * (0.10 + treble * 0.05),
                 ],
                 '·',
                 0.14,
@@ -795,9 +999,11 @@ impl Renderer {
     ) {
         wash(buf, visible, palette, theme, 0.58, 0.010);
         sprinkle_stars(buf, visible, palette, theme, t, 0.7);
-        let planet = [0.42_f32, -0.04];
-        let pull = 0.10 * (1.0 + unit(audio.bass) * 0.9);
+        let planet = [0.30_f32, 0.05];
+        let rp = 0.34_f32;
+        let bass = unit(audio.bass);
         let mid = unit(audio.mid);
+        let pull = 0.10 * (1.0 + bass * 1.2);
         {
             let mut c = Canvas::new(buf, area, visible, palette, theme);
             for gx in 0..13 {
@@ -839,7 +1045,6 @@ impl Renderer {
                 }
             }
         }
-        let rp = 0.46_f32;
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
@@ -876,38 +1081,47 @@ impl Renderer {
         }
         {
             let mut c = Canvas::new(buf, area, visible, palette, theme);
-            c.circle(planet, 0.72, '·', 0.45, 0.16);
+            let ring = 0.62 + bass * 0.22;
+            c.circle(planet, ring, '·', 0.45, 0.12 + mid * 0.05);
+            c.circle(planet, ring + 0.08, '·', 0.45, 0.08);
             let moon_a = t * 0.9;
             c.plot(
                 [
-                    planet[0] + moon_a.cos() * 0.72,
-                    planet[1] + moon_a.sin() * 0.72,
+                    planet[0] + moon_a.cos() * ring,
+                    planet[1] + moon_a.sin() * ring,
                 ],
                 '•',
                 0.60,
                 0.7,
             );
-            let xmax = area.width as f32 / area.height.max(1) as f32;
-            let p0 = [-xmax - 0.3, 0.78];
-            let p1 = [planet[0] - 0.05, planet[1] + 0.52];
-            let p2 = [xmax + 0.3, -0.82];
-            let point = |u: f32| {
-                let v = 1.0 - u;
-                [
-                    v * v * p0[0] + 2.0 * v * u * p1[0] + u * u * p2[0],
-                    v * v * p0[1] + 2.0 * v * u * p1[1] + u * u * p2[1],
-                ]
-            };
-            let progress = (t * 0.085 + unit(audio.locked_beat_phase()) * 0.15).fract();
-            let last = (progress * 90.0) as usize;
-            for k in 0..last {
-                let u = k as f32 / 90.0;
-                c.plot(point(u), '·', 0.40, 0.35 + u * 0.25);
+            // The full flyby is faintly visible from the first frame, so the
+            // encounter never starts as an empty field around one blob.
+            let path = AssistPath::new(self.burst);
+            for k in 0..=96 {
+                let u = k as f32 / 96.0;
+                c.plot(path.point(u), '·', 0.46, 0.10 + self.burst * 0.06);
             }
-            let ship = point(progress);
-            let flare = 0.4 + unit(audio.transients[3]) * 0.8;
-            c.circle(ship, 0.045, '·', 0.15, flare * 0.5);
-            c.plot(ship, '◆', 0.12, 0.95);
+            let flown = (self.ship * 96.0) as usize;
+            for k in 0..=flown {
+                let u = k as f32 / 96.0;
+                c.plot(path.point(u), '·', 0.38, 0.26 + u * 0.40);
+            }
+            let peri = path.periapsis();
+            if self.burst > 0.04 {
+                let shock = 0.16 + self.burst * (0.40 + path.bend() * 0.25);
+                c.circle(peri, shock, '◦', 0.30, 0.15 + self.burst * 0.65);
+                c.circle(peri, shock * 0.55, '·', 0.26, 0.10 + self.burst * 0.35);
+                c.plot(peri, '✦', 0.20, 0.30 + self.burst * 0.65);
+            }
+            let ship = path.point(self.ship);
+            c.circle(
+                ship,
+                0.045 + self.burst * 0.05,
+                '·',
+                0.15,
+                0.35 + self.burst * 0.40,
+            );
+            c.plot(ship, '◆', 0.12, 0.96);
         }
     }
 
@@ -924,11 +1138,14 @@ impl Renderer {
     ) {
         wash(buf, visible, palette, theme, 0.58, 0.012);
         sprinkle_stars(buf, visible, palette, theme, t, 0.7);
-        let (px, py, pr) = (-1.10_f32, 0.05_f32, 1.28_f32);
-        let (mx, my, mr) = (0.88_f32, -0.02_f32, 0.62_f32);
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
-        let lib = 0.22 * (t * 0.52 + unit(audio.locked_beat_phase()) * 0.6).sin();
+        let (planet, pr, moon, mr) = tidal_bodies(bass, self.precession);
+        let mut dir = [planet[0] - moon[0], planet[1] - moon[1]];
+        let d = dir[0].hypot(dir[1]).max(0.001);
+        dir = [dir[0] / d, dir[1] / d];
+        let perp = [-dir[1], dir[0]];
+        let lib = (0.16 + bass * 0.22) * (t * 0.52 + unit(audio.locked_beat_phase()) * 0.6).sin();
         let xs = &self.xs;
         let ys = &self.ys;
         for (j, &y) in ys.iter().enumerate() {
@@ -937,17 +1154,19 @@ impl Renderer {
                 let mut light = 0.0_f32;
                 let mut phase = 0.5_f32;
                 let mut bg_light = 0.010;
-                let mdx = (x - mx) / mr;
-                let mdy = (y - my) / mr;
-                let meff = mdx.hypot(mdy);
+                let dx = (x - moon[0]) / mr;
+                let dy = (y - moon[1]) / mr;
+                let lx = dx * dir[0] + dy * dir[1];
+                let ly = -dx * dir[1] + dy * dir[0];
+                let meff = lx.hypot(ly);
                 let bulge = 0.12 * (1.0 + bass * 1.1);
-                let limit = 1.0 + bulge * (-mdx).max(0.0);
+                let limit = 1.0 + bulge * lx.max(0.0);
                 if meff < limit {
                     let z = (1.0 - (meff / limit).powi(2)).max(0.0).sqrt();
-                    let lon = mdx.atan2(z.max(0.06)) + lib;
-                    let lat = mdy.clamp(-1.0, 1.0).asin();
+                    let lon = lx.atan2(z.max(0.06)) + lib;
+                    let lat = ly.clamp(-1.0, 1.0).asin();
                     let ch = hash((lon * 3.2).floor() as i32, (lat * 5.5).floor() as i32);
-                    let mut l = (0.10 + 0.90 * (-mdx * 0.82 + z * 0.38).max(0.0) + treble * 0.06)
+                    let mut l = (0.10 + 0.90 * (-dx * 0.82 + z * 0.38).max(0.0) + treble * 0.06)
                         .clamp(0.0, 1.0);
                     if ch > 0.82 {
                         l *= 0.55;
@@ -966,9 +1185,9 @@ impl Renderer {
                     light = l;
                     phase = 0.42 + ch * 0.12;
                     bg_light = 0.012 + l * 0.05;
-                } else if (x - px).hypot(y - py) < pr {
-                    let dx = (x - px) / pr;
-                    let dy = (y - py) / pr;
+                } else if (x - planet[0]).hypot(y - planet[1]) < pr {
+                    let dx = (x - planet[0]) / pr;
+                    let dy = (y - planet[1]) / pr;
                     let z = (1.0 - (dx * dx + dy * dy).clamp(0.0, 1.0)).max(0.0).sqrt();
                     let band = 0.5 + 0.5 * (dy * 21.0 + (dx * 5.0 + t * 0.12).sin() * 2.2).sin();
                     let l = (body_light(dx, dy, z) * (0.72 + 0.28 * band)).clamp(0.0, 1.0);
@@ -992,7 +1211,7 @@ impl Renderer {
                     mark,
                     phase,
                     light,
-                    0.55 + mdy * 0.03,
+                    0.55 + dy * 0.03,
                     bg_light,
                     palette,
                     theme,
@@ -1001,28 +1220,61 @@ impl Renderer {
         }
         {
             let mut c = Canvas::new(buf, area, visible, palette, theme);
-            for s in 0..3 {
-                let lift = (s as f32 - 1.0) * 0.16;
-                let start = [mx - 0.48, my + lift * 0.4];
-                let control = [0.10, my + lift + 0.22 * (1.0 + bass)];
-                let end = [px + pr * 0.55, py + lift * 0.5];
-                let mut prev = start;
+            let sep = d;
+            let (near, far) = tidal_bridge(planet, pr, moon, mr);
+            let mid = [(near[0] + far[0]) * 0.5, (near[1] + far[1]) * 0.5];
+            for k in 0..96 {
+                let a = k as f32 / 96.0 * TAU;
+                c.plot(
+                    [
+                        planet[0] + dir[0] * sep * a.cos() + perp[0] * sep * 0.30 * a.sin(),
+                        planet[1] + dir[1] * sep * a.cos() + perp[1] * sep * 0.30 * a.sin(),
+                    ],
+                    '·',
+                    0.40,
+                    0.10 + bass * 0.05,
+                );
+            }
+            let strands = 3 + (self.burst * 3.0) as usize;
+            for s in 0..strands {
+                let spread = (s as f32 - (strands as f32 - 1.0) * 0.5) * 0.06;
+                let bow = 0.18 * (1.0 + bass) + spread;
+                let control = [mid[0] + perp[0] * bow, mid[1] + perp[1] * bow];
+                let mut prev = near;
                 for k in 1..=24 {
                     let u = k as f32 / 24.0;
                     let v = 1.0 - u;
                     let p = [
-                        v * v * start[0] + 2.0 * v * u * control[0] + u * u * end[0],
-                        v * v * start[1] + 2.0 * v * u * control[1] + u * u * end[1],
+                        v * v * near[0] + 2.0 * v * u * control[0] + u * u * far[0],
+                        v * v * near[1] + 2.0 * v * u * control[1] + u * u * far[1],
                     ];
                     c.line(
                         prev,
                         p,
                         '·',
-                        0.34 + s as f32 * 0.04,
-                        (1.0 - u) * 0.35 + 0.05,
+                        0.34 + s as f32 * 0.03,
+                        (1.0 - u) * 0.28 + 0.06 + self.burst * 0.25,
                     );
                     prev = p;
                 }
+            }
+            if self.burst > 0.04 {
+                let h = 0.05 + self.burst * 0.22;
+                c.line(
+                    [mid[0] - perp[0] * h, mid[1] - perp[1] * h],
+                    [mid[0] + perp[0] * h, mid[1] + perp[1] * h],
+                    '·',
+                    0.32,
+                    0.20 + self.burst * 0.60,
+                );
+                c.circle(
+                    mid,
+                    0.07 + self.burst * 0.20,
+                    '·',
+                    0.30,
+                    0.12 + self.burst * 0.48,
+                );
+                c.plot(mid, '✦', 0.26, 0.25 + self.burst * 0.65);
             }
         }
     }
@@ -1271,8 +1523,12 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    fn render(style: usize, audio: &Reactivity, frames: usize) -> Buffer {
-        let area = Rect::new(0, 0, 80, 30);
+    fn area() -> Rect {
+        Rect::new(0, 0, 80, 30)
+    }
+
+    fn render_with(style: usize, audio: &Reactivity, frames: usize) -> (Renderer, Buffer) {
+        let area = area();
         let mut buf = Buffer::empty(area);
         let mut renderer = Renderer::default();
         for frame in 0..frames {
@@ -1287,7 +1543,75 @@ mod tests {
                 &Theme::default(),
             );
         }
-        buf
+        (renderer, buf)
+    }
+
+    fn render(style: usize, audio: &Reactivity, frames: usize) -> Buffer {
+        render_with(style, audio, frames).1
+    }
+
+    fn cell_world(col: u16, row: u16) -> [f32; 2] {
+        let area = area();
+        let scale = 2.0 / area.height as f32;
+        let cx = area.x as f32 + area.width as f32 * 0.5;
+        let cy = area.y as f32 + area.height as f32 * 0.5;
+        [
+            (col as f32 + 0.5 - cx) * scale,
+            (row as f32 + 0.5 - cy) * scale,
+        ]
+    }
+
+    fn painted(buf: &Buffer) -> usize {
+        buf.content.iter().filter(|c| c.symbol() != " ").count()
+    }
+
+    fn count_char(buf: &Buffer, glyph: char) -> usize {
+        buf.content
+            .iter()
+            .filter(|c| c.symbol() == glyph.to_string())
+            .count()
+    }
+
+    fn count_near(buf: &Buffer, p: [f32; 2], radius: f32) -> usize {
+        let mut n = 0;
+        for (i, cell) in buf.content.iter().enumerate() {
+            if cell.symbol() == " " {
+                continue;
+            }
+            let q = cell_world((i % 80) as u16, (i / 80) as u16);
+            if (q[0] - p[0]).hypot(q[1] - p[1]) < radius {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
+        (a[0] - b[0]).hypot(a[1] - b[1])
+    }
+
+    fn comet_tail_cells(renderer: &Renderer, buf: &Buffer) -> usize {
+        let orbit = CometOrbit::new(0.0, renderer.precession);
+        let head = orbit.focus(CometOrbit::anomaly(renderer.clock));
+        let mut away = [head[0] - orbit.star[0], head[1] - orbit.star[1]];
+        let d = away[0].hypot(away[1]).max(0.001);
+        away = [away[0] / d, away[1] / d];
+        let perp = [-away[1], away[0]];
+        let mut n = 0;
+        for (i, cell) in buf.content.iter().enumerate() {
+            if cell.symbol() == " " {
+                continue;
+            }
+            let p = cell_world((i % 80) as u16, (i / 80) as u16);
+            let dx = p[0] - head[0];
+            let dy = p[1] - head[1];
+            let along = dx * away[0] + dy * away[1];
+            let side = dx * perp[0] + dy * perp[1];
+            if (0.35..1.25).contains(&along) && side.abs() < 0.30 {
+                n += 1;
+            }
+        }
+        n
     }
 
     fn signature(buf: &Buffer) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
@@ -1435,6 +1759,203 @@ mod tests {
             let a = signature(&render(style, &audio, 24));
             let b = signature(&render(style, &audio, 24));
             assert_eq!(a, b, "style {style} is not deterministic");
+        }
+    }
+
+    fn attack(scale: f32) -> Reactivity {
+        Reactivity {
+            transients: [scale; 4],
+            onset: scale,
+            ..Reactivity::default()
+        }
+    }
+
+    #[test]
+    fn comet_orbit_radius_and_precession_follow_bass() {
+        let quiet = CometOrbit::new(0.0, 0.0);
+        let low = CometOrbit::new(0.9, 0.0);
+        assert!(low.a > quiet.a + 0.1, "bass must widen the orbit");
+        for anomaly in [0.0, 0.8, 1.9, 3.6, 5.1] {
+            let r0 = dist(quiet.focus(anomaly), quiet.star);
+            let r1 = dist(low.focus(anomaly), low.star);
+            assert!(
+                r1 > r0,
+                "bass must raise the orbital radius at anomaly {anomaly}"
+            );
+        }
+        let turned = CometOrbit::new(0.9, 0.6);
+        assert!(
+            dist(low.focus(0.0), turned.focus(0.0)) > 0.2,
+            "precession must rotate the orbit"
+        );
+    }
+
+    #[test]
+    fn comet_tail_visibly_extends_with_treble() {
+        let quiet = Reactivity::default();
+        let bright = Reactivity {
+            treble: 1.0,
+            ..Reactivity::default()
+        };
+        let (quiet_renderer, quiet_buf) = render_with(5, &quiet, 40);
+        let (bright_renderer, bright_buf) = render_with(5, &bright, 40);
+        // Treble alone must not move the head, so the length difference is the
+        // tail and not a different part of the orbit.
+        assert!((quiet_renderer.clock - bright_renderer.clock).abs() < 1.0e-5);
+        let quiet_tail = comet_tail_cells(&quiet_renderer, &quiet_buf);
+        let bright_tail = comet_tail_cells(&bright_renderer, &bright_buf);
+        assert!(quiet_tail > 0, "the comet needs a visible tail in silence");
+        assert!(
+            bright_tail > quiet_tail + 10,
+            "treble should lengthen the tail: {quiet_tail} -> {bright_tail}"
+        );
+    }
+
+    #[test]
+    fn gravity_assist_encounter_bends_and_clears_the_planet() {
+        let calm = AssistPath::new(0.0);
+        let hit = AssistPath::new(1.0);
+        assert!(hit.rp < calm.rp - 0.1, "attack must lower the periapsis");
+        assert!(
+            hit.bend() > calm.bend() + 0.25,
+            "attack must sharpen the flyby"
+        );
+        assert!(
+            calm.rp > 0.34 && hit.rp > 0.34,
+            "periapsis must clear the planet"
+        );
+        for path in [calm, hit] {
+            let entry = path.point(0.0);
+            let exit = path.point(1.0);
+            assert!(
+                entry[0] < path.center[0],
+                "entry must approach from the left"
+            );
+            assert!(exit[0] > path.center[0], "exit must leave to the right");
+            assert!(entry.iter().chain(exit.iter()).all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn gravity_assist_shows_an_encounter_not_one_blob() {
+        let (_, quiet) = render_with(6, &Reactivity::default(), 40);
+        let (_, loud) = render_with(6, &attack(0.95), 40);
+        assert_eq!(
+            count_char(&quiet, '◦'),
+            0,
+            "silence should not draw the shock ring"
+        );
+        assert!(
+            count_char(&loud, '◦') > 12,
+            "an attack should ring the periapsis, not just brighten the planet"
+        );
+        assert_eq!(count_char(&quiet, '◆'), 1, "the ship stays visible");
+        assert!(
+            painted(&quiet) > 800,
+            "the flyby path must fill the field from the first frames"
+        );
+    }
+
+    #[test]
+    fn lagrange_bass_opens_the_pair_and_attacks_bloom_the_trojans() {
+        let calm = Lagrange::new(0.0, 0.0);
+        let low = Lagrange::new(0.9, 0.0);
+        assert!(
+            low.sep > calm.sep + 0.15,
+            "bass must widen the two-body separation"
+        );
+        let l4_calm = calm.points_world()[3];
+        let l4_low = low.points_world()[3];
+        assert!(dist(l4_calm, l4_low) > 0.1, "bass must move the L4 point");
+        let (quiet_renderer, quiet) = render_with(2, &Reactivity::default(), 40);
+        let (loud_renderer, loud) = render_with(2, &attack(0.95), 40);
+        let quiet_l4 = Lagrange::new(0.0, quiet_renderer.precession).points_world()[3];
+        let loud_l4 = Lagrange::new(0.0, loud_renderer.precession).points_world()[3];
+        assert!(
+            count_near(&quiet, quiet_l4, 0.45) > 20,
+            "the L4 region must be painted in silence"
+        );
+        assert!(
+            count_char(&loud, '•') > count_char(&quiet, '•') + 4,
+            "the transient should expand the trojan bloom"
+        );
+        assert!(
+            count_near(&loud, loud_l4, 0.45) > 20,
+            "the L4 region must stay painted"
+        );
+    }
+
+    #[test]
+    fn tidal_lock_opens_the_orbit_and_flares_the_bridge_on_attack() {
+        let (p0, _, m0, _) = tidal_bodies(0.0, 0.0);
+        let (p1, _, m1, _) = tidal_bodies(0.9, 0.0);
+        assert!(
+            dist(p1, m1) > dist(p0, m0) + 0.1,
+            "bass must open the moon's orbit"
+        );
+        let (quiet_renderer, quiet) = render_with(7, &Reactivity::default(), 40);
+        let (loud_renderer, loud) = render_with(7, &attack(0.95), 40);
+        let (p, pr, m, mr) = tidal_bodies(0.0, quiet_renderer.precession);
+        let (pl, prl, ml, mrl) = tidal_bodies(0.0, loud_renderer.precession);
+        let (near, far) = tidal_bridge(p, pr, m, mr);
+        let (near_loud, far_loud) = tidal_bridge(pl, prl, ml, mrl);
+        let mid = [(near[0] + far[0]) * 0.5, (near[1] + far[1]) * 0.5];
+        let mid_loud = [
+            (near_loud[0] + far_loud[0]) * 0.5,
+            (near_loud[1] + far_loud[1]) * 0.5,
+        ];
+        assert!(
+            count_near(&loud, mid_loud, 0.3) > count_near(&quiet, mid, 0.3) + 10,
+            "the attack should light the tidal bridge between the bodies"
+        );
+        for body in [p0, p1, m0, m1] {
+            assert!(body.iter().all(|v| v.is_finite() && v.abs() < 2.6));
+        }
+    }
+
+    #[test]
+    fn envelopes_stay_bounded_under_extreme_audio() {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(area());
+        let loud = Reactivity {
+            energy: 1.0,
+            bass: 1.0,
+            mid: 1.0,
+            treble: 1.0,
+            onset: 1.0,
+            transients: [1.0; 4],
+            ..Reactivity::default()
+        };
+        let broken = Reactivity {
+            energy: f32::NAN,
+            bass: f32::INFINITY,
+            transients: [f32::NAN, f32::INFINITY, -3.0, 2.0],
+            ..Reactivity::default()
+        };
+        for frame in 0..600 {
+            let audio = if frame % 3 == 0 { &broken } else { &loud };
+            let time = if frame % 17 == 0 {
+                f32::NAN
+            } else {
+                frame as f32 / 60.0
+            };
+            renderer.draw(
+                &mut buf,
+                area(),
+                time,
+                frame % NAMES.len(),
+                0,
+                &[f32::NAN; 32],
+                audio,
+                &Theme::default(),
+            );
+            assert!(renderer.burst.is_finite());
+            assert!((0.0..=1.0).contains(&renderer.burst));
+            assert!(renderer.precession.is_finite());
+            assert!((0.0..TAU).contains(&renderer.precession));
+            assert!(renderer.ship.is_finite());
+            assert!((0.0..1.0).contains(&renderer.ship));
+            assert!(renderer.clock.is_finite());
         }
     }
 }
