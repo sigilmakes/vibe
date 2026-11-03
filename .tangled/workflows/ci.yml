@@ -1,51 +1,42 @@
 when:
   - event: push
+    branch: [main]
+  - event: pull_request
     branch: ["**"]
+  - event: manual
 
 engine: microvm
 image: nixos
-dependencies: [git]
+dependencies: [git, zstd]
 
 environment:
   CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
   CARGO_HOME: ".cargo"
+  NIX_CONFIG: "experimental-features = nix-command flakes"
+  RUST_BACKTRACE: "1"
 
 cache:
   - key: vibe-cargo
-    hash: [Cargo.lock]
+    hash: [Cargo.lock, flake.lock]
+    fallback: true
     paths: [".cargo", "target"]
 
-steps:
-  - name: "Configure Nix"
-    command: |
-      ulimit -n 65536
-      mkdir -p "$HOME/.config/nix"
-      cat >> "$HOME/.config/nix/nix.conf" <<'EOF'
-      extra-substituters = https://cache.nixos.org
-      extra-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
-      EOF
+substituters:
+  https://cache.nixos.org: "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 
+steps:
   - name: "Flake check"
-    command: |
-      export NIX_CONFIG="experimental-features = nix-command flakes"
-      nix flake check --no-build --max-jobs 1
+    command: nix flake check --no-build
 
   - name: "Nix build"
-    command: |
-      export NIX_CONFIG="experimental-features = nix-command flakes"
-      nix build .#default --no-link --max-jobs 1 --cores 2
+    command: nix build .#default --no-link --max-jobs 1 --cores 2
 
   - name: "Format"
-    command: |
-      export NIX_CONFIG="experimental-features = nix-command flakes"
-      nix develop --command cargo fmt --check
+    command: nix develop --command cargo fmt --check
 
   - name: "Clippy"
-    command: |
-      export NIX_CONFIG="experimental-features = nix-command flakes"
-      nix develop --command cargo clippy --all-targets -- -D warnings
+    command: nix develop --command cargo clippy --all-targets --locked -- -D warnings
 
   - name: "Tests"
-    command: |
-      export NIX_CONFIG="experimental-features = nix-command flakes"
-      nix develop --command cargo test --all-targets
+    command: nix develop --command cargo test --all-targets --locked
