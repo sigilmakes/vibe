@@ -42,6 +42,15 @@ enum Family {
     Typography,
     Organic,
     FractalMath,
+    Circuit,
+    Metaballs,
+    Fluid,
+    Tunnel,
+    Kaleidoscope,
+    Weather,
+    Terrain,
+    Textile,
+    Orbital,
 }
 
 /// Tag vocabulary shared by every scene. Filters match against these.
@@ -87,6 +96,15 @@ const fn scene_tags(family: Family, local: usize) -> &'static [&'static str] {
         Family::Typography => &["structure", "minimal", "geometric"],
         Family::Organic => &["organic", "flow", "calm"],
         Family::FractalMath => &["fractal", "dense", "structure"],
+        Family::Circuit => &["structure", "geometric", "bright"],
+        Family::Metaballs => &["organic", "flow", "calm"],
+        Family::Fluid => &["flow", "organic", "calm"],
+        Family::Tunnel => &["geometric", "flow", "dark"],
+        Family::Kaleidoscope => &["geometric", "bright", "structure"],
+        Family::Weather => &["chaotic", "flow", "dark"],
+        Family::Terrain => &["structure", "organic", "calm"],
+        Family::Textile => &["structure", "geometric", "minimal"],
+        Family::Orbital => &["geometric", "calm", "dark"],
     }
 }
 
@@ -101,7 +119,7 @@ const ORIGINAL_FAMILIES: [(Family, usize); 7] = [
     (Family::Chaos, 2),
 ];
 
-const NEW_FAMILIES: [(Family, &[&str]); 8] = [
+const NEW_FAMILIES: [(Family, &[&str]); 17] = [
     (Family::Curves, crate::families::curves::NAMES),
     (Family::Waves, crate::families::waves::NAMES),
     (Family::Cells, crate::families::cells::NAMES),
@@ -110,9 +128,18 @@ const NEW_FAMILIES: [(Family, &[&str]); 8] = [
     (Family::Typography, crate::families::typography::NAMES),
     (Family::Organic, crate::families::organic::NAMES),
     (Family::FractalMath, crate::families::fractalmath::NAMES),
+    (Family::Circuit, crate::families::circuit::NAMES),
+    (Family::Metaballs, crate::families::metaballs::NAMES),
+    (Family::Fluid, crate::families::fluid::NAMES),
+    (Family::Tunnel, crate::families::tunnel::NAMES),
+    (Family::Kaleidoscope, crate::families::kaleidoscope::NAMES),
+    (Family::Weather, crate::families::weather::NAMES),
+    (Family::Terrain, crate::families::terrain::NAMES),
+    (Family::Textile, crate::families::textile::NAMES),
+    (Family::Orbital, crate::families::orbital::NAMES),
 ];
 
-const SCENE_COUNT: usize = 100;
+const SCENE_COUNT: usize = 190;
 
 #[derive(Clone, Copy)]
 struct SceneEntry {
@@ -263,6 +290,15 @@ pub struct Renderer {
     typography: Option<crate::families::typography::Renderer>,
     organic: Option<crate::families::organic::Renderer>,
     fractalmath: Option<crate::families::fractalmath::Renderer>,
+    circuit: Option<crate::families::circuit::Renderer>,
+    metaballs: Option<crate::families::metaballs::Renderer>,
+    fluid: Option<crate::families::fluid::Renderer>,
+    tunnel: Option<crate::families::tunnel::Renderer>,
+    kaleidoscope: Option<crate::families::kaleidoscope::Renderer>,
+    weather: Option<crate::families::weather::Renderer>,
+    terrain: Option<crate::families::terrain::Renderer>,
+    textile: Option<crate::families::textile::Renderer>,
+    orbital: Option<crate::families::orbital::Renderer>,
     glyphs: Option<crate::families::glyphs::Renderer>,
     sculptures: Option<crate::families::sculptures::Renderer>,
     flocks: Option<crate::families::flocks::Renderer>,
@@ -406,6 +442,42 @@ impl Renderer {
                 .draw(buf, area, time, local, palette, bands, audio, theme),
             Family::FractalMath => self
                 .fractalmath
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Circuit => self
+                .circuit
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Metaballs => self
+                .metaballs
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Fluid => self
+                .fluid
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Tunnel => self
+                .tunnel
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Kaleidoscope => self
+                .kaleidoscope
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Weather => self
+                .weather
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Terrain => self
+                .terrain
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Textile => self
+                .textile
+                .get_or_insert_with(Default::default)
+                .draw(buf, area, time, local, palette, bands, audio, theme),
+            Family::Orbital => self
+                .orbital
                 .get_or_insert_with(Default::default)
                 .draw(buf, area, time, local, palette, bands, audio, theme),
         }
@@ -1435,6 +1507,15 @@ mod tests {
         check_family!(typography, Typography);
         check_family!(organic, Organic);
         check_family!(fractalmath, FractalMath);
+        check_family!(circuit, Circuit);
+        check_family!(metaballs, Metaballs);
+        check_family!(fluid, Fluid);
+        check_family!(tunnel, Tunnel);
+        check_family!(kaleidoscope, Kaleidoscope);
+        check_family!(weather, Weather);
+        check_family!(terrain, Terrain);
+        check_family!(textile, Textile);
+        check_family!(orbital, Orbital);
         assert_eq!(offset, SCENES.len());
     }
 
@@ -1455,6 +1536,15 @@ mod tests {
             assert!(renderer.typography.is_none());
             assert!(renderer.organic.is_none());
             assert!(renderer.fractalmath.is_none());
+            assert!(renderer.circuit.is_none());
+            assert!(renderer.metaballs.is_none());
+            assert!(renderer.fluid.is_none());
+            assert!(renderer.tunnel.is_none());
+            assert!(renderer.kaleidoscope.is_none());
+            assert!(renderer.weather.is_none());
+            assert!(renderer.terrain.is_none());
+            assert!(renderer.textile.is_none());
+            assert!(renderer.orbital.is_none());
             assert!(renderer.chaos.is_none());
             assert!(renderer.fractals.is_none());
             assert!(renderer.spectrum.is_none());
