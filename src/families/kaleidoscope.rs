@@ -140,11 +140,12 @@ fn mandala(p: &Params, x: f32, y: f32) -> (f32, f32) {
         + p.energy * 0.05
         + p.bands[0] * 0.07
         + p.bands[7] * 0.05
+        + p.chroma_mag * 0.03
         + p.beat * 0.05 * pulse;
     let ring = (-((r - rim) * 10.0).powi(2)).exp();
     let inside = (1.0 - r / (rim + 0.06)).clamp(0.0, 1.0);
-    let webbing = ((r * 21.0 - p.t * (2.0 + p.bands[3] * 1.8) + u * 3.0).sin() * 0.5 + 0.5)
-        * inside;
+    let webbing =
+        ((r * 21.0 - p.t * (2.0 + p.bands[3] * 1.8) + u * 3.0).sin() * 0.5 + 0.5) * inside;
     let spokes = (-(u * u) * 130.0).exp() * inside;
     let heart = (-r * r * 80.0).exp() * (0.75 + p.impact * 0.5 + p.kick * 0.1);
     let veil = 0.05 + 0.11 * (u * PI).sin() * inside;
@@ -748,15 +749,12 @@ mod tests {
         let area = Rect::new(0, 0, 80, 30);
         let quiet = render(0, Reactivity::default(), area, 60);
         let loud = render(0, loud(), area, 60);
-        let changed = quiet
-            .content
-            .iter()
-            .zip(&loud.content)
-            .filter(|(a, b)| a.symbol() != b.symbol())
-            .count();
+        let quiet = signature(&quiet);
+        let loud = signature(&loud);
+        let changed = quiet.iter().zip(&loud).filter(|(a, b)| a != b).count();
         assert!(
             changed > 10,
-            "Mandala Bloom changed only {changed} glyphs with audio"
+            "Mandala Bloom changed only {changed} cells with audio"
         );
     }
 

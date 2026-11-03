@@ -782,7 +782,11 @@ impl Renderer {
             let head = cell_position(point);
             let tail = cell_position(tail);
             let tangent = [head[0] - tail[0], head[1] - tail[1]];
-            let steps = tangent[0].abs().max(tangent[1].abs()).ceil().max(1.0) as usize;
+            let steps = tangent[0]
+                .abs()
+                .max(tangent[1].abs())
+                .ceil()
+                .clamp(1.0, 4096.0) as usize;
             for i in 0..steps {
                 let u = i as f32 / steps as f32;
                 plot(

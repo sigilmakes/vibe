@@ -92,9 +92,9 @@ impl Renderer {
                     life = 14.0;
                 }
                 5 => {
-                    p = [0.5 + (s - 0.5) * 0.15, 0.79];
-                    v = [(q - 0.5) * 0.75, -0.35 - s * strength * 0.65];
-                    life = 0.35 + q * 0.65;
+                    p = [0.5 + (s - 0.5) * 0.34, 0.79];
+                    v = [(q - 0.5) * 0.95, -0.35 - s * strength * 0.65];
+                    life = 0.45 + q * 0.80;
                 }
                 6 => {
                     p = [-0.04, q * 0.7];
@@ -173,14 +173,14 @@ impl Renderer {
             && attack - self.attack > 0.08
             && self.cooldown == 0.0
         {
-            self.emit(style, if style == 5 { 14 } else { 38 }, attack, audio);
+            self.emit(style, if style == 5 { 22 } else { 38 }, attack, audio);
             self.cooldown = 0.10;
         }
         self.attack = attack;
         if style == 5 {
             // A forge keeps a low ember stream between air attacks. Without it
             // the scene is black whenever the track has no fourth transient.
-            self.emission += dt * (36.0 + audio.energy.clamp(0.0, 1.0) * 36.0);
+            self.emission += dt * (64.0 + audio.energy.clamp(0.0, 1.0) * 48.0);
             let count = self.emission as usize;
             self.emission -= count as f32;
             self.emit(style, count, 0.0, audio);
@@ -197,7 +197,7 @@ impl Renderer {
             self.emission -= count as f32;
             self.emit(style, count, 0.0, audio);
         }
-        let steps = (dt / STEP).ceil().max(1.0) as usize;
+        let steps = (dt / STEP).ceil().clamp(1.0, 64.0) as usize;
         let h = dt / steps as f32;
         for p in &mut self.particles {
             if dt > 0.0 {

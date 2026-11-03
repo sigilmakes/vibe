@@ -115,7 +115,7 @@ impl Renderer {
                 let a = map(a);
                 let b = map(b);
                 let delta = [b[0] - a[0], b[1] - a[1]];
-                let steps = delta[0].abs().max(delta[1].abs()).ceil().max(1.0) as usize;
+                let steps = delta[0].abs().max(delta[1].abs()).ceil().clamp(1.0, 4096.0) as usize;
                 let position = i as f32 / self.segments.len().max(1) as f32;
                 let band = unit(bands[(position * 31.0) as usize]);
                 let pulse = (position * TAU * 3.0 - self.phase * 2.0).cos() * 0.5 + 0.5;

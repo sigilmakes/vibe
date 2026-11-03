@@ -131,7 +131,7 @@ impl Canvas {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let glyph = line_glyph(dx, dy);
-        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
+        let steps = dx.abs().max(dy.abs()).ceil().clamp(1.0, 4096.0) as i32;
         for step in 0..=steps {
             let f = step as f32 / steps as f32;
             self.plot_tinted(

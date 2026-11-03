@@ -104,7 +104,7 @@ impl Renderer {
         self.attack = attack;
         if tank {
             self.init_tank();
-            let steps = (dt * 120.0).ceil().max(1.0) as usize;
+            let steps = (dt * 120.0).ceil().clamp(1.0, 1024.0) as usize;
             let h = dt / steps as f32;
             // Fixed edges, damped wave equation; c*dt < 0.13 cells/substep.
             for _ in 0..steps {

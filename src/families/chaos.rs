@@ -255,7 +255,7 @@ impl Garden {
             );
         }
         self.remainder += dt * 720.0;
-        let steps = self.remainder.floor() as usize;
+        let steps = self.remainder.floor().clamp(0.0, 4096.0) as usize;
         self.remainder -= steps as f32;
         for _ in 0..steps {
             self.step(
