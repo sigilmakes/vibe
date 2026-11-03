@@ -434,8 +434,9 @@ fn main() -> io::Result<()> {
 
     let config_path = config_path(&args);
     let mut warnings = Vec::new();
-    let (mut config, config_warnings) = config::load(&config_path);
+    let (file_config, config_warnings) = config::load(&config_path);
     warnings.extend(config_warnings);
+    let mut config = file_config.clone();
     apply_cli(&mut config, &args);
 
     let state_path = state::state_path(
@@ -470,6 +471,7 @@ fn main() -> io::Result<()> {
     let mut app = App::new(Options {
         scene: initial_scene,
         config,
+        persisted_config: file_config,
         demo: args.demo,
         config_path: config_path.clone(),
         state_path: state_path.clone(),

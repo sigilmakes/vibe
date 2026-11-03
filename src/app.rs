@@ -8,7 +8,10 @@ use crate::{audio, config, flow, menu, now_playing, palette, state, ui, visuals}
 /// config and resolves the scene before constructing an `App`.
 pub struct Options {
     pub scene: usize,
+    /// Effective config for this session: file values plus CLI overrides.
     pub config: config::Config,
+    /// File values before CLI overrides, used as the save baseline.
+    pub persisted_config: config::Config,
     pub demo: bool,
     pub config_path: PathBuf,
     pub state_path: Option<PathBuf>,
@@ -65,6 +68,8 @@ const CONFIG_DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct App {
     scene: usize,
     config: config::Config,
+    persisted_config: config::Config,
+    session_start: config::Config,
     active_playlist: String,
     config_dirty: bool,
     config_touched: Option<Instant>,
@@ -88,9 +93,12 @@ pub struct App {
 
 impl App {
     pub fn new(options: Options) -> Self {
+        let session_start = options.config.clone();
         let mut app = Self {
             scene: options.scene,
             config: options.config,
+            persisted_config: options.persisted_config,
+            session_start: session_start.clone(),
             active_playlist: options.active_playlist,
             config_dirty: false,
             config_touched: None,
@@ -116,6 +124,9 @@ impl App {
         app.prune_auto_advance();
         app.prune_appearance();
         app.prune_audio();
+        // Startup canonicalisation belongs on disk, but CLI overrides do not.
+        config::merge_changed(&mut app.persisted_config, &session_start, &app.config);
+        app.session_start = app.config.clone();
         app.rebuild_pages();
         if !app.demo {
             app.connect();
@@ -1004,11 +1015,16 @@ impl App {
         if !self.config_dirty {
             return;
         }
-        if let Err(error) = config::save(&self.config_path, &self.config) {
+        let mut saved = self.persisted_config.clone();
+        config::merge_changed(&mut saved, &self.session_start, &self.config);
+        if let Err(error) = config::save(&self.config_path, &saved) {
             self.save_errors.push(format!(
                 "Could not save config to {}: {error}",
                 self.config_path.display()
             ));
+        } else {
+            self.persisted_config = saved;
+            self.session_start = self.config.clone();
         }
         self.config_dirty = false;
         self.config_touched = None;
@@ -1133,6 +1149,7 @@ mod tests {
         Options {
             scene: 0,
             config: config::Config::default(),
+            persisted_config: config::Config::default(),
             demo: true,
             config_path: std::env::temp_dir().join("vibe-unused-config.toml"),
             state_path: None,
@@ -1382,6 +1399,7 @@ mod tests {
         let mut app = App::new(Options {
             scene: 0,
             config: config::Config::default(),
+            persisted_config: config::Config::default(),
             demo: true,
             config_path: config_path.clone(),
             state_path: Some(state_path.clone()),
@@ -1562,6 +1580,44 @@ mod tests {
     }
 
     #[test]
+    fn cli_overrides_are_not_written_back_by_menu_edits() {
+        let dir = temp_dir("cli-override-persist");
+        let config_path = dir.join("config.toml");
+        let file = config::Config::default();
+        let mut effective = file.clone();
+        effective.appearance.palette = "Ember".into();
+        effective.appearance.fps = 30;
+
+        let mut app = App::new(Options {
+            scene: 0,
+            config: effective,
+            persisted_config: file,
+            demo: true,
+            config_path: config_path.clone(),
+            state_path: None,
+            active_playlist: String::new(),
+        });
+        // A menu edit to an unrelated field must not persist --palette/--fps.
+        app.config.audio.rate = 44_100;
+        app.mark_config_dirty();
+        app.flush();
+
+        let (saved, _) = config::load(&config_path);
+        assert_eq!(saved.appearance.palette, "Terminal");
+        assert_eq!(saved.appearance.fps, 60);
+        assert_eq!(saved.audio.rate, 44_100);
+
+        // Editing the CLI-owned field explicitly does persist the new value.
+        app.config.appearance.fps = 45;
+        app.mark_config_dirty();
+        app.flush();
+        let (saved, _) = config::load(&config_path);
+        assert_eq!(saved.appearance.fps, 45);
+        assert_eq!(saved.appearance.palette, "Terminal");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn playlist_edits_persist_to_config_and_state() {
         let dir = temp_dir("playlist-persist");
         let config_path = dir.join("config.toml");
@@ -1569,6 +1625,7 @@ mod tests {
         let mut app = App::new(Options {
             scene: 0,
             config: config::Config::default(),
+            persisted_config: config::Config::default(),
             demo: true,
             config_path: config_path.clone(),
             state_path: Some(state_path.clone()),

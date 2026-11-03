@@ -127,6 +127,131 @@ pub struct Config {
     pub playlists: Vec<Playlist>,
 }
 
+/// Copy only fields that differ from `base` into `target`.
+///
+/// `target` is the on-disk config; `base` is the effective config at the start
+/// of the session (file values plus CLI overrides); `current` is the effective
+/// config after menu edits. CLI-only values match `base`, so they are not
+/// copied back.
+pub fn merge_changed(target: &mut Config, base: &Config, current: &Config) {
+    fn copy<T: Clone + PartialEq>(target: &mut T, base: &T, current: &T) {
+        if current != base {
+            *target = current.clone();
+        }
+    }
+
+    copy(
+        &mut target.scenes.filter,
+        &base.scenes.filter,
+        &current.scenes.filter,
+    );
+    copy(
+        &mut target.scenes.filter_tags,
+        &base.scenes.filter_tags,
+        &current.scenes.filter_tags,
+    );
+    copy(
+        &mut target.scenes.favourites,
+        &base.scenes.favourites,
+        &current.scenes.favourites,
+    );
+
+    copy(
+        &mut target.auto_advance.mode,
+        &base.auto_advance.mode,
+        &current.auto_advance.mode,
+    );
+    copy(
+        &mut target.auto_advance.transition_secs,
+        &base.auto_advance.transition_secs,
+        &current.auto_advance.transition_secs,
+    );
+    copy(
+        &mut target.auto_advance.within,
+        &base.auto_advance.within,
+        &current.auto_advance.within,
+    );
+
+    copy(
+        &mut target.audio.source,
+        &base.audio.source,
+        &current.audio.source,
+    );
+    copy(
+        &mut target.audio.target,
+        &base.audio.target,
+        &current.audio.target,
+    );
+    copy(
+        &mut target.audio.command,
+        &base.audio.command,
+        &current.audio.command,
+    );
+    copy(
+        &mut target.audio.file,
+        &base.audio.file,
+        &current.audio.file,
+    );
+    copy(
+        &mut target.audio.format,
+        &base.audio.format,
+        &current.audio.format,
+    );
+    copy(
+        &mut target.audio.rate,
+        &base.audio.rate,
+        &current.audio.rate,
+    );
+    copy(
+        &mut target.audio.channels,
+        &base.audio.channels,
+        &current.audio.channels,
+    );
+    copy(
+        &mut target.audio.auto_reconnect,
+        &base.audio.auto_reconnect,
+        &current.audio.auto_reconnect,
+    );
+    copy(
+        &mut target.audio.loop_file,
+        &base.audio.loop_file,
+        &current.audio.loop_file,
+    );
+
+    copy(
+        &mut target.appearance.palette,
+        &base.appearance.palette,
+        &current.appearance.palette,
+    );
+    copy(
+        &mut target.appearance.follow_theme,
+        &base.appearance.follow_theme,
+        &current.appearance.follow_theme,
+    );
+    copy(
+        &mut target.appearance.fps,
+        &base.appearance.fps,
+        &current.appearance.fps,
+    );
+    copy(
+        &mut target.appearance.color_depth,
+        &base.appearance.color_depth,
+        &current.appearance.color_depth,
+    );
+    copy(
+        &mut target.appearance.glyphs,
+        &base.appearance.glyphs,
+        &current.appearance.glyphs,
+    );
+    copy(
+        &mut target.appearance.sensitivity,
+        &base.appearance.sensitivity,
+        &current.appearance.sensitivity,
+    );
+
+    copy(&mut target.playlists, &base.playlists, &current.playlists);
+}
+
 /// `$XDG_CONFIG_HOME/vibe/config.toml`, or `~/.config/vibe/config.toml`.
 pub fn config_path(xdg_config_home: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
     xdg_config_home
@@ -350,5 +475,22 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
+    }
+    #[test]
+    fn merge_changed_keeps_cli_overrides_out_of_the_file() {
+        let file = Config::default();
+        let mut effective = file.clone();
+        effective.appearance.palette = "Ember".into();
+        effective.appearance.fps = 30;
+        let mut edited = effective.clone();
+        edited.audio.rate = 44_100;
+        edited.appearance.glyphs = "ascii".into();
+
+        let mut saved = file.clone();
+        merge_changed(&mut saved, &effective, &edited);
+        assert_eq!(saved.appearance.palette, "Terminal");
+        assert_eq!(saved.appearance.fps, 60);
+        assert_eq!(saved.audio.rate, 44_100);
+        assert_eq!(saved.appearance.glyphs, "ascii");
     }
 }
