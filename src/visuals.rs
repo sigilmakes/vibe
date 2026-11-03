@@ -24,6 +24,11 @@ const ORIGINAL_SCENES: &[&str] = &[
     "Reaction Garden",
 ];
 
+/// Fraction of real time the visual clock keeps in silence. Full-energy audio
+/// runs the clock at real time. The curve bends toward full speed, so ordinary
+/// music still moves near its own pace while quiet passages slow down.
+const MOTION_FLOOR: f32 = 0.15;
+
 /// The renderer family that owns a contiguous run of global scene indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Family {
@@ -301,6 +306,11 @@ impl Reactivity {
     }
 }
 
+/// Smallest beat step accepted as elapsed motion. The visual clock can run at
+/// a fraction of real time, so a slow frame still has to accept real beat
+/// steps that a `dt`-scaled window alone would mistake for a tracker resync.
+const BEAT_STEP_FLOOR: f32 = 0.25;
+
 /// Continuous beat position, integrated from the tempo tracker's phase.
 ///
 /// `beat_phase` is a sawtooth: it ramps through one beat and snaps back at the
@@ -331,7 +341,7 @@ impl BeatClock {
         if let Some(last) = self.phase {
             // A larger step is a tracker resync rather than movement.
             let step = (phase - last).rem_euclid(1.0);
-            if step <= dt.max(0.0) * 12.0 + 1e-4 {
+            if step <= (dt.max(0.0) * 12.0).max(BEAT_STEP_FLOOR) + 1e-4 {
                 self.position += step;
             }
         }
@@ -444,6 +454,10 @@ pub struct Renderer {
     fractals: Option<crate::families::fractals::Renderer>,
     chaos: Option<crate::families::chaos::Renderer>,
     last_time: Option<f32>,
+    /// Visual clock for the families. It advances at a rate set by the audio
+    /// energy, so silence does not leave every scene running at full speed.
+    motion_time: f32,
+    motion_last: Option<f32>,
     rotation: f32,
     expansion: f32,
     expansion_velocity: f32,
@@ -516,12 +530,41 @@ impl Renderer {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Audio energy sets how fast the visual clock runs. The clock starts at
+        // the caller's time so a fresh renderer does not jump, then integrates
+        // the gated rate. Envelopes and the spectrum still change the picture
+        // directly, and the floor keeps silent scenes drifting instead of
+        // freezing them. Rotation and impacts keep the real clock so attacks
+        // and beat state stay in sync with the music.
+        let now = if time.is_finite() {
+            time
+        } else {
+            self.motion_last.unwrap_or(0.0)
+        };
+        let dt = self
+            .motion_last
+            .map_or(0.0, |last| (now - last).clamp(0.0, 0.1));
+        if self.motion_last.is_none() {
+            self.motion_time = now;
+        }
+        self.motion_last = Some(now);
+        let energy = if audio.energy.is_finite() {
+            audio.energy.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Ease-out: half energy keeps three quarters of the full range, and
+        // the adaptive mixer's ordinary music level stays close to real time.
+        let shape = energy * (2.0 - energy);
+        let speed = MOTION_FLOOR + (1.0 - MOTION_FLOOR) * shape;
+        self.motion_time += dt * speed;
+        let time = self.motion_time;
         let (family, local) = scene_route(scene);
         match family {
             Family::Original => {
                 // Rotation, expansion and impact state belong only to the
                 // original seven scenes. New families keep their own clocks.
-                self.advance(time, audio);
+                self.advance(now, audio);
                 self.draw_original(buf, area, time, local, palette, bands, audio, theme)
             }
             Family::Glyphs => self
@@ -724,6 +767,7 @@ impl Renderer {
                     scale,
                     area.width as f32 / area.height as f32 * 0.5,
                     bands,
+                    time,
                 );
                 let bottom = self.pixel(
                     [x, y + scale * 0.5],
@@ -736,6 +780,7 @@ impl Renderer {
                     scale,
                     area.width as f32 / area.height as f32 * 0.5,
                     bands,
+                    time,
                 );
                 let cell = &mut buf[(col, row)];
                 cell.reset();
@@ -874,12 +919,13 @@ impl Renderer {
         scale: f32,
         half_width: f32,
         bands: &[f32; 32],
+        time: f32,
     ) -> Pixel {
         match scene {
             0 => self.flower(p, vertices, palette, audio, theme, scale),
             1 => self.scope(p, palette, audio, theme, scale, half_width),
-            5 => self.ribbons(p, ribbons, palette, audio, theme),
-            _ => self.restored_soft(p, scene, palette, audio, bands, theme),
+            5 => self.ribbons(p, ribbons, palette, audio, theme, time),
+            _ => self.restored_soft(p, scene, palette, audio, bands, theme, time),
         }
     }
 
@@ -890,6 +936,7 @@ impl Renderer {
         palette: usize,
         audio: &Reactivity,
         theme: &crate::palette::Theme,
+        time: f32,
     ) -> Pixel {
         let mut nearest = f32::MAX;
         let mut phase = 0.0;
@@ -912,11 +959,7 @@ impl Renderer {
         }
         let width = 0.012 + audio.treble * 0.012;
         let line = 1.0 / (1.0 + nearest / (width * width));
-        let base = theme.rgb(
-            palette,
-            phase + self.last_time.unwrap_or(0.0) * 0.025,
-            0.008 + line * 0.82,
-        );
+        let base = theme.rgb(palette, phase + time * 0.025, 0.008 + line * 0.82);
         let rgb: [u8; 3] = std::array::from_fn(|i| {
             (base[i] as f32 + (theme.foreground[i] as f32 - base[i] as f32) * line.powi(3) * 0.35)
                 .round() as u8
@@ -936,8 +979,9 @@ impl Renderer {
         audio: &Reactivity,
         bands: &[f32; 32],
         theme: &crate::palette::Theme,
+        time: f32,
     ) -> Pixel {
-        let t = self.last_time.unwrap_or(0.0);
+        let t = time;
         let e = audio.energy;
         let bass = audio.bass;
         let mid = audio.mid;
@@ -1141,6 +1185,43 @@ mod tests {
             &crate::palette::Theme::default(),
         );
         assert_eq!(renderer.last_time, Some(1.0));
+    }
+
+    #[test]
+    fn visual_clock_slows_with_audio_energy_without_stopping() {
+        let area = Rect::new(0, 0, 16, 8);
+        let theme = crate::palette::Theme::default();
+        let clock_after_one_second = |energy: f32| {
+            let mut renderer = Renderer::default();
+            let mut buffer = Buffer::empty(area);
+            for frame in 0..=60 {
+                let audio = Reactivity {
+                    energy,
+                    ..Reactivity::default()
+                };
+                renderer.draw(
+                    &mut buffer,
+                    area,
+                    frame as f32 / 60.0,
+                    2,
+                    0,
+                    &[0.0; 32],
+                    &audio,
+                    &theme,
+                );
+            }
+            renderer.motion_time
+        };
+        let quiet = clock_after_one_second(0.0);
+        let half = clock_after_one_second(0.5);
+        let full = clock_after_one_second(1.0);
+        assert!((quiet - MOTION_FLOOR).abs() < 0.01, "quiet clock: {quiet}");
+        assert!(
+            (half - (MOTION_FLOOR + (1.0 - MOTION_FLOOR) * 0.75)).abs() < 0.01,
+            "half-energy clock: {half}"
+        );
+        assert!((full - 1.0).abs() < 0.01, "full-energy clock: {full}");
+        assert!(quiet < half && half < full);
     }
 
     #[test]
@@ -1520,6 +1601,28 @@ mod tests {
             },
         );
         assert_eq!(clock.position(), last);
+    }
+
+    #[test]
+    fn beat_clock_keeps_real_steps_when_the_visual_clock_is_gated() {
+        let mut clock = BeatClock::default();
+        let gated_dt = (1.0 / 60.0) * MOTION_FLOOR;
+        for frame in 0..600 {
+            let t = frame as f32 / 60.0;
+            clock.advance(
+                gated_dt,
+                &Reactivity {
+                    beat_phase: (t * 3.0).fract(),
+                    tempo_confidence: 1.0,
+                    ..Reactivity::default()
+                },
+            );
+        }
+        assert!(
+            clock.position() > 29.8,
+            "gated time dropped real beat steps: {}",
+            clock.position()
+        );
     }
 
     /// Scenes that take beat motion from the integrated clock. Each one used to
@@ -2124,5 +2227,249 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         Renderer::default().draw(&mut buffer, area, 1.0, 6, 0, &[1e30; 32], &audio, &theme);
         assert_eq!(buffer.content.len(), area.area() as usize);
+    }
+
+    fn audit_audio(seconds: f32, energy: f32) -> Reactivity {
+        if energy <= 0.0 {
+            return Reactivity::default();
+        }
+        let beat = (-((seconds * 2.0).fract()) * 9.0).exp();
+        let phase = seconds * 0.7;
+        Reactivity {
+            energy,
+            bass: (0.55 + 0.3 * beat) * energy,
+            mid: (0.5 + 0.15 * (phase * 0.9).sin()) * energy,
+            treble: (0.5 + 0.2 * (phase * 1.3 + 2.0).sin()) * energy,
+            onset: 0.45 * beat * energy,
+            kick: 0.6 * beat * energy,
+            beat: 0.5 * energy,
+            beat_phase: (seconds * 2.0).fract(),
+            tempo_confidence: if energy > 0.4 { 1.0 } else { 0.0 },
+            novelty: 0.3 * beat * energy,
+            chroma: std::array::from_fn(|i| {
+                ((seconds * 0.3 + i as f32 * 0.7).sin() * 0.5 + 0.5) / 6.0 * energy
+            }),
+            centroid: 0.5,
+            flatness: 0.3,
+            width: 0.5,
+            balance: 0.3 * (seconds * 0.4).sin(),
+            waveform: std::array::from_fn(|i| {
+                (i as f32 * 1.3 + seconds * 5.0).sin() * 0.7 * energy
+            }),
+            transients: [0.8 * beat, 0.25 * beat, 0.35 * beat, 0.2 * beat]
+                .map(|value| value * energy),
+        }
+    }
+
+    fn audit_bands(seconds: f32, energy: f32) -> [f32; 32] {
+        if energy <= 0.0 {
+            return [0.0; 32];
+        }
+        std::array::from_fn(|i| {
+            let i = i as f32;
+            (((seconds * 0.7 + i * 0.4).sin() * 0.5 + 0.5) * (0.9 - i * 0.015) + 0.05) * energy
+        })
+    }
+
+    fn audit_rgb(color: Color) -> [f32; 3] {
+        match color {
+            Color::Rgb(r, g, b) => [r as f32, g as f32, b as f32],
+            _ => [0.0; 3],
+        }
+    }
+
+    fn audit_luma(color: Color) -> f32 {
+        let [r, g, b] = audit_rgb(color);
+        0.299 * r + 0.587 * g + 0.114 * b
+    }
+
+    fn audit_field(buf: &Buffer, width: usize, height: usize) -> Vec<f32> {
+        let mut field = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let cell = &buf[(x as u16, y as u16)];
+                field.push((audit_luma(cell.fg) + audit_luma(cell.bg)) * 0.5);
+            }
+        }
+        field
+    }
+
+    /// Mean brightness-constancy displacement: how far a cell would have to
+    /// move to explain the luminance change, weighted by spatial contrast.
+    fn audit_normal_flow(a: &[f32], b: &[f32], width: usize, height: usize) -> f32 {
+        let mut total = 0.0;
+        let mut weight = 0.0;
+        for y in 1..height - 1 {
+            for x in 1..width - 1 {
+                let i = y * width + x;
+                let ix = (a[i + 1] - a[i - 1]) * 0.5;
+                let iy = (a[i + width] - a[i - width]) * 0.5;
+                let grad = (ix * ix + iy * iy).sqrt();
+                if grad < 0.75 {
+                    continue;
+                }
+                let it = (b[i] - a[i]).abs();
+                total += (it / grad).min(4.0) * grad;
+                weight += grad;
+            }
+        }
+        total / weight.max(1.0)
+    }
+
+    /// Lucas-Kanade flow on overlapping patches. Gradient-weighted, sub-cell.
+    fn audit_patch_flow(a: &[f32], b: &[f32], width: usize, height: usize) -> f32 {
+        const BW: usize = 16;
+        const BH: usize = 8;
+        let mut total = 0.0;
+        let mut tracked: f32 = 0.0;
+        for by in (0..=height - BH).step_by(BH / 2) {
+            for bx in (0..=width - BW).step_by(BW / 2) {
+                let (mut a11, mut a12, mut a22, mut b1, mut b2, mut weight) =
+                    (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+                for y in 1..BH - 1 {
+                    for x in 1..BW - 1 {
+                        let i = (by + y) * width + bx + x;
+                        let ix = (a[i + 1] - a[i - 1]) * 0.5;
+                        let iy = (a[i + width] - a[i - width]) * 0.5;
+                        let it = b[i] - a[i];
+                        a11 += ix * ix;
+                        a12 += ix * iy;
+                        a22 += iy * iy;
+                        b1 += ix * it;
+                        b2 += iy * it;
+                        weight += ix * ix + iy * iy;
+                    }
+                }
+                let count = ((BW - 2) * (BH - 2)) as f32;
+                if weight / count < 0.25 {
+                    continue;
+                }
+                let det = a11 * a22 - a12 * a12;
+                if det.abs() < 1e-3 {
+                    continue;
+                }
+                let dx = (-(a22 * b1 - a12 * b2) / det).clamp(-2.0, 2.0);
+                let dy = (-(a11 * b2 - a12 * b1) / det).clamp(-2.0, 2.0);
+                if !dx.is_finite() || !dy.is_finite() {
+                    continue;
+                }
+                total += (dx * dx + dy * dy).sqrt();
+                tracked += 1.0;
+            }
+        }
+        total / tracked.max(1.0)
+    }
+
+    fn audit_cells(a: &Buffer, b: &Buffer) -> f32 {
+        a.content
+            .iter()
+            .zip(&b.content)
+            .filter(|(x, y)| x != y)
+            .count() as f32
+            / a.content.len() as f32
+    }
+
+    fn audit_symbols(a: &Buffer, b: &Buffer) -> f32 {
+        a.content
+            .iter()
+            .zip(&b.content)
+            .filter(|(x, y)| x.symbol() != y.symbol())
+            .count() as f32
+            / a.content.len() as f32
+    }
+
+    /// Pearson correlation of two luminance fields.
+    fn audit_correlation(a: &[f32], b: &[f32]) -> f32 {
+        let mean_a = a.iter().sum::<f32>() / a.len() as f32;
+        let mean_b = b.iter().sum::<f32>() / b.len() as f32;
+        let mut cov = 0.0;
+        let mut var_a = 0.0;
+        let mut var_b = 0.0;
+        for (x, y) in a.iter().zip(b) {
+            cov += (x - mean_a) * (y - mean_b);
+            var_a += (x - mean_a).powi(2);
+            var_b += (y - mean_b).powi(2);
+        }
+        cov / (var_a * var_b).sqrt().max(1e-6)
+    }
+
+    struct Audit {
+        normal: f32,
+        flow: f32,
+        /// Largest single-frame normal flow in the sampled window.
+        peak: f32,
+        churn: f32,
+        symbols: f32,
+        correlation: f32,
+        image: Buffer,
+    }
+
+    fn audit_run(scene: usize, energy: f32) -> Audit {
+        const W: usize = 80;
+        const H: usize = 24;
+        let area = Rect::new(0, 0, W as u16, H as u16);
+        let theme = crate::palette::Theme::default();
+        let mut renderer = Renderer::default();
+        let mut buffer = Buffer::empty(area);
+        let mut previous = Buffer::empty(area);
+        let mut at_two = Buffer::empty(area);
+        let (mut normal, mut flow, mut peak, mut frames): (f32, f32, f32, f32) =
+            (0.0, 0.0, 0.0, 0.0);
+        for frame in 0..=180 {
+            let seconds = frame as f32 / 60.0;
+            let audio = audit_audio(seconds, energy);
+            let bands = audit_bands(seconds, energy);
+            previous.clone_from(&buffer);
+            renderer.draw(&mut buffer, area, seconds, scene, 0, &bands, &audio, &theme);
+            if frame >= 120 {
+                let a = audit_field(&previous, W, H);
+                let b = audit_field(&buffer, W, H);
+                let step = audit_normal_flow(&a, &b, W, H);
+                normal += step;
+                peak = peak.max(step);
+                flow += audit_patch_flow(&a, &b, W, H);
+                frames += 1.0;
+            }
+            if frame == 120 {
+                at_two.clone_from(&buffer);
+            }
+        }
+        Audit {
+            normal: normal / frames.max(1.0) * 60.0,
+            flow: flow / frames.max(1.0) * 60.0,
+            peak: peak * 60.0,
+            churn: audit_cells(&at_two, &buffer),
+            symbols: audit_symbols(&at_two, &buffer),
+            correlation: audit_correlation(
+                &audit_field(&at_two, W, H),
+                &audit_field(&buffer, W, H),
+            ),
+            image: buffer,
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn audit_idle_energy() {
+        println!("energy\tnormal\tflow\tpeak\tchurn\tsymbols\tcorr\tcross\tscene");
+        for (scene, name) in SCENES.iter().enumerate() {
+            let runs: Vec<Audit> = [0.0, 0.5, 1.0]
+                .iter()
+                .map(|&energy| audit_run(scene, energy))
+                .collect();
+            for (audit, energy) in runs.iter().zip([0.0, 0.5, 1.0]) {
+                println!(
+                    "{energy:.1}\t{:.2}\t{:.2}\t{:.2}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{scene}\t{}",
+                    audit.normal,
+                    audit.flow,
+                    audit.peak,
+                    audit.churn,
+                    audit.symbols,
+                    audit.correlation,
+                    audit_cells(&runs[0].image, &audit.image),
+                    name
+                );
+            }
+        }
     }
 }
