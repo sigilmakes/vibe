@@ -18,8 +18,55 @@ pub const NAMES: &[&str] = &[
     "Vapour Veil",
 ];
 
+/// Scenes share a little memory: an audio-driven advection phase, a decaying
+/// attack envelope and the capillary charge. None of them advance on the wall
+/// clock alone, so a silent stream rests instead of animating by itself.
 #[derive(Default)]
-pub struct Renderer;
+pub struct Renderer {
+    last_time: Option<f32>,
+    transport: f32,
+    attack: f32,
+    impact: f32,
+    level: f32,
+}
+
+impl Renderer {
+    fn advance(&mut self, time: f32, audio: &Reactivity) {
+        let now = if time.is_finite() {
+            time
+        } else {
+            self.last_time.unwrap_or(0.0)
+        };
+        let dt = self
+            .last_time
+            .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.05));
+        self.last_time = Some(now);
+        let attack = unit(audio.onset).max(
+            audio
+                .transients
+                .iter()
+                .copied()
+                .map(unit)
+                .fold(0.0, f32::max),
+        );
+        if attack > self.attack + 0.06 {
+            self.impact = 1.0;
+        }
+        self.attack = attack;
+        self.impact = (self.impact - dt * 2.2).clamp(0.0, 1.0);
+        let energy = unit(audio.energy);
+        // Advection is a function of the music: silence leaves the dye almost
+        // still, while energy and attacks carry it downstream.
+        self.transport = (self.transport
+            + dt * (0.03 + energy * 1.7 + unit(audio.mid) * 0.55 + self.impact * 0.9))
+            .rem_euclid(4096.0);
+        // Capillary charge climbs on attacks and drains once they stop.
+        self.level = (self.level
+            + dt * (0.04 + energy * 0.30 + unit(audio.onset) * 1.1 + unit(audio.kick) * 0.25)
+            - dt * 0.45 * self.level)
+            .clamp(0.0, 1.0);
+    }
+}
 
 fn unit(v: f32) -> f32 {
     if v.is_finite() {
@@ -113,6 +160,9 @@ struct Scene<'a> {
     onset: f32,
     flatness: f32,
     centroid: f32,
+    transport: f32,
+    impact: f32,
+    level: f32,
 }
 
 impl Scene<'_> {
@@ -169,6 +219,7 @@ impl Renderer {
         audio: &Reactivity,
         theme: &Theme,
     ) {
+        self.advance(time, audio);
         let mode = style % NAMES.len();
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
@@ -225,6 +276,9 @@ impl Renderer {
             onset: unit(audio.onset),
             flatness: unit(audio.flatness),
             centroid: unit(audio.centroid),
+            transport: self.transport,
+            impact: self.impact,
+            level: self.level,
         };
         match mode {
             0 => ink_bloom(&mut scene),
@@ -273,12 +327,13 @@ fn ink_bloom(s: &mut Scene<'_>) {
     }
 }
 
-/// Two counter-rotating dye vortices with spiral arms. `mid` tightens the
-/// spiral, treble adds a fine ripple, and the chroma hue tints each arm.
+/// Two counter-rotating dye vortices with spiral arms. `mid` and `energy`
+/// turn the spiral, and a transient throws an extra pair of arms plus a dye
+/// ring that travels outward from each core instead of only raising brightness.
 fn dye_vortex(s: &mut Scene<'_>) {
     let span = s.span;
-    let speed = 0.7 + 1.2 * s.mid;
-    let arms = 2.5 + 1.5 * s.treble;
+    let arms = 2.5 + 1.5 * s.treble + 2.0 * s.impact;
+    let spin = s.transport * (1.0 + 0.7 * s.mid);
     for j in 0..s.height() {
         let y = s.y(j);
         for i in 0..s.width() {
@@ -294,20 +349,31 @@ fn dye_vortex(s: &mut Scene<'_>) {
                 let theta = dy.atan2(dx);
                 let swirl = 1.8 * (-d * d * 8.0).exp();
                 let band =
-                    (arms * theta + d * (11.0 + 4.0 * s.mid) + side * (swirl * 2.4 - s.t * speed))
-                        .sin();
+                    (arms * theta + d * (11.0 + 4.0 * s.mid) + side * (swirl * 2.4 - spin)).sin();
                 let envelope = (-d * d * 2.0).exp();
-                field += band * envelope * (1.0 + 0.25 * s.treble * (d * 37.0 - s.t * 3.0).sin());
+                let ripple = 0.25 * s.treble * (d * 37.0 - spin * 1.2).sin();
+                // The attack ring starts at the core and travels outward while
+                // the envelope decays.
+                let ring_radius = 0.06 + 0.36 * (1.0 - s.impact);
+                let ring =
+                    s.impact * (-((d - ring_radius) / (0.018 + 0.010 * s.treble)).powi(2)).exp();
+                field += band * envelope * (1.0 + ripple) + ring;
                 tx += -dy / d * side * envelope;
                 ty += dx / d * side * envelope;
             }
-            let b = ((field.abs() * 1.25 - 0.08).max(0.0) * (0.65 + 0.6 * s.mid)).min(1.0);
-            let mark = if b > 0.04 {
+            let b = ((field.abs() * 1.25 - 0.06).max(0.0)
+                * (0.22 + 0.85 * s.mid + 0.55 * s.energy))
+                .min(1.0);
+            let mark = if b > 0.05 + 0.12 * (1.0 - s.energy) {
                 direction_glyph(tx, ty)
             } else {
                 ' '
             };
-            let phase = 0.5 + 0.18 * field.signum() + 0.22 * s.hue + 0.08 * (y * 6.0).sin();
+            let phase = 0.5
+                + 0.18 * field.signum()
+                + 0.22 * s.hue
+                + 0.08 * (y * 6.0).sin()
+                + 0.20 * s.impact;
             s.put(i, j, mark, phase, b * 0.95);
         }
     }
@@ -342,34 +408,36 @@ fn smoke_plume(s: &mut Scene<'_>) {
     }
 }
 
-/// An alternating vortex street shed from a leading edge. The shed pairs
-/// travel downstream and fade; `energy` speeds the wake and `kick` sharpens it.
+/// An alternating vortex street shed from a leading edge. The wake flows with
+/// the music; an attack releases a strong counter-rotating pair at the leading
+/// edge that travels downstream instead of a free-running animation.
 fn vortex_street(s: &mut Scene<'_>) {
     let span = s.span;
-    let speed = 0.11 + 0.05 * s.energy;
+    let travel = s.transport * 0.11;
     let mut shed = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); 12];
-    let mut count = 0;
-    for k in 0..12 {
-        let life = (s.t * speed + k as f32 * 0.083).rem_euclid(1.0);
+    for (k, slot) in shed.iter_mut().enumerate() {
+        let life = (travel + k as f32 * 0.083).rem_euclid(1.0);
         let u = 0.22 + life * 1.05;
         let side = if k % 2 == 0 { 1.0 } else { -1.0 };
         let v = 0.5
-            + side * 0.15 * (life * 6.0).min(1.0) * (1.0 - 0.5 * life)
+            + side * (0.15 + 0.10 * s.impact) * (life * 6.0).min(1.0) * (1.0 - 0.5 * life)
             + 0.02 * (life * 30.0).sin();
-        let strength = (1.0 - life).powf(0.7) * (0.6 + 0.5 * s.bass);
-        let radius = 0.04 + life * 0.035;
-        shed[count] = (u, v, side * strength, radius);
-        count += 1;
+        let strength = (1.0 - life).powf(0.7) * (0.10 + 0.85 * s.energy + 0.30 * s.bass);
+        let radius = 0.035 + life * 0.035 + 0.02 * s.kick;
+        *slot = (u, v, side * strength, radius);
     }
     let obst_u = 0.16;
     let obst_v = 0.5;
-    let obst_r = 0.045;
+    let obst_r = 0.045 + 0.012 * s.bass + 0.02 * s.impact;
+    // The released pair starts at the leading edge and drifts downstream as
+    // the attack envelope decays.
+    let pair_u = 0.22 + 0.48 * (1.0 - s.impact);
     for j in 0..s.height() {
         let v = s.v(j);
         for i in 0..s.width() {
             let u = s.u(i);
             let mut spin = 0.0;
-            for &(su, sv, strength, radius) in shed.iter().take(count) {
+            for &(su, sv, strength, radius) in &shed {
                 let dx = (u - su) * span;
                 let dy = v - sv;
                 let d2 = dx * dx + dy * dy;
@@ -378,8 +446,13 @@ fn vortex_street(s: &mut Scene<'_>) {
             let shear = (-((v - 0.5) / 0.22).powi(2)).exp()
                 * 0.18
                 * (u - obst_u).max(0.0)
-                * (u * 8.0 - s.t * 0.8).cos();
+                * (u * 8.0 - s.transport * 0.8).cos();
             spin += shear;
+            for (side, sv) in [(1.0f32, 0.38f32), (-1.0, 0.62)] {
+                let dx = (u - pair_u) * span;
+                let dy = v - sv;
+                spin += side * s.impact * 1.5 * (-(dx * dx + dy * dy) / 0.0042).exp();
+            }
             let du = (u - obst_u) * span;
             let dv = v - obst_v;
             let dr = (du * du + dv * dv).sqrt();
@@ -399,52 +472,76 @@ fn vortex_street(s: &mut Scene<'_>) {
     }
 }
 
-/// Liquid climbing narrow capillaries: the bass sets the column heights, the
-/// beat nudges them, and treble shimmers the meniscus.
+const CAPILLARIES: usize = 6;
+
+/// Centre and half-width of a capillary in canvas coordinates. Widths vary, so
+/// the surface never settles into a row of equal bars.
+fn capillary(k: usize) -> (f32, f32) {
+    let f = k as f32;
+    let centre = 0.5 + (f - 2.5) * 0.155;
+    let half = 0.052 - 0.008 * (f * 1.7).sin().abs();
+    (centre, half)
+}
+
+/// Liquid height at `u`: one continuous meniscus curve with a peak standing in
+/// each tube. `charge` lifts the columns and `kick` ripples the crest.
+fn meniscus(u: f32, level: f32, charge: f32, kick: f32, ripple: f32) -> f32 {
+    let mut h = level + 0.012 * (u * 13.0 + ripple).sin() * kick;
+    for k in 0..CAPILLARIES {
+        let (centre, half) = capillary(k);
+        let q = (u - centre) / half;
+        // Narrow tubes draw liquid higher, as real capillaries do.
+        let climb = (0.08 + 0.42 * charge) * (0.055 / half);
+        h += climb / (1.0 + q * q * 2.6);
+    }
+    h
+}
+
+/// Liquid climbing narrow capillaries. The charge built by attacks raises a
+/// shared reservoir and its menisci; `bass` deepens the climb and treble
+/// shimmers the surface. The liquid is one body, not a chart of columns.
 fn capillary_rise(s: &mut Scene<'_>) {
-    let columns = 7.0;
-    let wall = 0.045;
+    let charge = (s.level * 0.62 + s.bass * 0.30 + s.energy * 0.08).min(1.0);
+    let level = 0.05 + 0.30 * s.level + 0.08 * s.bass;
     for j in 0..s.height() {
         let v = s.v(j);
         let d = 1.0 - v;
         for i in 0..s.width() {
             let u = s.u(i);
-            let scaled = u * columns;
-            let column = scaled.floor() as usize % 7;
-            let local = scaled.fract();
-            let ci = column as f32;
-            let surface = 0.30
-                + 0.16 * (s.t * 0.55 + ci * 0.9).sin()
-                + 0.22 * s.bass
-                + 0.05 * s.beat
-                + 0.03 * (s.t * 1.7 + ci * 2.3).sin();
-            let lift = 0.05 * (1.0 - (2.0 * local - 1.0).powi(2)) * (0.4 + s.treble);
-            let top = surface + lift;
-            let (mark, phase, light) = if local < wall || local > 1.0 - wall {
-                if d < top {
-                    ('│', 0.62 + 0.1 * ci, 0.18 + 0.10 * s.treble)
-                } else {
-                    (' ', 0.5, 0.0)
-                }
-            } else if d < top {
-                let depth = top - d;
-                let near = (-depth * 20.0).exp();
-                let streak = 0.5 + 0.5 * (d * 64.0 + ci * 3.0 + s.t * 2.4).sin();
-                let light = (0.22 + near * 0.7 + streak * 0.10).min(1.0);
-                let mark = if near > 0.45 {
+            let surface = meniscus(u, level, charge, s.kick, s.transport).min(0.95);
+            let crest = (-((d - surface) / 0.016).powi(2)).exp();
+            let mut wall: f32 = 1.0;
+            for k in 0..CAPILLARIES {
+                let (centre, half) = capillary(k);
+                wall = wall.min(((u - centre).abs() - half).abs());
+            }
+            let (mark, phase, light) = if d < surface {
+                let depth = surface - d;
+                let near = (-depth * 16.0).exp();
+                let streak = 0.5 + 0.5 * (d * 54.0 - s.transport * 2.2 + u * 18.0).sin();
+                let light = (0.14 + near * 0.66 + streak * 0.07 + crest * 0.35).min(1.0);
+                let mark = if crest > 0.5 {
                     '▄'
-                } else if light > 0.62 {
+                } else if light > 0.58 {
                     '▓'
-                } else if light > 0.38 {
+                } else if light > 0.34 {
                     '▒'
-                } else {
+                } else if light > 0.15 {
                     '░'
+                } else {
+                    '·'
                 };
-                (mark, 0.52 + 0.03 * ci + near * 0.22 + 0.24 * s.hue, light)
+                (
+                    mark,
+                    0.50 + 0.04 * (u * 9.0) + near * 0.18 + crest * 0.22 + 0.22 * s.hue,
+                    light,
+                )
+            } else if wall < 0.006 {
+                ('│', 0.62 + 0.10 * s.treble, 0.12 + 0.10 * s.treble)
             } else {
-                let spark = (d * 26.0 + ci * 2.1 - s.t * 2.6).sin();
-                if spark > 0.965 {
-                    ('·', 0.7, 0.25 + 0.2 * s.treble)
+                let spark = (d * 26.0 + u * 31.0 - s.transport * 2.6).sin();
+                if spark > 0.972 {
+                    ('·', 0.70, 0.16 + 0.18 * s.treble)
                 } else {
                     (' ', 0.5, 0.0)
                 }
@@ -591,38 +688,46 @@ fn viscous_fingers(s: &mut Scene<'_>) {
     }
 }
 
-/// Line-integral convection streamlines through a double gyre. `mid` speeds the
-/// flow, treble shortens the dashes, and the waveform bends each column.
+/// Line-integral convection streamlines through a double gyre. `mid` and
+/// `energy` set the flow speed, so a silent stream rests; an attack bends the
+/// streamlines and drags a visible plume along them.
 fn current_lines(s: &mut Scene<'_>) {
-    let flow = 0.7 + 1.1 * s.mid;
+    let flow = 0.25 + 1.15 * s.mid + 0.85 * s.energy;
     let band = 28.0 + 10.0 * s.treble;
+    let gust_u = (0.10 + s.transport * 0.22).rem_euclid(1.24) - 0.12;
+    let gust_v = 0.5 + 0.28 * (s.transport * 0.8).sin();
     for j in 0..s.height() {
         let v = s.v(j);
         for i in 0..s.width() {
             let u = s.u(i);
             let wv = s.audio.waveform[(u * 31.0) as usize] * 0.6;
-            let mut pu = u;
-            let mut pv = v;
+            let du = u - gust_u;
+            let dv = v - gust_v;
+            let plume = s.impact * (-(du * du + dv * dv) / 0.010).exp();
+            let mut pu = (u + 0.035 * plume * (dv * 22.0).cos()).rem_euclid(1.0);
+            let mut pv = (v + 0.035 * plume * (du * 22.0).sin()).rem_euclid(1.0);
             let mut acc = 0.0;
             let mut fx = 0.0;
             let mut fy = 0.0;
             for _ in 0..5 {
                 let ux = PI * (PI * pu).sin() * (PI * pv).cos() * flow;
-                let uy = 0.35 * (TAU * pu + s.t * 0.4).sin()
+                let uy = 0.35 * (TAU * pu + s.transport * 0.4).sin()
                     - PI * (PI * pu).cos() * (PI * pv).sin() * flow;
                 pu = (pu + ux * 0.004).rem_euclid(1.0);
                 pv = (pv + uy * 0.004).rem_euclid(1.0);
-                fx = ux;
-                fy = uy;
-                acc += (band * (pu * 0.7 + pv * 0.4) - s.t * 2.6 + wv).sin();
+                // The gust turns the local tangent, so the glyphs change
+                // direction along the plume instead of only getting brighter.
+                fx = ux + plume * 1.6 * (dv * 26.0).cos();
+                fy = uy + plume * 1.6 * (du * 26.0).sin();
+                acc += (band * (pu * 0.7 + pv * 0.4) - s.transport * 2.6 + wv).sin();
             }
-            let b = (acc / 5.0).abs().powf(1.4) * (0.8 + 0.6 * s.energy);
-            let mark = if b > 0.05 {
+            let b = ((acc / 5.0).abs().powf(1.4) * (0.24 + 0.90 * s.energy) + plume * 0.9).min(1.0);
+            let mark = if b > 0.05 + 0.10 * (1.0 - s.energy) {
                 direction_glyph(fx, fy)
             } else {
                 ' '
             };
-            let phase = 0.52 + 0.22 * ((pu - pv) * 2.0).sin() + 0.2 * s.hue;
+            let phase = 0.52 + 0.22 * ((pu - pv) * 2.0).sin() + 0.2 * s.hue + 0.24 * plume;
             s.put(i, j, mark, phase, (b * 1.2).min(1.0));
         }
     }
@@ -686,7 +791,7 @@ mod tests {
     fn render(style: usize, audio: &Reactivity) -> String {
         let area = Rect::new(1, 2, 100, 40);
         let mut buf = Buffer::empty(area);
-        let mut renderer = Renderer;
+        let mut renderer = Renderer::default();
         for frame in 0..90 {
             renderer.draw(
                 &mut buf,
@@ -795,7 +900,7 @@ mod tests {
                 cell.set_char('X');
             }
             let target = Rect::new(7, 5, 19, 11);
-            Renderer.draw(
+            Renderer::default().draw(
                 &mut buf,
                 target,
                 2.5,
@@ -825,7 +930,7 @@ mod tests {
                 Rect::new(9, 9, 2, 3),
             ] {
                 let mut buf = Buffer::empty(Rect::new(0, 0, 5, 4));
-                Renderer.draw(
+                Renderer::default().draw(
                     &mut buf,
                     area,
                     f32::NAN,
@@ -845,5 +950,265 @@ mod tests {
         for style in 0..NAMES.len() {
             assert_eq!(render(style, &audio), render(style, &audio));
         }
+    }
+
+    const AREA: Rect = Rect::new(0, 0, 100, 40);
+
+    fn draw_frame(
+        renderer: &mut Renderer,
+        buf: &mut Buffer,
+        style: usize,
+        audio: &Reactivity,
+        frame: usize,
+    ) {
+        renderer.draw(
+            buf,
+            AREA,
+            frame as f32 / 30.0,
+            style,
+            0,
+            &BANDS,
+            audio,
+            &Theme::default(),
+        );
+    }
+
+    fn render_buffer(style: usize, audio: &Reactivity, frames: usize) -> (Renderer, Buffer) {
+        let mut buf = Buffer::empty(AREA);
+        let mut renderer = Renderer::default();
+        for frame in 0..frames {
+            draw_frame(&mut renderer, &mut buf, style, audio, frame);
+        }
+        (renderer, buf)
+    }
+
+    fn luminance(color: Color) -> i32 {
+        match color {
+            Color::Rgb(r, g, b) => (r as i32 + g as i32 + b as i32) / 3,
+            _ => 0,
+        }
+    }
+
+    /// Perceptible cell change: a glyph swap or a luminance step that a viewer
+    /// can see, so eight-bit colour rounding does not read as motion.
+    fn signature(buf: &Buffer) -> Vec<(char, i32)> {
+        buf.content
+            .iter()
+            .map(|c| {
+                let glyph = c.symbol().chars().next().unwrap_or(' ');
+                (glyph, (luminance(c.fg) + luminance(c.bg)) / 2)
+            })
+            .collect()
+    }
+
+    fn mask(buf: &Buffer) -> Vec<char> {
+        buf.content
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    /// Mean fraction of cells that change per frame once the envelopes settle.
+    fn movement(style: usize, audio: &Reactivity) -> f32 {
+        let mut buf = Buffer::empty(AREA);
+        let mut renderer = Renderer::default();
+        for frame in 0..30 {
+            draw_frame(&mut renderer, &mut buf, style, audio, frame);
+        }
+        let mut last = signature(&buf);
+        let mut total = 0.0;
+        for frame in 30..60 {
+            draw_frame(&mut renderer, &mut buf, style, audio, frame);
+            let now = signature(&buf);
+            total += now
+                .iter()
+                .zip(&last)
+                .filter(|(a, b)| a.0 != b.0 || (a.1 - b.1).abs() > 8)
+                .count() as f32
+                / now.len() as f32;
+            last = now;
+        }
+        total / 30.0
+    }
+
+    #[test]
+    fn named_scenes_rest_in_silence_and_follow_energy() {
+        let quiet = Reactivity::default();
+        let active = Reactivity {
+            energy: 0.9,
+            bass: 0.6,
+            mid: 0.8,
+            ..Reactivity::default()
+        };
+        for style in [1, 3, 8] {
+            let rest = movement(style, &quiet);
+            let moving = movement(style, &active);
+            assert!(
+                rest < 0.01,
+                "{} still churns {:.1}% of its cells in silence",
+                NAMES[style],
+                rest * 100.0
+            );
+            assert!(
+                moving > 0.05,
+                "{} only moves {:.1}% of its cells with energy",
+                NAMES[style],
+                moving * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn transients_bend_named_scenes_structurally() {
+        let steady = Reactivity {
+            energy: 0.5,
+            bass: 0.4,
+            mid: 0.4,
+            ..Reactivity::default()
+        };
+        let hit = Reactivity {
+            onset: 1.0,
+            kick: 1.0,
+            transients: [1.0; 4],
+            ..steady
+        };
+        for style in [1, 3, 8] {
+            let (mut plain, mut plain_buf) = render_buffer(style, &steady, 24);
+            let (mut struck, mut struck_buf) = render_buffer(style, &steady, 24);
+            draw_frame(&mut plain, &mut plain_buf, style, &steady, 24);
+            draw_frame(&mut struck, &mut struck_buf, style, &hit, 24);
+            let changed = mask(&plain_buf)
+                .iter()
+                .zip(mask(&struck_buf).iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            assert!(
+                changed > 150,
+                "{} attack changed only {changed} glyph cells",
+                NAMES[style]
+            );
+        }
+    }
+
+    #[test]
+    fn capillary_meniscus_is_a_continuous_rising_curve() {
+        let sample = |charge: f32| -> Vec<f32> {
+            (0..240)
+                .map(|i| meniscus(i as f32 / 240.0, 0.10, charge, 0.4, 1.3))
+                .collect()
+        };
+        let low = sample(0.05);
+        let high = sample(0.95);
+        let step = low
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            step < 0.08,
+            "the surface steps {step:.3} between samples like separate bars"
+        );
+        let peak = |v: &[f32]| v.iter().copied().fold(f32::MIN, f32::max);
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        assert!(
+            peak(&high) > peak(&low) + 0.15,
+            "charge did not raise the menisci"
+        );
+        assert!(
+            mean(&high) > mean(&low) + 0.06,
+            "charge did not raise the body"
+        );
+        for k in 0..CAPILLARIES {
+            let (centre, _) = capillary(k);
+            assert!(
+                meniscus(centre, 0.10, 0.95, 0.0, 0.0)
+                    > meniscus(centre, 0.10, 0.05, 0.0, 0.0) + 0.1,
+                "tube {k} did not climb with charge"
+            );
+        }
+    }
+
+    #[test]
+    fn capillary_attacks_raise_the_liquid_body() {
+        let quiet = Reactivity::default();
+        let (quiet_state, quiet_buf) = render_buffer(4, &quiet, 90);
+        let mut struck = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        for frame in 0..90 {
+            let pulse = if frame % 6 == 0 { 1.0 } else { 0.0 };
+            let audio = Reactivity {
+                energy: 0.7,
+                bass: 0.6,
+                kick: pulse,
+                onset: pulse,
+                transients: [pulse; 4],
+                ..Reactivity::default()
+            };
+            draw_frame(&mut struck, &mut buf, 4, &audio, frame);
+        }
+        assert!(
+            struck.level > quiet_state.level + 0.2,
+            "attacks did not charge the capillaries ({:.3} vs {:.3})",
+            struck.level,
+            quiet_state.level
+        );
+        let liquid = |buf: &Buffer| {
+            buf.content
+                .iter()
+                .filter(|c| matches!(c.symbol(), "▄" | "▓" | "▒" | "░"))
+                .count()
+        };
+        assert!(
+            liquid(&buf) > liquid(&quiet_buf) + 100,
+            "charged capillaries did not fill more cells ({} vs {})",
+            liquid(&buf),
+            liquid(&quiet_buf)
+        );
+    }
+
+    #[test]
+    fn attack_memory_stays_bounded_and_drains() {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        for frame in 0..300 {
+            let pulse = if frame % 5 == 0 { 1.0 } else { 0.0 };
+            let audio = Reactivity {
+                energy: 1.0,
+                bass: 0.8,
+                mid: 0.7,
+                kick: pulse,
+                onset: pulse,
+                transients: [pulse; 4],
+                ..Reactivity::default()
+            };
+            draw_frame(&mut renderer, &mut buf, 4, &audio, frame);
+        }
+        assert!((0.0..=1.0).contains(&renderer.impact));
+        assert!((0.0..=1.0).contains(&renderer.level));
+        assert!(renderer.transport.is_finite() && renderer.transport <= 4096.0);
+        let charged = renderer.level;
+        for frame in 300..900 {
+            draw_frame(&mut renderer, &mut buf, 4, &Reactivity::default(), frame);
+        }
+        assert_eq!(renderer.impact, 0.0, "impact did not decay");
+        assert!(
+            renderer.level < charged * 0.5,
+            "charge did not drain ({:.3} of {charged:.3})",
+            renderer.level
+        );
+        let hostile = Reactivity {
+            energy: f32::NAN,
+            bass: f32::INFINITY,
+            mid: 1e30,
+            onset: f32::NAN,
+            kick: f32::NAN,
+            transients: [f32::INFINITY; 4],
+            ..Reactivity::default()
+        };
+        for style in [1, 3, 4, 8] {
+            draw_frame(&mut renderer, &mut buf, style, &hostile, 900);
+        }
+        assert!(renderer.impact.is_finite() && (0.0..=1.0).contains(&renderer.impact));
+        assert!(renderer.level.is_finite() && (0.0..=1.0).contains(&renderer.level));
+        assert!(renderer.transport.is_finite());
     }
 }
