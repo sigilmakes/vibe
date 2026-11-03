@@ -76,7 +76,7 @@ impl Canvas {
     }
 
     fn plot(&mut self, x: i32, y: i32, mark: char, level: f32) {
-        if !(level > 0.0) || x < 0 || y < 0 {
+        if !level.is_finite() || level <= 0.0 || x < 0 || y < 0 {
             return;
         }
         let (x, y) = (x as usize, y as usize);
@@ -116,7 +116,7 @@ fn point_along(pts: &[[f32; 2]], s: f32) -> [f32; 2] {
         .windows(2)
         .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
         .sum();
-    if !(total > 0.0) {
+    if !total.is_finite() || total <= 0.0 {
         return pts.first().copied().unwrap_or([0.0, 0.0]);
     }
     let target = unit(s) * total;
@@ -675,8 +675,8 @@ impl Renderer {
         }
         let fw = w as f32;
         let fh = h as f32;
-        let pulse =
-            (t * 1.3 + unit(audio.locked_beat_phase()) * 1.6 + unit(audio.bass) * 1.1).rem_euclid(6.2);
+        let pulse = (t * 1.3 + unit(audio.locked_beat_phase()) * 1.6 + unit(audio.bass) * 1.1)
+            .rem_euclid(6.2);
         for b in &self.tree {
             let d = b.depth as f32;
             let ring = (-((d + 0.5 - pulse) * (d + 0.5 - pulse)) * 1.8).exp();
@@ -824,8 +824,8 @@ impl Renderer {
             route_level,
         );
         route.push([right, ys[row] as f32]);
-        let s =
-            (t * (0.18 + unit(audio.bass) * 0.2) + unit(audio.locked_beat_phase()) * 0.5).rem_euclid(1.0);
+        let s = (t * (0.18 + unit(audio.bass) * 0.2) + unit(audio.locked_beat_phase()) * 0.5)
+            .rem_euclid(1.0);
         for tail in 0..4 {
             let p = point_along(&route, (s - tail as f32 * 0.012).rem_euclid(1.0));
             self.canvas.dot(
@@ -911,8 +911,8 @@ impl Renderer {
         xs.push(0);
         let total: f32 = weights.iter().sum();
         let mut acc = 0.0;
-        for c in 0..cols - 1 {
-            acc += weights[c];
+        for &weight in weights.iter().take(cols - 1) {
+            acc += weight;
             let previous = *xs.last().unwrap_or(&0);
             let x = (acc / total * fw).round() as i32;
             xs.push(x.clamp(previous, (w as i32 - 1).max(0)));
@@ -925,8 +925,8 @@ impl Renderer {
         ys.push(0);
         let row_total: f32 = row_weights.iter().sum();
         let mut racc = 0.0;
-        for r in 0..rows - 1 {
-            racc += row_weights[r];
+        for &weight in row_weights.iter().take(rows - 1) {
+            racc += weight;
             let previous = *ys.last().unwrap_or(&0);
             let y = (racc / row_total * fh).round() as i32;
             ys.push(y.clamp(previous, (h as i32 - 1).max(0)));

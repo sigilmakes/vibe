@@ -71,6 +71,7 @@ impl Renderer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     buf: &mut Buffer,
     col: u16,
@@ -326,6 +327,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rings(
         &mut self,
         buf: &mut Buffer,
@@ -672,6 +674,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn comet(
         &mut self,
         buf: &mut Buffer,
@@ -779,6 +782,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assist(
         &mut self,
         buf: &mut Buffer,
@@ -907,6 +911,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tidal(
         &mut self,
         buf: &mut Buffer,
@@ -1022,6 +1027,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resonance(
         &mut self,
         buf: &mut Buffer,
@@ -1125,6 +1131,7 @@ impl Renderer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn roche(
         &mut self,
         buf: &mut Buffer,

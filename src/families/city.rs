@@ -100,7 +100,7 @@ impl Canvas {
     }
 
     fn plot_tinted(&mut self, x: i32, y: i32, mark: char, level: f32, hue: f32) {
-        if !(level > 0.0) || x < 0 || y < 0 {
+        if !level.is_finite() || level <= 0.0 || x < 0 || y < 0 {
             return;
         }
         let (x, y) = (x as usize, y as usize);
@@ -150,7 +150,7 @@ fn point_along(pts: &[[f32; 2]], s: f32) -> [f32; 2] {
         .windows(2)
         .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
         .sum();
-    if !(total > 0.0) {
+    if !total.is_finite() || total <= 0.0 {
         return pts.first().copied().unwrap_or([0.0, 0.0]);
     }
     let target = unit(s) * total;
@@ -839,10 +839,10 @@ impl Renderer {
                 let road_y = j.rem_euclid(sy) < 2;
                 if road_x || road_y {
                     self.canvas.plot(i, j, '·', 0.045 + treble * 0.02);
-                    if i.rem_euclid(sx) == 1 || j.rem_euclid(sy) == 1 {
-                        if (i + j + (t * 4.0) as i32) % 9 == 0 {
-                            self.canvas.plot(i, j, '─', 0.14);
-                        }
+                    if (i.rem_euclid(sx) == 1 || j.rem_euclid(sy) == 1)
+                        && (i + j + (t * 4.0) as i32) % 9 == 0
+                    {
+                        self.canvas.plot(i, j, '─', 0.14);
                     }
                 } else {
                     let bx = i / sx;
@@ -1033,7 +1033,7 @@ impl Renderer {
                     if lit {
                         for y in (y0 + sh + 1)..h as i32 {
                             let wobble = (y as f32 * 0.5 + t * 2.2).sin() * 1.2;
-                            if (y + id as i32) % 2 == 0 {
+                            if (y + id) % 2 == 0 {
                                 self.canvas.dot_tinted(
                                     cx + wobble,
                                     y as f32,
@@ -1188,7 +1188,7 @@ mod tests {
     fn every_style_draws_and_scenes_differ() {
         let quiet = Reactivity::default();
         let mut images = Vec::new();
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             let image = snapshot(mode, &quiet);
             assert!(
                 image.chars().any(|mark| mark != ' '),
@@ -1213,7 +1213,7 @@ mod tests {
             beat_phase: 0.5,
             ..Reactivity::default()
         };
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             assert_ne!(
                 snapshot(mode, &quiet),
                 snapshot(mode, &loud),
@@ -1226,7 +1226,7 @@ mod tests {
     fn drawing_stays_inside_the_visible_area() {
         let mut renderer = Renderer::default();
         let area = Rect::new(4, 5, 11, 7);
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             for target in [
                 Rect::new(0, 0, 0, 0),
                 Rect::new(5, 6, 1, 1),
@@ -1279,7 +1279,7 @@ mod tests {
         for (i, band) in bands.iter_mut().enumerate() {
             *band = 0.4 + 0.5 * ((i as f32 * 0.7).sin() * 0.5 + 0.5);
         }
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             for frame in 0..30 {
                 renderer.draw(
                     &mut buf,

@@ -678,7 +678,7 @@ mod tests {
     fn render(style: usize, audio: &Reactivity) -> String {
         let area = Rect::new(1, 2, 100, 40);
         let mut buf = Buffer::empty(area);
-        let mut renderer = Renderer::default();
+        let mut renderer = Renderer;
         for frame in 0..90 {
             renderer.draw(
                 &mut buf,
@@ -764,7 +764,7 @@ mod tests {
                 cell.set_char('X');
             }
             let target = Rect::new(7, 5, 19, 11);
-            Renderer::default().draw(
+            Renderer.draw(
                 &mut buf,
                 target,
                 2.5,
@@ -794,7 +794,7 @@ mod tests {
                 Rect::new(9, 9, 2, 3),
             ] {
                 let mut buf = Buffer::empty(Rect::new(0, 0, 5, 4));
-                Renderer::default().draw(
+                Renderer.draw(
                     &mut buf,
                     area,
                     f32::NAN,

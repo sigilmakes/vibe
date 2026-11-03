@@ -93,7 +93,7 @@ impl Canvas {
     }
 
     fn plot(&mut self, x: i32, y: i32, mark: char, level: f32) {
-        if !(level > 0.0) || x < 0 || y < 0 {
+        if !level.is_finite() || level <= 0.0 || x < 0 || y < 0 {
             return;
         }
         let (x, y) = (x as usize, y as usize);
@@ -197,6 +197,7 @@ struct Bolt {
 }
 
 fn build_bolt(seed: u32, fw: f32, fh: f32, branch_skip: f32) -> Vec<Bolt> {
+    #[allow(clippy::too_many_arguments)]
     fn grow(
         out: &mut Vec<Bolt>,
         x: f32,
@@ -555,7 +556,7 @@ impl Renderer {
         }
         for x in 0..w as i32 {
             let height = 1 + (noise2(x as f32 * 0.12 + t * 0.02, 3.7) * 2.0 + bass * 2.0) as i32;
-            for k in 0..height.max(0).min(4) {
+            for k in 0..height.clamp(0, 4) {
                 self.canvas
                     .plot(x, h as i32 - 1 - k, '░', 0.12 + treble * 0.08);
             }
@@ -642,7 +643,7 @@ impl Renderer {
         for x in 0..w as i32 {
             let n = noise2(x as f32 * 0.16 + t * 0.03, 1.3);
             let height = 1 + (n * 2.0 + bass * 2.0) as i32;
-            for k in 0..height.max(0).min(4) {
+            for k in 0..height.clamp(0, 4) {
                 self.canvas
                     .plot(x, h as i32 - 1 - k, '░', 0.14 + bass * 0.14);
             }
@@ -770,8 +771,9 @@ impl Renderer {
         let bass = unit(audio.bass);
         let energy = unit(audio.energy);
         let treble = unit(audio.treble);
-        let sweep =
-            t * (0.7 + energy * 1.1) + unit(audio.locked_beat_phase()) * TAU + unit(audio.centroid) * 2.0;
+        let sweep = t * (0.7 + energy * 1.1)
+            + unit(audio.locked_beat_phase()) * TAU
+            + unit(audio.centroid) * 2.0;
         for j in 0..h {
             let v = j as f32 / fh;
             for i in 0..w {
@@ -875,7 +877,7 @@ mod tests {
     fn every_style_draws_and_scenes_differ() {
         let quiet = Reactivity::default();
         let mut images = Vec::new();
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             let image = snapshot(mode, &quiet);
             assert!(
                 image.chars().any(|mark| mark != ' '),
@@ -900,7 +902,7 @@ mod tests {
             beat_phase: 0.5,
             ..Reactivity::default()
         };
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             assert_ne!(
                 snapshot(mode, &quiet),
                 snapshot(mode, &loud),
@@ -913,7 +915,7 @@ mod tests {
     fn drawing_stays_inside_the_visible_area() {
         let mut renderer = Renderer::default();
         let area = Rect::new(4, 5, 11, 7);
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             for target in [
                 Rect::new(0, 0, 0, 0),
                 Rect::new(5, 6, 1, 1),
@@ -966,7 +968,7 @@ mod tests {
             flatness: 0.4,
             ..Reactivity::default()
         };
-        for mode in 0..NAMES.len() {
+        for (mode, _) in NAMES.iter().enumerate() {
             for frame in 0..30 {
                 renderer.draw(
                     &mut buf,

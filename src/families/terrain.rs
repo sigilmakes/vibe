@@ -252,6 +252,7 @@ impl Renderer {
 
 /// Layered mountain silhouettes with atmospheric haze. Bass lifts the ridges,
 /// onsets light their crests and treble thickens the star field.
+#[allow(clippy::needless_range_loop)]
 fn ridge_horizon(s: &mut Scene<'_>) {
     let width = s.width();
     let height = s.height();
@@ -753,9 +754,7 @@ fn tundra_silence(s: &mut Scene<'_>) {
                 let b = (curtain * 0.7 + if spark > 0.99 { 0.3 * s.treble } else { 0.0 }).min(0.9);
                 let mark = if curtain > 0.45 {
                     '░'
-                } else if curtain > 0.2 {
-                    '·'
-                } else if spark > 0.994 - 0.004 * s.treble {
+                } else if curtain > 0.2 || spark > 0.994 - 0.004 * s.treble {
                     '·'
                 } else {
                     ' '
@@ -893,7 +892,7 @@ mod tests {
     fn render(style: usize, audio: &Reactivity) -> String {
         let area = Rect::new(1, 2, 100, 40);
         let mut buf = Buffer::empty(area);
-        let mut renderer = Renderer::default();
+        let mut renderer = Renderer;
         for frame in 0..90 {
             renderer.draw(
                 &mut buf,
@@ -979,7 +978,7 @@ mod tests {
                 cell.set_char('X');
             }
             let target = Rect::new(7, 5, 19, 11);
-            Renderer::default().draw(
+            Renderer.draw(
                 &mut buf,
                 target,
                 2.5,
@@ -1009,7 +1008,7 @@ mod tests {
                 Rect::new(9, 9, 2, 3),
             ] {
                 let mut buf = Buffer::empty(Rect::new(0, 0, 5, 4));
-                Renderer::default().draw(
+                Renderer.draw(
                     &mut buf,
                     area,
                     f32::NAN,
