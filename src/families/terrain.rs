@@ -893,11 +893,22 @@ mod tests {
 
     const BANDS: [f32; 32] = [0.5; 32];
 
-    fn render(style: usize, audio: &Reactivity) -> String {
+    fn render(
+        style: usize,
+        audio: &Reactivity,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
+        render_for(style, audio, 90)
+    }
+
+    fn render_for(
+        style: usize,
+        audio: &Reactivity,
+        frames: usize,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
         let area = Rect::new(1, 2, 100, 40);
         let mut buf = Buffer::empty(area);
         let mut renderer = Renderer;
-        for frame in 0..90 {
+        for frame in 0..frames {
             renderer.draw(
                 &mut buf,
                 area,
@@ -909,7 +920,10 @@ mod tests {
                 &Theme::default(),
             );
         }
-        buf.content.iter().map(|c| c.symbol()).collect()
+        buf.content
+            .iter()
+            .map(|c| (c.symbol().to_owned(), c.fg, c.bg))
+            .collect()
     }
 
     fn loud() -> Reactivity {
@@ -945,7 +959,7 @@ mod tests {
         for style in 0..NAMES.len() {
             let image = render(style, &Reactivity::default());
             assert!(
-                image.chars().filter(|c| *c != ' ').count() > 200,
+                image.iter().filter(|(c, ..)| c != " ").count() > 200,
                 "style {style} barely painted"
             );
         }
@@ -965,9 +979,8 @@ mod tests {
         let quiet = Reactivity::default();
         let loud = loud();
         for style in 0..NAMES.len() {
-            assert_ne!(
-                render(style, &quiet),
-                render(style, &loud),
+            assert!(
+                render(style, &quiet) != render(style, &loud),
                 "style {style} ignores audio"
             );
         }
@@ -978,6 +991,53 @@ mod tests {
         let t = 64.0 * std::f32::consts::TAU + 0.25;
         assert_eq!(clock(t), t);
         assert_eq!(clock(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn each_style_keeps_its_audio_wiring() {
+        // Terrain shifts height from band energy and hue from chroma and the
+        // brightness centroid. Hue-only inputs are invisible to a symbol
+        // snapshot, so probe each input against the full cell contents.
+        let quiet = Reactivity::default();
+        let probes = [
+            (
+                "bass",
+                Reactivity {
+                    bass: 0.85,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "energy",
+                Reactivity {
+                    energy: 0.7,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "centroid",
+                Reactivity {
+                    centroid: 0.9,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "chroma",
+                Reactivity {
+                    chroma: std::array::from_fn(|i| if i == 3 { 0.9 } else { 0.0 }),
+                    ..Reactivity::default()
+                },
+            ),
+        ];
+        for (style, name) in NAMES.iter().enumerate() {
+            let base = render_for(style, &quiet, 30);
+            for (input, audio) in &probes {
+                assert!(
+                    base != render_for(style, audio, 30),
+                    "{name} ignores {input}"
+                );
+            }
+        }
     }
 
     #[test]

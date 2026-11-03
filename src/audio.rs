@@ -2209,6 +2209,25 @@ mod tests {
     }
 
     #[test]
+    fn pcm_format_validation_rejects_zero_rate_and_channels() {
+        use crate::audio::SampleFormat;
+        let valid = PcmFormat {
+            rate: 48_000,
+            channels: 2,
+            sample: SampleFormat::F32,
+        };
+        assert_eq!(valid.validate().unwrap(), valid);
+        for (rate, channels) in [(0, 2), (48_000, 0), (0, 0)] {
+            let bad = PcmFormat {
+                rate,
+                channels,
+                sample: SampleFormat::F32,
+            };
+            assert!(bad.validate().is_err(), "{rate} Hz, {channels} channels");
+        }
+    }
+
+    #[test]
     fn pcm_decoder_mixes_channels_and_accepts_s16_and_f32() {
         let mut samples = [0.0_f32; HOP];
         let format = PcmFormat {

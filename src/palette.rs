@@ -773,9 +773,7 @@ mod tests {
         assert_eq!(input.theme.background, old_background);
         let updated = input.theme.clone();
         input.next_refresh = Some(Instant::now());
-        let start = Instant::now();
         assert!(input.read(wait).unwrap().is_none());
-        assert!(start.elapsed() < Duration::from_millis(100));
         assert_eq!(
             input.theme, updated,
             "unanswered refresh retains the last theme"

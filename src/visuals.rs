@@ -1562,6 +1562,63 @@ mod tests {
     }
 
     #[test]
+    fn every_scene_renders_a_distinct_image() {
+        use std::collections::HashMap;
+        use std::hash::{Hash, Hasher};
+
+        // Family tests only compare scenes inside one family, so a renderer
+        // that is accidentally wired to another family's body stays green.
+        let area = Rect::new(0, 0, 64, 20);
+        let theme = crate::palette::Theme::default();
+        let audio = Reactivity {
+            energy: 0.7,
+            bass: 0.6,
+            mid: 0.5,
+            treble: 0.6,
+            onset: 0.5,
+            kick: 0.6,
+            beat: 0.7,
+            beat_phase: 0.3,
+            tempo_confidence: 0.8,
+            novelty: 0.4,
+            chroma: [0.5; 12],
+            centroid: 0.5,
+            flatness: 0.3,
+            width: 0.4,
+            balance: 0.2,
+            ..Reactivity::default()
+        };
+        let bands: [f32; 32] = std::array::from_fn(|i| ((i as f32 * 0.7).sin() * 0.5 + 0.5) * 0.8);
+        let mut seen: HashMap<u64, &str> = HashMap::new();
+        for (scene, name) in SCENES.iter().enumerate() {
+            let mut buffer = Buffer::empty(area);
+            let mut renderer = Renderer::default();
+            for frame in 0..8 {
+                renderer.draw(
+                    &mut buffer,
+                    area,
+                    frame as f32 / 60.0,
+                    scene,
+                    0,
+                    &bands,
+                    &audio,
+                    &theme,
+                );
+            }
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            for cell in &buffer.content {
+                cell.symbol().hash(&mut hasher);
+                cell.fg.hash(&mut hasher);
+                cell.bg.hash(&mut hasher);
+            }
+            if let Some(other) = seen.insert(hasher.finish(), name) {
+                panic!("{name} renders the same image as {other}");
+            }
+        }
+        assert_eq!(seen.len(), SCENES.len());
+    }
+
+    #[test]
     fn registry_maps_every_scene_once_to_a_family_and_name() {
         use std::collections::{HashMap, HashSet};
 

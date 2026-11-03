@@ -811,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual release-mode frame timing at 160x50"]
     fn frame_budget() {
         let theme = Theme::default();
         let area = Rect::new(0, 0, 160, 50);

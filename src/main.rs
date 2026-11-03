@@ -282,6 +282,37 @@ fn apply_cli(config: &mut config::Config, args: &Args) {
     }
 }
 
+/// Cross-flag checks that clap cannot express on a single argument.
+fn validate_args(args: &Args) -> io::Result<()> {
+    if args.audio_source == Some(AudioSourceArg::Command) && args.audio_command.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--audio-source command needs --audio-command",
+        ));
+    }
+    if args.audio_source == Some(AudioSourceArg::File) && args.audio_file.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--audio-source file needs --audio-file",
+        ));
+    }
+    if let Some(name) = &args.palette {
+        if !palette::PALETTES
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(name))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown palette '{name}'; choose: {}",
+                    palette::PALETTES.join(", ")
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_audio(capture: &audio::Capture, timeout: Duration) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     let mut state = capture.snapshot();
@@ -399,32 +430,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    if args.audio_source == Some(AudioSourceArg::Command) && args.audio_command.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--audio-source command needs --audio-command",
-        ));
-    }
-    if args.audio_source == Some(AudioSourceArg::File) && args.audio_file.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--audio-source file needs --audio-file",
-        ));
-    }
-    if let Some(name) = &args.palette {
-        if !palette::PALETTES
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(name))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "unknown palette '{name}'; choose: {}",
-                    palette::PALETTES.join(", ")
-                ),
-            ));
-        }
-    }
+    validate_args(&args)?;
 
     let config_path = config_path(&args);
     let mut warnings = Vec::new();
@@ -643,11 +649,26 @@ mod tests {
     #[test]
     fn explicit_command_and_file_sources_need_their_payloads() {
         use clap::Parser;
-        assert!(Args::try_parse_from(["vibe", "--audio-source", "command"]).is_ok());
-        assert!(Args::try_parse_from(["vibe", "--audio-source", "file"]).is_ok());
-        // Payload requirements are validated in main() before the TUI starts.
         let command = Args::try_parse_from(["vibe", "--audio-source", "command"]).unwrap();
-        assert_eq!(command.audio_command, None);
+        let error = validate_args(&command).unwrap_err();
+        assert!(error.to_string().contains("--audio-command"));
+
+        let file = Args::try_parse_from(["vibe", "--audio-source", "file"]).unwrap();
+        let error = validate_args(&file).unwrap_err();
+        assert!(error.to_string().contains("--audio-file"));
+
+        let with_payload = Args::try_parse_from([
+            "vibe",
+            "--audio-source",
+            "command",
+            "--audio-command",
+            "parec",
+        ])
+        .unwrap();
+        assert!(validate_args(&with_payload).is_ok());
+
+        let unknown_palette = Args::try_parse_from(["vibe", "--palette", "Nope"]).unwrap();
+        assert!(validate_args(&unknown_palette).is_err());
     }
 
     #[test]

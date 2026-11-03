@@ -840,23 +840,38 @@ impl Renderer {
 mod tests {
     use super::*;
 
-    fn snapshot(mode: usize, audio: &Reactivity) -> String {
+    fn snapshot(
+        mode: usize,
+        audio: &Reactivity,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
+        snapshot_for(mode, audio, &[0.0; 32], 90)
+    }
+
+    fn snapshot_for(
+        mode: usize,
+        audio: &Reactivity,
+        bands: &[f32; 32],
+        frames: usize,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
         let area = Rect::new(2, 3, 96, 36);
         let mut buf = Buffer::empty(area);
         let mut renderer = Renderer::default();
-        for frame in 0..90 {
+        for frame in 0..frames {
             renderer.draw(
                 &mut buf,
                 area,
                 frame as f32 / 60.0,
                 mode,
                 0,
-                &[0.0; 32],
+                bands,
                 audio,
                 &Theme::default(),
             );
         }
-        buf.content.iter().map(|cell| cell.symbol()).collect()
+        buf.content
+            .iter()
+            .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+            .collect()
     }
 
     #[test]
@@ -876,9 +891,13 @@ mod tests {
         let mut images = Vec::new();
         for (mode, _) in NAMES.iter().enumerate() {
             let image = snapshot(mode, &quiet);
+            let marks = image
+                .iter()
+                .filter(|(mark, fg, bg)| mark != " " || fg != bg)
+                .count();
             assert!(
-                image.chars().any(|mark| mark != ' '),
-                "empty quiet scene {mode}"
+                marks > 96 * 36 / 20,
+                "quiet scene {mode} painted only {marks} cells"
             );
             assert!(!images.contains(&image), "duplicate scene {mode}");
             images.push(image);
@@ -905,6 +924,48 @@ mod tests {
                 snapshot(mode, &loud),
                 "scene {mode} ignores audio"
             );
+        }
+    }
+
+    #[test]
+    fn each_scene_keeps_its_audio_wiring() {
+        // Every weather scene drives its geometry or its palette from these
+        // inputs; checking them one at a time stops a dropped input from
+        // hiding behind the scene's other responses.
+        let quiet = Reactivity::default();
+        let probes = [
+            (
+                "energy",
+                Reactivity {
+                    energy: 0.7,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "centroid",
+                Reactivity {
+                    centroid: 0.9,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "beat",
+                Reactivity {
+                    beat: 0.9,
+                    beat_phase: 0.4,
+                    tempo_confidence: 0.9,
+                    ..Reactivity::default()
+                },
+            ),
+        ];
+        for (mode, name) in NAMES.iter().enumerate() {
+            let base = snapshot_for(mode, &quiet, &[0.0; 32], 30);
+            for (input, audio) in &probes {
+                assert!(
+                    base != snapshot_for(mode, audio, &[0.0; 32], 30),
+                    "{name} ignores {input}"
+                );
+            }
         }
     }
 

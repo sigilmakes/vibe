@@ -1087,23 +1087,38 @@ fn gate_signal(index: usize, bands: &[f32; 32], audio: &Reactivity, t: f32) -> f
 mod tests {
     use super::*;
 
-    fn snapshot(mode: usize, audio: &Reactivity) -> String {
+    fn snapshot(
+        mode: usize,
+        audio: &Reactivity,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
+        snapshot_for(mode, audio, &[0.0; 32], 90)
+    }
+
+    fn snapshot_for(
+        mode: usize,
+        audio: &Reactivity,
+        bands: &[f32; 32],
+        frames: usize,
+    ) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
         let area = Rect::new(2, 3, 96, 36);
         let mut buf = Buffer::empty(area);
         let mut renderer = Renderer::default();
-        for frame in 0..90 {
+        for frame in 0..frames {
             renderer.draw(
                 &mut buf,
                 area,
                 frame as f32 / 60.0,
                 mode,
                 0,
-                &[0.0; 32],
+                bands,
                 audio,
                 &Theme::default(),
             );
         }
-        buf.content.iter().map(|cell| cell.symbol()).collect()
+        buf.content
+            .iter()
+            .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+            .collect()
     }
 
     #[test]
@@ -1123,9 +1138,13 @@ mod tests {
         let mut images = Vec::new();
         for mode in 0..NAMES.len() {
             let image = snapshot(mode, &quiet);
+            let marks = image
+                .iter()
+                .filter(|(mark, fg, bg)| mark != " " || fg != bg)
+                .count();
             assert!(
-                image.chars().any(|mark| mark != ' '),
-                "empty quiet scene {mode}"
+                marks > 96 * 36 / 20,
+                "quiet scene {mode} painted only {marks} cells"
             );
             assert!(!images.contains(&image), "duplicate scene {mode}");
             images.push(image);
@@ -1190,11 +1209,57 @@ mod tests {
             ..Reactivity::default()
         };
         for mode in 0..NAMES.len() {
-            assert_ne!(
-                snapshot(mode, &quiet),
-                snapshot(mode, &loud),
+            assert!(
+                snapshot(mode, &quiet) != snapshot(mode, &loud),
                 "scene {mode} ignores audio"
             );
+        }
+    }
+
+    #[test]
+    fn each_scene_keeps_its_audio_wiring() {
+        // Circuit scenes read the spectrum, the beat, the brightness centroid,
+        // and overall energy. A single everything-on frame hides one missing
+        // input, so probe each of them separately.
+        let quiet = Reactivity::default();
+        let ramp: [f32; 32] = std::array::from_fn(|i| (i + 1) as f32 / 32.0);
+        let probes = [
+            ("bands", Reactivity::default(), ramp),
+            (
+                "energy",
+                Reactivity {
+                    energy: 0.7,
+                    ..Reactivity::default()
+                },
+                [0.0; 32],
+            ),
+            (
+                "centroid",
+                Reactivity {
+                    centroid: 0.9,
+                    ..Reactivity::default()
+                },
+                [0.0; 32],
+            ),
+            (
+                "beat",
+                Reactivity {
+                    beat: 0.9,
+                    beat_phase: 0.4,
+                    tempo_confidence: 0.9,
+                    ..Reactivity::default()
+                },
+                [0.0; 32],
+            ),
+        ];
+        for (mode, name) in NAMES.iter().enumerate() {
+            let base = snapshot_for(mode, &quiet, &[0.0; 32], 30);
+            for (input, audio, bands) in &probes {
+                assert!(
+                    base != snapshot_for(mode, audio, bands, 30),
+                    "{name} ignores {input}"
+                );
+            }
         }
     }
 

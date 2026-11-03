@@ -261,6 +261,31 @@ mod tests {
             ] {
                 render(&mut Renderer::default(), area, 0.0, style, &[1.0; 32]);
             }
+            // A partially visible target must paint only its intersection.
+            let outer = Rect::new(0, 0, 20, 10);
+            let target = Rect::new(14, 6, 20, 10);
+            let mut buf = Buffer::empty(outer);
+            for cell in &mut buf.content {
+                cell.set_char('!');
+            }
+            Renderer::default().draw(
+                &mut buf,
+                target,
+                0.0,
+                style,
+                0,
+                &[1.0; 32],
+                &crate::visuals::Reactivity::default(),
+                &crate::palette::Theme::default(),
+            );
+            let visible = target.intersection(outer);
+            for y in outer.y..outer.bottom() {
+                for x in outer.x..outer.right() {
+                    if !visible.contains((x, y).into()) {
+                        assert_eq!(buf[(x, y)].symbol(), "!", "style {style} painted outside");
+                    }
+                }
+            }
         }
     }
 

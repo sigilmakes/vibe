@@ -1290,8 +1290,11 @@ mod tests {
         buf
     }
 
-    fn symbols(buf: &Buffer) -> String {
-        buf.content.iter().map(|cell| cell.symbol()).collect()
+    fn signature(buf: &Buffer) -> Vec<(String, ratatui::style::Color, ratatui::style::Color)> {
+        buf.content
+            .iter()
+            .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+            .collect()
     }
 
     #[test]
@@ -1306,10 +1309,14 @@ mod tests {
         let quiet = Reactivity::default();
         let mut images = std::collections::HashSet::new();
         for style in 0..NAMES.len() {
-            let image = symbols(&render(style, &quiet, 36));
+            let image = signature(&render(style, &quiet, 36));
+            let marks = image
+                .iter()
+                .filter(|(mark, fg, bg)| mark != " " || fg != bg)
+                .count();
             assert!(
-                image.chars().any(|c| c != ' '),
-                "style {style} drew nothing"
+                marks > 80 * 30 / 20,
+                "style {style} painted only {marks} cells"
             );
             assert!(images.insert(image), "duplicate style {style}");
         }
@@ -1337,9 +1344,41 @@ mod tests {
             ..Reactivity::default()
         };
         for style in 0..NAMES.len() {
-            let a = symbols(&render(style, &quiet, 36));
-            let b = symbols(&render(style, &loud, 36));
-            assert_ne!(a, b, "audio does not change style {style}");
+            let a = signature(&render(style, &quiet, 36));
+            let b = signature(&render(style, &loud, 36));
+            assert!(a != b, "audio does not change style {style}");
+        }
+    }
+
+    #[test]
+    fn each_scene_keeps_its_audio_wiring() {
+        // Every orbital scene scales its clock by bass and energy; check them
+        // one at a time so a dropped input cannot hide behind the other.
+        let quiet = Reactivity::default();
+        let probes = [
+            (
+                "bass",
+                Reactivity {
+                    bass: 0.85,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "energy",
+                Reactivity {
+                    energy: 0.7,
+                    ..Reactivity::default()
+                },
+            ),
+        ];
+        for (style, name) in NAMES.iter().enumerate() {
+            let base = signature(&render(style, &quiet, 24));
+            for (input, audio) in &probes {
+                assert!(
+                    base != signature(&render(style, audio, 24)),
+                    "{name} ignores {input}"
+                );
+            }
         }
     }
 
@@ -1393,8 +1432,8 @@ mod tests {
             ..Reactivity::default()
         };
         for style in 0..NAMES.len() {
-            let a = symbols(&render(style, &audio, 24));
-            let b = symbols(&render(style, &audio, 24));
+            let a = signature(&render(style, &audio, 24));
+            let b = signature(&render(style, &audio, 24));
             assert_eq!(a, b, "style {style} is not deterministic");
         }
     }
