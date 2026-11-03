@@ -1053,9 +1053,12 @@ fn reactivity(state: &audio::AudioState, gain: f32) -> visuals::Reactivity {
         chroma: state.chroma,
         centroid: state.centroid,
         flatness: state.flatness,
+        width: state.width,
+        balance: state.balance,
         kick: scale(state.kick),
         beat: scale(state.beat),
         beat_phase: state.beat_phase,
+        tempo_confidence: state.tempo_confidence,
         waveform: state.waveform.map(|x| (x * gain).clamp(-1.0, 1.0)),
     }
 }
@@ -1089,6 +1092,43 @@ mod tests {
 
     fn demo_app() -> App {
         App::new(demo_options())
+    }
+
+    #[test]
+    fn sensitivity_scales_envelopes_but_not_spectral_or_stereo_features() {
+        let state = audio::AudioState {
+            energy: 0.4,
+            onset: 0.4,
+            beat: 0.4,
+            transients: [0.4; 4],
+            waveform: [0.4; 32],
+            chroma: [1.0 / 12.0; 12],
+            centroid: 0.5,
+            flatness: 0.5,
+            width: 0.4,
+            balance: -0.4,
+            beat_phase: 0.25,
+            tempo_confidence: 0.6,
+            ..audio::AudioState::default()
+        };
+
+        let doubled = reactivity(&state, 2.0);
+        assert!((doubled.energy - 0.8).abs() < 1e-6);
+        assert!((doubled.onset - 0.8).abs() < 1e-6);
+        assert!((doubled.beat - 0.8).abs() < 1e-6);
+        assert!((doubled.transients[0] - 0.8).abs() < 1e-6);
+        assert!((doubled.waveform[0] - 0.8).abs() < 1e-6);
+        assert_eq!(doubled.chroma, state.chroma);
+        assert_eq!(doubled.centroid, state.centroid);
+        assert_eq!(doubled.flatness, state.flatness);
+        assert_eq!(doubled.width, state.width);
+        assert_eq!(doubled.balance, state.balance);
+        assert_eq!(doubled.beat_phase, state.beat_phase);
+        assert_eq!(doubled.tempo_confidence, state.tempo_confidence);
+
+        let quiet = reactivity(&state, 0.5);
+        assert!((quiet.energy - 0.2).abs() < 1e-6);
+        assert!((quiet.waveform[0] - 0.2).abs() < 1e-6);
     }
 
     #[test]

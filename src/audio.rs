@@ -211,6 +211,11 @@ pub struct AudioState {
     /// Geometric/arithmetic power ratio over 40 Hz–16 kHz: tone ~0, noise ~0.56.
     /// Bounded to [0, 1]; silence and below-gate input are 0.
     pub flatness: f32,
+    /// Side/mid energy ratio in [0, 1]. Zero for mono or identical channels,
+    /// about 0.5 for uncorrelated stereo, and near 1 for anti-phase material.
+    pub width: f32,
+    /// Right-minus-left loudness balance in [-1, 1]; zero when centred.
+    pub balance: f32,
     pub onset: f32,
     pub kick: f32,
     /// Independent low/bass, low-mid/snare, presence, and air attack envelopes.
@@ -520,11 +525,46 @@ fn open_source(config: &CaptureConfig) -> io::Result<OpenedSource> {
     }
 }
 
-fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) {
+/// Per-hop stereo energy. Mono input yields identical left and right energy.
+#[derive(Clone, Copy, Debug, Default)]
+struct StereoStats {
+    left: f32,
+    right: f32,
+    cross: f32,
+}
+
+impl StereoStats {
+    /// Side/mid energy ratio: 0 for mono or identical channels, about 0.5 for
+    /// uncorrelated stereo, and 1 for anti-phase material.
+    fn width(self) -> f32 {
+        let total = self.left + self.right;
+        if total <= 1e-12 {
+            return 0.0;
+        }
+        ((total - 2.0 * self.cross).max(0.0) / (2.0 * total)).clamp(0.0, 1.0)
+    }
+
+    /// Right-minus-left loudness balance in [-1, 1].
+    fn balance(self) -> f32 {
+        let left = self.left.sqrt();
+        let right = self.right.sqrt();
+        let total = left + right;
+        if total <= 1e-12 {
+            return 0.0;
+        }
+        ((right - left) / total).clamp(-1.0, 1.0)
+    }
+}
+
+fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) -> StereoStats {
     let frame_bytes = format.frame_bytes();
     let channels = format.channels as usize;
+    let mut stereo = StereoStats::default();
+    let mut frames = 0.0;
     for (sample, frame) in samples.iter_mut().zip(bytes.chunks_exact(frame_bytes)) {
         let mut sum = 0.0;
+        let mut left = 0.0;
+        let mut right_value = None;
         for channel in 0..channels {
             let offset = channel * format.sample.bytes();
             let value = match format.sample {
@@ -544,10 +584,28 @@ fn decode_pcm(bytes: &[u8], format: PcmFormat, samples: &mut [f32; HOP]) {
             };
             if value.is_finite() {
                 sum += value;
+                match channel {
+                    0 => left = value,
+                    1 => right_value = Some(value),
+                    _ => {}
+                }
             }
         }
         *sample = sum / channels as f32;
+        // Mono input has identical left and right energy, so a mono source
+        // reads as centred rather than hard left.
+        let right = right_value.unwrap_or(left);
+        stereo.left += left * left;
+        stereo.right += right * right;
+        stereo.cross += left * right;
+        frames += 1.0;
     }
+    if frames > 0.0 {
+        stereo.left /= frames;
+        stereo.right /= frames;
+        stereo.cross /= frames;
+    }
+    stereo
 }
 
 impl Capture {
@@ -600,9 +658,9 @@ impl Capture {
                         }
                         break;
                     }
-                    decode_pcm(&bytes, format, &mut samples);
+                    let stereo = decode_pcm(&bytes, format, &mut samples);
                     let updated = Instant::now();
-                    let mut analyzed = analyzer.analyze(&samples);
+                    let mut analyzed = analyzer.analyze_with(&samples, stereo);
                     analyzed.updated = Some(updated);
                     analyzed.connected = true;
                     analyzed.source = worker_info.clone();
@@ -978,13 +1036,20 @@ impl Analyzer {
         let window = (0..FRAMES)
             .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FRAMES as f32).cos())
             .collect();
+        // Bands above Nyquist collapse to an empty range instead of indexing
+        // past the FFT output when the source rate is low.
+        let nyquist_bin = FRAMES / 2;
         let mut ranges = [(0, 0); BANDS];
         for (i, range) in ranges.iter_mut().enumerate() {
             let low = LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / BANDS as f32);
             let high = LOW_HZ * (HIGH_HZ / LOW_HZ).powf((i + 1) as f32 / BANDS as f32);
             let start = (low * FRAMES as f32 / sample_rate).ceil() as usize;
             let end = (high * FRAMES as f32 / sample_rate).ceil() as usize;
-            *range = (start.max(1), end.max(start + 1).min(FRAMES / 2));
+            *range = if start >= nyquist_bin {
+                (nyquist_bin, nyquist_bin)
+            } else {
+                (start.max(1), end.max(start + 1).min(nyquist_bin))
+            };
         }
         Self {
             fft,
@@ -1015,8 +1080,9 @@ impl Analyzer {
             return;
         }
         let bin_hz = self.sample_rate / FRAMES as f32;
-        let start = (LOW_HZ / bin_hz).ceil() as usize;
-        let end = (HIGH_HZ / bin_hz).ceil() as usize;
+        let nyquist_bin = FRAMES / 2;
+        let start = ((LOW_HZ / bin_hz).ceil() as usize).min(nyquist_bin - 1);
+        let end = ((HIGH_HZ / bin_hz).ceil() as usize).clamp(start + 1, nyquist_bin);
         let mut powers = [0.0_f32; FRAMES / 2];
         let mut total = 0.0;
         let mut weighted = 0.0;
@@ -1074,7 +1140,13 @@ impl Analyzer {
         }
     }
 
+    /// Mono analysis for tests; capture passes per-hop stereo statistics.
+    #[cfg(test)]
     fn analyze(&mut self, samples: &[f32; HOP]) -> AudioState {
+        self.analyze_with(samples, StereoStats::default())
+    }
+
+    fn analyze_with(&mut self, samples: &[f32; HOP], stereo: StereoStats) -> AudioState {
         self.samples.copy_within(HOP.., 0);
         self.samples[FRAMES - HOP..].copy_from_slice(samples);
         let mut squares = 0.0;
@@ -1094,6 +1166,13 @@ impl Analyzer {
             self.quiet_time + self.dt
         };
         self.state.silent_for = self.quiet_time;
+        let (width, balance) = if audible {
+            (stereo.width(), stereo.balance())
+        } else {
+            (0.0, 0.0)
+        };
+        self.state.width = follow(self.state.width, width, 0.15, 0.4, self.dt);
+        self.state.balance = follow(self.state.balance, balance, 0.1, 0.3, self.dt);
         // Freeze adaptation below the gate: silence must never turn into extra gain.
         if audible {
             self.reference = follow(
@@ -1143,11 +1222,13 @@ impl Analyzer {
         let mut novelty = [0.0_f32; 2];
         let mut counts = [0.0_f32; 2];
         for (i, &(start, end)) in self.ranges.iter().enumerate() {
-            let magnitude = self.buffer[start..end]
-                .iter()
-                .map(|bin| (bin.norm() * (2.0 / FRAMES as f32)).powi(2))
-                .sum::<f32>()
-                .sqrt();
+            // Empty ranges are bands above Nyquist at the current sample rate.
+            let magnitude = self.buffer.get(start..end).map_or(0.0, |bins| {
+                bins.iter()
+                    .map(|bin| (bin.norm() * (2.0 / FRAMES as f32)).powi(2))
+                    .sum::<f32>()
+                    .sqrt()
+            });
             // Normalize each band before differencing, so loud instruments cannot
             // erase quieter percussion. The floor avoids amplifying empty bands.
             let compressed = (1.0 + magnitude / self.band_reference[i].max(0.003)).ln();
@@ -2057,6 +2138,19 @@ mod tests {
     }
 
     #[test]
+    fn low_sample_rates_clamp_analysis_to_nyquist() {
+        let mut analyzer = Analyzer::with_sample_rate(8_000);
+        let mut state = AudioState::default();
+        for frame in 0..8 {
+            state = analyzer.analyze(&frame_at(frame, 1_000.0, 0.5));
+        }
+        assert!(state.centroid.is_finite() && (0.0..=1.0).contains(&state.centroid));
+        assert!(state.flatness.is_finite() && (0.0..=1.0).contains(&state.flatness));
+        assert!(state.chroma.iter().all(|value| value.is_finite()));
+        assert!(state.bands.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn pcm_decoder_mixes_channels_and_accepts_s16_and_f32() {
         let mut samples = [0.0_f32; HOP];
         let format = PcmFormat {
@@ -2080,9 +2174,11 @@ mod tests {
             sample: SampleFormat::S16,
         };
         let bytes = [0x00, 0x40, 0x00, 0x80];
-        decode_pcm(&bytes, format, &mut samples);
+        let mono = decode_pcm(&bytes, format, &mut samples);
         assert!((samples[0] - 0.5).abs() < 1e-6);
         assert_eq!(samples[1], -1.0);
+        assert!(mono.width() < 1e-6, "mono must read as centred");
+        assert!(mono.balance().abs() < 1e-6, "mono must read as centred");
 
         let format = PcmFormat {
             rate: 48_000,
@@ -2092,6 +2188,55 @@ mod tests {
         let bytes = 1_073_741_824_i32.to_le_bytes();
         decode_pcm(&bytes, format, &mut samples);
         assert!((samples[0] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stereo_stats_measure_width_and_balance_from_the_first_two_channels() {
+        fn decode_constant(left: f32, right: f32) -> StereoStats {
+            let format = PcmFormat {
+                rate: 48_000,
+                channels: 2,
+                sample: SampleFormat::F32,
+            };
+            let mut samples = [0.0_f32; HOP];
+            let mut bytes = Vec::with_capacity(HOP * 8);
+            for _ in 0..HOP {
+                bytes.extend_from_slice(&left.to_le_bytes());
+                bytes.extend_from_slice(&right.to_le_bytes());
+            }
+            decode_pcm(&bytes, format, &mut samples)
+        }
+
+        let centred = decode_constant(0.5, 0.5);
+        assert!(centred.width() < 1e-6);
+        assert!(centred.balance().abs() < 1e-6);
+
+        let anti_phase = decode_constant(0.5, -0.5);
+        assert!((anti_phase.width() - 1.0).abs() < 1e-6);
+        assert!(anti_phase.balance().abs() < 1e-6);
+
+        let left_only = decode_constant(0.5, 0.0);
+        assert!((left_only.width() - 0.5).abs() < 1e-6);
+        assert!((left_only.balance() + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stereo_width_and_balance_reach_the_analyzer_state() {
+        let mut analyzer = Analyzer::new();
+        let samples = frame_at(0, 440.0, 0.4);
+        let mut state = AudioState::default();
+        for _ in 0..40 {
+            state = analyzer.analyze_with(
+                &samples,
+                StereoStats {
+                    left: 0.04,
+                    right: 0.0,
+                    cross: 0.0,
+                },
+            );
+        }
+        assert!(state.width > 0.35, "width {}", state.width);
+        assert!(state.balance < -0.5, "balance {}", state.balance);
     }
 
     #[test]

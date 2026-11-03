@@ -219,7 +219,17 @@ const fn scene_route(scene: usize) -> (Family, usize) {
     (entry.family, entry.local)
 }
 
-/// Normalized live audio. Transients carry independent low-to-high attacks.
+/// Normalized live audio for one rendered frame.
+///
+/// Continuous envelopes (`energy`, `bass`, `mid`, `treble`, `onset`, `kick`,
+/// `beat`, `novelty`, `transients`) and `waveform` are scaled by the
+/// sensitivity setting. Distribution and position features (`chroma`,
+/// `centroid`, `flatness`, `width`, `balance`) and `beat_phase` are not.
+///
+/// Envelopes and spectrum come from a mono mix; `width` and `balance` come
+/// from the first two input channels before mixing. `transients` carries
+/// independent low, low-mid, presence, and air attacks; `onset` is their
+/// maximum.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Reactivity {
     pub energy: f32,
@@ -229,13 +239,36 @@ pub struct Reactivity {
     pub onset: f32,
     pub kick: f32,
     pub beat: f32,
+    /// Fraction of the current beat in [0, 1). Only advances while the tempo
+    /// tracker is locked; use `locked_beat_phase` or `tempo_confidence` for
+    /// beat-synced motion.
     pub beat_phase: f32,
+    /// Confidence of the tempo estimate in [0, 1]. Treat `beat_phase` as
+    /// meaningful only when this is clearly above zero.
+    pub tempo_confidence: f32,
     pub waveform: [f32; 32],
     pub transients: [f32; 4],
     pub novelty: f32,
     pub chroma: [f32; 12],
     pub centroid: f32,
     pub flatness: f32,
+    /// Side/mid energy ratio in [0, 1]: 0 mono, ~0.5 uncorrelated stereo.
+    pub width: f32,
+    /// Right-minus-left loudness balance in [-1, 1]; zero when centred.
+    pub balance: f32,
+}
+
+impl Reactivity {
+    /// Beat phase, or zero when the tempo estimate is too weak to trust.
+    /// `beat_phase` stops advancing while the tracker is unlocked, so scenes
+    /// must not treat it as a free-running clock.
+    pub fn locked_beat_phase(&self) -> f32 {
+        if self.tempo_confidence >= 0.25 {
+            self.beat_phase
+        } else {
+            0.0
+        }
+    }
 }
 
 fn hash(x: i32, y: i32) -> f32 {
@@ -328,13 +361,9 @@ impl Renderer {
         self.impacts.retain(|impact| impact.age < 0.18);
         for channel in 0..4 {
             self.cooldown[channel] = (self.cooldown[channel] - dt).max(0.0);
-            let fallback = match channel {
-                0 => audio.kick,
-                1 => audio.onset * 0.75,
-                2 => audio.novelty,
-                _ => audio.onset * audio.treble,
-            };
-            let attack = audio.transients[channel].max(fallback).clamp(0.0, 1.0);
+            // Each channel owns one attack band. Broad signals such as `onset`
+            // and `novelty` must not retrigger every channel for one hit.
+            let attack = audio.transients[channel].clamp(0.0, 1.0);
             let rise = attack - self.attacks[channel];
             if rise > 0.09 && attack > 0.16 && self.cooldown[channel] == 0.0 {
                 self.serial = self.serial.wrapping_add(1);
@@ -510,7 +539,7 @@ impl Renderer {
                 + self.expansion
                 + audio.bass * 0.055
                 + audio.beat * 0.025
-                + (angle * 7.0 - audio.beat_phase * TAU).cos() * audio.beat * 0.008
+                + (angle * 7.0 - audio.locked_beat_phase() * TAU).cos() * audio.beat * 0.008
                 + bands[petal * 4].clamp(0.0, 1.0) * 0.10
                 + if i % 2 == 0 { 0.055 } else { -0.045 }
                 + bands[i * 31 / 41].clamp(0.0, 1.0) * 0.08;
@@ -833,6 +862,8 @@ impl Renderer {
                 contours * 0.25,
             )
         } else if scene == 3 {
+            // Panning moves the curtain sideways; width opens its ribbon.
+            let x = x + audio.balance * 0.06;
             let sway = (x * 2.2 + t * 0.25).sin() * 0.28 + (x * 4.7 - t * 0.32).sin() * 0.1;
             let position = (x * 0.22 + 0.5).clamp(0.0, 1.0) * 31.0;
             let i = position.floor() as usize;
@@ -845,7 +876,7 @@ impl Renderer {
                 + onset * 0.05
                 + low_attack * 0.10
                 + high_attack * 0.045 * (x * 13.0).sin();
-            let ribbon = glow(curtain, 0.12 + e * 0.08);
+            let ribbon = glow(curtain, 0.12 + e * 0.08 + audio.width * 0.05);
             let silk = (x * 27.0 + (y * 3.0 + t * 0.4).sin() * 3.0 + t * 0.5).sin() * 0.5 + 0.5;
             let haze = glow(curtain - 0.25, 0.45) * 0.18;
             (
@@ -854,6 +885,9 @@ impl Renderer {
                 ribbon.powi(3) * silk * 0.38,
             )
         } else {
+            // A small pan offset recentres the ring field, and width softens
+            // the rings without changing their beat phase.
+            let x = x - audio.balance * 0.06;
             let r = x.hypot(y);
             let a = y.atan2(x);
             let position = (a / TAU + 0.5).rem_euclid(1.0) * 31.0;
@@ -865,8 +899,8 @@ impl Renderer {
                 - spectrum * 0.1
                 - onset * 0.06
                 - high_attack * 0.03 * (a * 11.0).sin();
-            let wave = (radius * (14.0 + e * 2.0) - audio.beat_phase * TAU).sin();
-            let rings = glow(wave, 0.085 + e * 0.06 + treble * 0.025);
+            let wave = (radius * (14.0 + e * 2.0) - audio.locked_beat_phase() * TAU).sin();
+            let rings = glow(wave, 0.085 + e * 0.06 + treble * 0.025 + audio.width * 0.02);
             let petals = (a * 8.0 + r * 3.0 - t * 0.3).cos() * 0.5 + 0.5;
             let core = glow(r, 0.13 + e * 0.05);
             (
@@ -1102,6 +1136,28 @@ mod tests {
     }
 
     #[test]
+    fn stereo_width_and_balance_reach_the_restored_scenes() {
+        let area = Rect::new(0, 0, 100, 36);
+        let theme = crate::palette::Theme::default();
+        let render = |audio: &Reactivity| {
+            let mut buffer = Buffer::empty(area);
+            Renderer::default().draw(&mut buffer, area, 2.0, 3, 0, &[0.0; 32], audio, &theme);
+            buffer
+        };
+        let centred = render(&Reactivity::default());
+        let panned = render(&Reactivity {
+            balance: 0.8,
+            ..Reactivity::default()
+        });
+        let wide = render(&Reactivity {
+            width: 0.8,
+            ..Reactivity::default()
+        });
+        assert_ne!(centred, panned, "pan must move the curtain");
+        assert_ne!(centred, wide, "width must change the ribbon");
+    }
+
+    #[test]
     fn swarm_has_discrete_heads_and_tails_and_reacts_to_attacks() {
         let area = Rect::new(0, 0, 120, 40);
         let theme = crate::palette::Theme::default();
@@ -1245,6 +1301,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn one_transient_fires_only_its_own_impact_channel() {
+        let mut renderer = Renderer::default();
+        renderer.advance(0.0, &Reactivity::default());
+        renderer.advance(
+            0.02,
+            &Reactivity {
+                transients: [0.9, 0.0, 0.0, 0.0],
+                ..Reactivity::default()
+            },
+        );
+        assert_eq!(renderer.impacts.len(), 1);
+        assert_eq!(renderer.impacts[0].channel, 0);
+
+        let mut broad = Renderer::default();
+        broad.advance(0.0, &Reactivity::default());
+        broad.advance(
+            0.02,
+            &Reactivity {
+                onset: 1.0,
+                kick: 1.0,
+                novelty: 1.0,
+                treble: 1.0,
+                ..Reactivity::default()
+            },
+        );
+        assert!(
+            broad.impacts.is_empty(),
+            "broad envelopes must not retrigger every transient channel"
+        );
+    }
+
+    #[test]
+    fn beat_phase_is_gated_by_tempo_confidence() {
+        let audio = Reactivity {
+            beat_phase: 0.75,
+            tempo_confidence: 0.1,
+            ..Reactivity::default()
+        };
+        assert_eq!(audio.locked_beat_phase(), 0.0);
+        let locked = Reactivity {
+            tempo_confidence: 0.9,
+            ..audio
+        };
+        assert_eq!(locked.locked_beat_phase(), 0.75);
     }
 
     #[test]
