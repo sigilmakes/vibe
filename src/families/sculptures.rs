@@ -114,12 +114,35 @@ impl Renderer {
         theme: &Theme,
     ) {
         let vertices = self.sculpture(bands, audio);
-        let scale = (area.width as f32 * 0.51).min(area.height as f32 * 0.91);
+        // Project into an abstract unit space first, then fit that box to the
+        // whole frame. One terminal row is twice a column, so a screen row uses
+        // half the horizontal scale; keeping both equal would stretch the knot
+        // vertically and crop its top and bottom.
+        let project_raw = |p: [f32; 3]| {
+            let perspective = 2.7 / (2.7 - p[2]).max(0.65);
+            [p[0] * perspective, p[1] * perspective, p[2]]
+        };
+        let mut lo = [f32::MAX; 2];
+        let mut hi = [f32::MIN; 2];
+        for row in &vertices {
+            for vertex in row {
+                let p = project_raw(*vertex);
+                lo[0] = lo[0].min(p[0]);
+                lo[1] = lo[1].min(p[1]);
+                hi[0] = hi[0].max(p[0]);
+                hi[1] = hi[1].max(p[1]);
+            }
+        }
+        let span = [(hi[0] - lo[0]).max(0.001), (hi[1] - lo[1]).max(0.001)];
+        let scale =
+            (area.width as f32 * 0.90 / span[0]).min(area.height as f32 * 0.90 * 2.0 / span[1]);
+        let center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        // Subpixel coordinates: two across a cell and four down.
         let project = |p: [f32; 3]| {
-            let perspective = 2.7 / (2.7 - p[2]);
+            let p = project_raw(p);
             [
-                area.width as f32 + p[0] * scale * 2.0 * perspective,
-                area.height as f32 * 2.0 + p[1] * scale * 4.0 * perspective,
+                area.width as f32 + (p[0] - center[0]) * scale * 2.0,
+                area.height as f32 * 2.0 + (p[1] - center[1]) * scale * 2.0,
                 p[2],
             ]
         };
@@ -342,6 +365,64 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn wire_sculpture_fills_the_frame_without_cropping() {
+        let theme = Theme::default();
+        let audio = Reactivity {
+            bass: 0.5,
+            mid: 0.4,
+            treble: 0.4,
+            ..Reactivity::default()
+        };
+        for (width, height) in [(120, 40), (40, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut renderer = Renderer::default();
+            let mut lo = [width, height];
+            let mut hi = [0, 0];
+            for frame in 0..120 {
+                let mut buf = Buffer::empty(area);
+                renderer.draw(
+                    &mut buf,
+                    area,
+                    frame as f32 / 60.0,
+                    0,
+                    0,
+                    &[0.4; 32],
+                    &audio,
+                    &theme,
+                );
+                for y in 0..height {
+                    for x in 0..width {
+                        if buf[(x, y)].symbol() != " " {
+                            lo[0] = lo[0].min(x);
+                            lo[1] = lo[1].min(y);
+                            hi[0] = hi[0].max(x);
+                            hi[1] = hi[1].max(y);
+                        }
+                    }
+                }
+            }
+            let used = [hi[0] - lo[0] + 1, hi[1] - lo[1] + 1];
+            assert!(
+                lo[0] >= 1 && lo[1] >= 1 && hi[0] < width && hi[1] < height - 1,
+                "wire sculpture must keep a margin at {width}x{height}: lo={lo:?} hi={hi:?}"
+            );
+            // The knot is round in physical space, so it fills whichever
+            // dimension is shorter: the height on wide terminals, the width on
+            // tall ones. Filling both would stretch it.
+            let fill = (used[0] as f32 / width as f32).max(used[1] as f32 / height as f32);
+            assert!(
+                fill > 0.85,
+                "wire sculpture must fill its limiting dimension at {width}x{height}: {used:?}"
+            );
+            let physical = used[0] as f32 / (used[1] as f32 * 2.0);
+            assert!(
+                (0.8..1.25).contains(&physical),
+                "wire sculpture must keep its physical aspect at {width}x{height}: {physical}"
+            );
+        }
+    }
+
     #[test]
     fn transient_has_short_bounded_memory() {
         let mut renderer = Renderer::default();
