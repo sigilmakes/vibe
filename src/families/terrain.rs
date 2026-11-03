@@ -40,8 +40,9 @@ fn clock(time: f32) -> f32 {
 
 fn hue_of(audio: &Reactivity) -> f32 {
     let total: f32 = audio.chroma.iter().copied().map(unit).sum();
+    let neutral = unit(audio.centroid) * 0.5;
     if total < 1e-4 {
-        0.0
+        neutral
     } else {
         let weighted: f32 = audio
             .chroma
@@ -49,7 +50,8 @@ fn hue_of(audio: &Reactivity) -> f32 {
             .enumerate()
             .map(|(i, c)| i as f32 * unit(*c))
             .sum();
-        weighted / total / 12.0
+        let pitch = weighted / total / 12.0;
+        pitch * audio.tonality() + neutral * (1.0 - audio.tonality())
     }
 }
 

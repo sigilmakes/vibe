@@ -1289,6 +1289,7 @@ mod tests {
             kick: 1.0,
             beat: 1.0,
             beat_phase: 0.5,
+            tempo_confidence: 0.9,
             ..Reactivity::default()
         };
         for (mode, _) in NAMES.iter().enumerate() {

@@ -3,7 +3,10 @@
 //! stay circular in terminals of any shape. Patterns are closed-form functions
 //! of integrated time and audio envelopes; no per-frame allocation is needed.
 
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{approach_hue, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
 
@@ -32,6 +35,8 @@ pub struct Renderer {
     scroll: f32,
     /// Bass, mid, treble, kick, onset, centroid, flatness.
     env: [f32; ENV],
+    /// Smoothed chroma hue, so noise does not flicker the palette.
+    chroma: f32,
 }
 
 fn unit(v: f32) -> f32 {
@@ -79,10 +84,12 @@ fn chroma_hue(audio: &Reactivity) -> f32 {
         weight += value;
         sum += value * i as f32;
     }
+    let neutral = unit(audio.centroid) * 0.5;
     if weight > 1e-3 {
-        (sum / weight) / 12.0
+        let pitch = (sum / weight) / 12.0;
+        pitch * audio.tonality() + neutral * (1.0 - audio.tonality())
     } else {
-        unit(audio.centroid) * 0.5
+        neutral
     }
 }
 
@@ -110,6 +117,7 @@ impl Renderer {
         for (value, target) in self.env.iter_mut().zip(targets) {
             *value += (target - *value) * follow;
         }
+        self.chroma = approach_hue(self.chroma, chroma_hue(audio), (dt * 8.0).min(1.0));
         self.phase = (self.phase + dt * (0.4 + unit(audio.energy) * 1.2 + self.env[1] * 0.5))
             .rem_euclid(TAU * 16.0);
         self.scroll = (self.scroll + dt * (0.5 + unit(audio.energy) * 1.5 + self.env[3] * 0.4))
@@ -150,9 +158,11 @@ impl Renderer {
             .copied()
             .map(unit)
             .fold(0.0, f32::max);
-        let chroma = chroma_hue(audio);
+        let chroma = self.chroma;
         let scale = 2.0 / area.height.max(1) as f32;
-        let cx = area.x as f32 + (area.width as f32 - 1.0) * 0.5;
+        let cx = area.x as f32
+            + (area.width as f32 - 1.0) * 0.5
+            + audio.pan() * area.width as f32 * 0.06;
         let cy = area.y as f32 + (area.height as f32 - 1.0) * 0.5;
         let background = theme.sample(palette, 0.0, 0.0);
         let columns = visible.width.max(1) as usize;
@@ -628,6 +638,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn stereo_balance_pans_every_style() {
+        for style in 0..NAMES.len() {
+            let base = symbols(&render(style, &Reactivity::default(), 12));
+            let panned = symbols(&render(
+                style,
+                &Reactivity {
+                    balance: 0.7,
+                    ..Reactivity::default()
+                },
+                12,
+            ));
+            assert_ne!(base, panned, "style {style} ignored stereo balance");
         }
     }
 

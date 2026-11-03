@@ -272,6 +272,55 @@ impl Reactivity {
             0.0
         }
     }
+
+    /// Stereo balance in [-1, 1]; non-finite input reads as centred.
+    pub fn pan(&self) -> f32 {
+        if self.balance.is_finite() {
+            self.balance.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Stereo width in [0, 1]; non-finite input reads as mono.
+    pub fn spread(&self) -> f32 {
+        if self.width.is_finite() {
+            self.width.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// How tonal the spectrum is: 1 for clear peaks, 0 for noise.
+    pub fn tonality(&self) -> f32 {
+        if self.flatness.is_finite() {
+            (1.0 - self.flatness).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Step a cyclic hue toward `target` along the shorter arc.
+pub(crate) fn approach_hue(current: f32, target: f32, blend: f32) -> f32 {
+    if !target.is_finite() {
+        return 0.0;
+    }
+    let blend = if blend.is_finite() {
+        blend.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let current = if current.is_finite() {
+        current.rem_euclid(1.0)
+    } else {
+        target.rem_euclid(1.0)
+    };
+    let mut delta = (target - current).rem_euclid(1.0);
+    if delta > 0.5 {
+        delta -= 1.0;
+    }
+    (current + delta * blend).rem_euclid(1.0)
 }
 
 fn hash(x: i32, y: i32) -> f32 {
@@ -1356,6 +1405,36 @@ mod tests {
             ..audio
         };
         assert_eq!(locked.locked_beat_phase(), 0.75);
+    }
+
+    #[test]
+    fn hue_approach_takes_the_short_way_around_the_wheel() {
+        assert!((approach_hue(0.95, 0.05, 1.0) - 0.05).abs() < 1e-6);
+        assert!((approach_hue(0.05, 0.95, 1.0) - 0.95).abs() < 1e-6);
+        assert!((approach_hue(0.2, 0.8, 0.25) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stereo_and_tonality_helpers_are_bounded() {
+        let audio = Reactivity {
+            width: 2.0,
+            balance: -2.0,
+            flatness: 0.25,
+            ..Reactivity::default()
+        };
+        assert_eq!(audio.spread(), 1.0);
+        assert_eq!(audio.pan(), -1.0);
+        assert!((audio.tonality() - 0.75).abs() < 1e-6);
+
+        let bad = Reactivity {
+            width: f32::NAN,
+            balance: f32::INFINITY,
+            flatness: f32::NAN,
+            ..Reactivity::default()
+        };
+        assert_eq!(bad.spread(), 0.0);
+        assert_eq!(bad.pan(), 0.0);
+        assert_eq!(bad.tonality(), 0.0);
     }
 
     #[test]

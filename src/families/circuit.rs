@@ -540,7 +540,7 @@ impl Renderer {
             let center = (lane as f32 + 0.5) * lane_h;
             let band = unit(bands[(lane * 3) % 32]);
             let amp = lane_h * 0.22 * (0.55 + unit(audio.bass) * 0.7 + band * 0.9) + 0.4;
-            let freq = 0.8 + band * 2.4 + unit(audio.chroma[lane % 12]) * 1.2;
+            let freq = 0.8 + band * 2.4 + unit(audio.chroma[lane % 12]) * audio.tonality() * 1.2;
             let speed = 0.5 + unit(audio.mid) * 1.2;
             let phase = lane as f32 * 0.9 + t * speed;
             for x in (0..w as i32).step_by(3) {
@@ -630,7 +630,7 @@ impl Renderer {
         let elements: i32 = 5;
         let mid_y = fh * 0.5;
         let steer = (unit(audio.centroid) - 0.5) * 2.2
-            + (unit(audio.chroma[0]) - unit(audio.chroma[6])) * 0.5;
+            + (unit(audio.chroma[0]) - unit(audio.chroma[6])) * audio.tonality() * 0.5;
         let period = 19.0 - unit(audio.flatness) * 3.0;
         let speed = 1.1 + unit(audio.energy) * 1.6;
         let amp = 0.55 + unit(audio.bass) * 0.45;
@@ -848,7 +848,7 @@ impl Renderer {
                 break;
             }
             let band = unit(bands[(r * 5) % 32]);
-            let freq = 0.05 + band * 0.35 + unit(audio.chroma[r % 12]) * 0.15;
+            let freq = 0.05 + band * 0.35 + unit(audio.chroma[r % 12]) * audio.tonality() * 0.15;
             let phase = r as f32 * 1.3 + t * speed * (0.6 + band * 1.4);
             let mut prev: Option<bool> = None;
             for x in 0..w as i32 {

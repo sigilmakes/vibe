@@ -3,7 +3,10 @@
 //! evaluated in cell coordinates, so a thread stays one cell wide at any
 //! terminal size. Audio envelopes alter gauge, tension, and thread colour.
 
-use crate::{palette::Theme, visuals::Reactivity};
+use crate::{
+    palette::Theme,
+    visuals::{approach_hue, Reactivity},
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::TAU;
 
@@ -31,6 +34,8 @@ pub struct Renderer {
     scroll: f32,
     /// Bass, mid, treble, kick, onset, centroid, flatness.
     env: [f32; ENV],
+    /// Smoothed chroma hue, so noise does not flicker the palette.
+    chroma: f32,
 }
 
 fn unit(v: f32) -> f32 {
@@ -79,10 +84,12 @@ fn chroma_hue(audio: &Reactivity) -> f32 {
         weight += value;
         sum += value * i as f32;
     }
+    let neutral = unit(audio.centroid) * 0.5;
     if weight > 1e-3 {
-        (sum / weight) / 12.0
+        let pitch = (sum / weight) / 12.0;
+        pitch * audio.tonality() + neutral * (1.0 - audio.tonality())
     } else {
-        unit(audio.centroid) * 0.5
+        neutral
     }
 }
 
@@ -110,6 +117,7 @@ impl Renderer {
         for (value, target) in self.env.iter_mut().zip(targets) {
             *value += (target - *value) * follow;
         }
+        self.chroma = approach_hue(self.chroma, chroma_hue(audio), (dt * 8.0).min(1.0));
         self.phase = (self.phase + dt * (0.4 + unit(audio.energy) * 1.2 + self.env[1] * 0.5))
             .rem_euclid(TAU * 16.0);
         self.scroll = (self.scroll + dt * (0.45 + unit(audio.energy) * 1.3 + self.env[3] * 0.4))
@@ -150,7 +158,7 @@ impl Renderer {
             .copied()
             .map(unit)
             .fold(0.0, f32::max);
-        let chroma = chroma_hue(audio);
+        let chroma = self.chroma;
         let cols = visible.width.max(1) as f32;
         let rows = visible.height.max(1) as f32;
         let aspect = cols / rows;

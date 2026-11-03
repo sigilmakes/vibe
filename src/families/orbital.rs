@@ -759,7 +759,7 @@ impl Renderer {
                 prev = p;
             }
         }
-        let burst = unit(audio.onset) + unit(audio.kick);
+        let burst = unit(audio.transients[0]).max(unit(audio.transients[1]));
         c.circle(head, 0.13 + burst * 0.05, '·', 0.36, 0.26 + burst * 0.3);
         c.circle(head, 0.065, '∘', 0.40, 0.55);
         c.plot(head, '●', 0.55, 0.96);
@@ -905,7 +905,7 @@ impl Renderer {
                 c.plot(point(u), '·', 0.40, 0.35 + u * 0.25);
             }
             let ship = point(progress);
-            let flare = 0.4 + unit(audio.onset) * 0.8;
+            let flare = 0.4 + unit(audio.transients[3]) * 0.8;
             c.circle(ship, 0.045, '·', 0.15, flare * 0.5);
             c.plot(ship, '◆', 0.12, 0.95);
         }
@@ -1147,7 +1147,7 @@ impl Renderer {
         let (px, py, pr) = (-1.25_f32, 0.06_f32, 1.38_f32);
         let (mx, my) = (0.74_f32, -0.48_f32);
         let bass = unit(audio.bass);
-        let onset = unit(audio.onset);
+        let debris = unit(audio.transients[1]).max(unit(audio.transients[2]));
         let stretch = 0.46 * (1.0 + bass * 0.22);
         let thin = 0.18 * (1.0 - bass * 0.10);
         let spin = -0.38_f32;
@@ -1228,7 +1228,7 @@ impl Renderer {
                 let v = 1.0 - u;
                 let h1 = hash(k, 7);
                 let h2 = hash(k, 19);
-                let spread = 0.04 + onset * 0.11 + u * 0.03;
+                let spread = 0.04 + debris * 0.11 + u * 0.03;
                 let p = [
                     v * v * start[0]
                         + 2.0 * v * u * control[0]

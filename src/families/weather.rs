@@ -399,9 +399,8 @@ impl Renderer {
         let fw = w as f32;
         let fh = h as f32;
         let energy = unit(audio.energy);
-        let flash = unit(audio.onset)
-            .max(unit(audio.kick))
-            .max(unit(audio.transients[0]))
+        let flash = unit(audio.transients[0])
+            .max(unit(audio.transients[2]))
             .max(energy * 0.35);
         for j in 0..h {
             for i in 0..w {
@@ -570,7 +569,7 @@ impl Renderer {
         let bass = unit(audio.bass);
         let energy = unit(audio.energy);
         let treble = unit(audio.treble);
-        let arms = 3.0 + unit(audio.chroma[0]) * 3.0 + treble * 1.5;
+        let arms = 3.0 + unit(audio.chroma[0]) * audio.tonality() * 3.0 + treble * 1.5;
         let spin = t * (0.9 + energy * 2.2);
         let eye = 0.12 + bass * 0.06;
         for j in 0..h {
@@ -655,9 +654,7 @@ impl Renderer {
         let fw = w as f32;
         let fh = h as f32;
         let energy = unit(audio.energy);
-        let flash = unit(audio.onset)
-            .max(unit(audio.kick))
-            .max(unit(audio.transients[1]));
+        let flash = unit(audio.transients[1]).max(unit(audio.transients[3]));
         let grow = unit(audio.bass) * 0.10 + energy * 0.06;
         let flash_seed = (t * 9.0) as i32;
         for j in 0..h {

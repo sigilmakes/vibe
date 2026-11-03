@@ -108,10 +108,7 @@ impl Renderer {
             self.last_time = Some(time);
         }
         self.clock += dt * (0.55 + unit(audio.energy) * 0.75 + unit(audio.mid) * 0.25);
-        let attack = unit(audio.kick)
-            .max(unit(audio.onset))
-            .max(unit(audio.transients[0]))
-            .max(unit(audio.transients[1]) * 0.8);
+        let attack = unit(audio.transients[0]).max(unit(audio.transients[1]) * 0.8);
         self.envelope += (attack - self.envelope) * (dt * 9.0).min(1.0);
         self.swell += (unit(audio.bass) - self.swell) * (dt * 4.0).min(1.0);
     }
@@ -140,12 +137,15 @@ impl Renderer {
         // Half-width of the plane in vertical units; keeps blobs circular on
         // terminals where a cell is about twice as tall as it is wide.
         let aspect = (width / (2.0 * height)).clamp(0.25, 4.0);
+        let pan = audio.pan() * 0.10;
+        let stretch = 1.0 + audio.spread() * 0.25;
 
         self.xs.clear();
         self.ys.clear();
         self.xs.extend(
-            (visible.x..visible.right())
-                .map(|x| (((x - area.x) as f32 + 0.5) / width * 2.0 - 1.0) * aspect),
+            (visible.x..visible.right()).map(|x| {
+                ((((x - area.x) as f32 + 0.5) / width * 2.0 - 1.0) + pan) * aspect * stretch
+            }),
         );
         self.ys.extend(
             (visible.y..visible.bottom()).map(|y| ((y - area.y) as f32 + 0.5) / height * 2.0 - 1.0),
@@ -166,7 +166,6 @@ impl Renderer {
         let bass = unit(audio.bass);
         let mid = unit(audio.mid);
         let treble = unit(audio.treble);
-        let onset = unit(audio.onset);
         let envelope = self.envelope;
         let swell = self.swell;
 
@@ -304,7 +303,8 @@ impl Renderer {
                 self.blobs.push(Blob::round(0.0, 0.0, 0.13 + bass * 0.04));
                 for i in 0..8 {
                     let a = i as f32 * TAU / 8.0 + angle;
-                    let chroma = unit(audio.chroma[i] + audio.chroma[(i + 3) % 12] * 0.5);
+                    let chroma =
+                        unit(audio.chroma[i] + audio.chroma[(i + 3) % 12] * 0.5) * audio.tonality();
                     let distance = 0.48 + 0.14 * chroma + 0.03 * (t * 0.9 + i as f32).sin();
                     let radius =
                         0.08 + 0.07 * chroma + bass * 0.04 + 0.015 * unit(bands[(i * 4) % 32]);
@@ -319,7 +319,7 @@ impl Renderer {
                 // A regular lattice that swells into a connected net on attacks.
                 let cols = if aspect > 1.1 { 6 } else { 5 };
                 let rows = 4;
-                let attack = envelope.max(unit(audio.kick));
+                let attack = envelope;
                 for gy in 0..rows {
                     for gx in 0..cols {
                         let i = gy * cols + gx;
@@ -395,7 +395,8 @@ impl Renderer {
             }
             1 => {
                 const LEVELS: [f32; 6] = [0.28, 0.52, 0.82, 1.20, 1.65, 2.20];
-                let tolerance = 0.024 + onset * 0.014;
+                let fine = unit(audio.transients[2]).max(unit(audio.transients[3]));
+                let tolerance = 0.024 + fine * 0.014;
                 for (j, &y) in self.ys.iter().enumerate() {
                     for (i, &x) in self.xs.iter().enumerate() {
                         let (value, _, _) = sample(blobs, x, y);
@@ -711,7 +712,7 @@ mod tests {
             beat_phase: 0.25,
             novelty: 1.0,
             centroid: 1.0,
-            flatness: 1.0,
+            flatness: 0.2,
             waveform: [0.8; 32],
             transients: [1.0; 4],
             chroma: [1.0; 12],
@@ -774,6 +775,24 @@ mod tests {
             assert_eq!(image, again, "style {style} is not deterministic");
         }
         assert_eq!(images.len(), NAMES.len());
+    }
+
+    #[test]
+    fn stereo_pan_and_width_move_the_field() {
+        let calm = Reactivity::default();
+        let (base, _) = snapshot(0, &calm, 48);
+        let panned = Reactivity {
+            balance: 0.8,
+            ..Reactivity::default()
+        };
+        let (shifted, _) = snapshot(0, &panned, 48);
+        assert_ne!(base, shifted, "balance did not pan the field");
+        let wide = Reactivity {
+            width: 0.9,
+            ..Reactivity::default()
+        };
+        let (stretched, _) = snapshot(0, &wide, 48);
+        assert_ne!(base, stretched, "width did not spread the field");
     }
 
     #[test]

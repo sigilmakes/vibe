@@ -23,7 +23,7 @@ pub struct Renderer {
     last_time: Option<f32>,
     phase: f32,
     spin: f32,
-    envelopes: [f32; 4],
+    envelopes: [f32; 3],
     attack: f32,
     impact: f32,
     xs: Vec<f32>,
@@ -368,7 +368,13 @@ impl Params {
             cx += weight * angle.cos();
             cy += weight * angle.sin();
         }
-        let chroma_mag = (cx.hypot(cy) / 3.0).min(1.0);
+        let tonality = audio.tonality();
+        let chroma_mag = (cx.hypot(cy) / 3.0).min(1.0) * tonality;
+        let chroma_angle = if chroma_mag > 0.001 {
+            cy.atan2(cx) * tonality
+        } else {
+            0.0
+        };
         let bands8: [f32; 8] =
             std::array::from_fn(|i| (0..4).map(|j| unit(bands[i * 4 + j])).sum::<f32>() * 0.25);
         let wave8: [f32; 8] = std::array::from_fn(|i| unit(audio.waveform[i * 4] * 0.5 + 0.5));
@@ -413,7 +419,7 @@ impl Params {
             impact: renderer.impact,
             centroid: unit(audio.centroid),
             flatness: unit(audio.flatness),
-            chroma_angle: cy.atan2(cx),
+            chroma_angle,
             chroma_mag,
             bands: bands8,
             wave: wave8,
@@ -437,23 +443,17 @@ impl Renderer {
             .last_time
             .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.05));
         self.last_time = Some(now);
-        let targets = [
-            unit(audio.bass),
-            unit(audio.mid),
-            unit(audio.treble),
-            unit(audio.onset).max(unit(audio.kick)),
-        ];
+        let targets = [unit(audio.bass), unit(audio.mid), unit(audio.treble)];
         let blend = 1.0 - (-dt * 9.0).exp();
         for (value, target) in self.envelopes.iter_mut().zip(targets) {
             *value += (target - *value) * blend;
         }
-        let attack = unit(
-            audio
-                .transients
-                .iter()
-                .copied()
-                .fold(unit(audio.onset).max(unit(audio.kick)), f32::max),
-        );
+        let attack = audio
+            .transients
+            .iter()
+            .copied()
+            .map(unit)
+            .fold(0.0, f32::max);
         if attack > self.attack + 0.08 {
             self.impact = 1.0;
         }
@@ -681,6 +681,19 @@ mod tests {
             assert!(
                 cells > 120,
                 "style {style} ({name}) filled only {cells} cells"
+            );
+        }
+    }
+
+    #[test]
+    fn every_style_draws_something_in_silence() {
+        let area = Rect::new(0, 0, 80, 30);
+        for (style, name) in NAMES.iter().enumerate() {
+            let buffer = render(style, Reactivity::default(), area, 30);
+            let cells = drawn_cells(&buffer);
+            assert!(
+                cells > 200,
+                "style {style} ({name}) drew only {cells} cells in silence"
             );
         }
     }

@@ -38,11 +38,13 @@ fn clock(time: f32) -> f32 {
     }
 }
 
-/// Chroma centroid as a hue in [0, 1).
+/// Chroma centroid as a hue in [0, 1), pulled toward the brightness
+/// centroid when the spectrum is too flat for pitch to be meaningful.
 fn hue_of(audio: &Reactivity) -> f32 {
     let total: f32 = audio.chroma.iter().copied().map(unit).sum();
+    let neutral = unit(audio.centroid) * 0.5;
     if total < 1e-4 {
-        0.0
+        neutral
     } else {
         let weighted: f32 = audio
             .chroma
@@ -50,7 +52,8 @@ fn hue_of(audio: &Reactivity) -> f32 {
             .enumerate()
             .map(|(i, c)| i as f32 * unit(*c))
             .sum();
-        weighted / total / 12.0
+        let pitch = weighted / total / 12.0;
+        pitch * audio.tonality() + neutral * (1.0 - audio.tonality())
     }
 }
 
@@ -98,6 +101,8 @@ struct Scene<'a> {
     bands: &'a [f32; 32],
     theme: &'a Theme,
     hue: f32,
+    pan: f32,
+    spread: f32,
     energy: f32,
     bass: f32,
     mid: f32,
@@ -208,6 +213,8 @@ impl Renderer {
             bands,
             theme,
             hue: hue_of(audio),
+            pan: audio.pan(),
+            spread: audio.spread(),
             energy,
             bass: unit(audio.bass),
             mid: unit(audio.mid),
@@ -279,7 +286,7 @@ fn dye_vortex(s: &mut Scene<'_>) {
             let mut tx = 0.0;
             let mut ty = 0.0;
             for (side, cx_scale, cy) in [(-1.0f32, -0.16, -0.04f32), (1.0, 0.16, 0.05)] {
-                let cx = cx_scale * span;
+                let cx = cx_scale * span * (1.0 + s.spread * 0.5) + s.pan * span * 0.10;
                 let dx = x - cx;
                 let dy = y - cy;
                 let d = dx.hypot(dy).max(0.015);
@@ -720,6 +727,22 @@ mod tests {
         assert_eq!(NAMES.len(), 10);
         let unique: std::collections::HashSet<_> = NAMES.iter().collect();
         assert_eq!(unique.len(), NAMES.len());
+    }
+
+    #[test]
+    fn stereo_pan_and_width_move_the_vortex() {
+        let calm = Reactivity::default();
+        let base = render(1, &calm);
+        let panned = Reactivity {
+            balance: 0.8,
+            ..Reactivity::default()
+        };
+        assert_ne!(base, render(1, &panned), "balance did not pan the vortex");
+        let wide = Reactivity {
+            width: 0.9,
+            ..Reactivity::default()
+        };
+        assert_ne!(base, render(1, &wide), "width did not spread the vortex");
     }
 
     #[test]
