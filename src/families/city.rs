@@ -131,7 +131,7 @@ impl Canvas {
         let dx = b[0] - a[0];
         let dy = b[1] - a[1];
         let glyph = line_glyph(dx, dy);
-        let steps = (dx.abs().max(dy.abs()) * 2.0).ceil().max(1.0) as i32;
+        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as i32;
         for step in 0..=steps {
             let f = step as f32 / steps as f32;
             self.plot_tinted(
@@ -182,7 +182,7 @@ fn hue_for(mode: usize, u: f32, v: f32, audio: &Reactivity) -> f32 {
         8 => 0.05 + u * 0.35,
         _ => 0.58 + u * 0.30,
     };
-    (base + unit(audio.centroid) * 0.16 + unit(audio.beat_phase) * 0.05).rem_euclid(1.0)
+    (base + unit(audio.centroid) * 0.16 + unit(audio.locked_beat_phase()) * 0.05).rem_euclid(1.0)
 }
 
 #[derive(Clone, Copy)]
@@ -201,17 +201,17 @@ fn build_skyline() -> Vec<Building> {
         let mut k = 0u32;
         while x < 1.0 {
             let seed = layer as u32 * 1000 + k * 17 + 1;
-            let w = 0.026 + hash01(seed) * 0.060;
+            let w = 0.045 + hash01(seed) * 0.090;
             let base = [0.62f32, 0.52, 0.42][layer as usize];
             let top = base - hash01(seed + 3) * 0.14 - layer as f32 * 0.04;
             out.push(Building {
                 x,
-                w: w * 0.96,
+                w: w * 0.90,
                 top,
                 layer,
                 seed,
             });
-            x += w;
+            x += w + 0.006;
             k += 1;
         }
     }
@@ -227,13 +227,22 @@ fn build_metro() -> Vec<MetroLine> {
     (0..6)
         .map(|i| {
             let k = i as u32 * 11;
-            let y0 = 0.10 + hash01(k + 1) * 0.22 + i as f32 * 0.115;
-            let x1 = 0.10 + hash01(k + 2) * 0.30;
-            let drop = (hash01(k + 3) - 0.5) * 0.34;
-            let y1 = (y0 + drop).clamp(0.08, 0.90);
-            let dx = 0.05 + hash01(k + 4) * 0.09;
+            let y0 = 0.08 + hash01(k + 1) * 0.78;
+            let x1 = 0.08 + hash01(k + 2) * 0.28;
+            let y1 = (y0 + (hash01(k + 3) - 0.5) * 0.45).clamp(0.08, 0.90);
+            let dx = 0.04 + hash01(k + 4) * 0.10;
+            let x2 = (x1 + dx + 0.10 + hash01(k + 5) * 0.20).min(0.74);
+            let dx2 = 0.04 + hash01(k + 6) * 0.10;
+            let y2 = (y1 + (hash01(k + 7) - 0.5) * 0.35).clamp(0.08, 0.92);
             MetroLine {
-                pts: vec![[-0.06, y0], [x1, y0], [x1 + dx, y1], [1.06, y1]],
+                pts: vec![
+                    [-0.06, y0],
+                    [x1, y0],
+                    [x1 + dx, y1],
+                    [x2, y1],
+                    [x2 + dx2, y2],
+                    [1.06, y2],
+                ],
                 hue: (i as f32 / 6.0 + 0.06).rem_euclid(1.0),
             }
         })
@@ -369,19 +378,23 @@ impl Renderer {
             if x1 <= x0 {
                 continue;
             }
-            let fill = ['░', '▒', '▓'][building.layer as usize];
-            let base = 0.10 + building.layer as f32 * 0.03;
+            let base = 0.40 + building.layer as f32 * 0.18;
             for y in y0..h as i32 {
                 for x in x0..=x1 {
-                    self.canvas.plot(x, y, fill, base);
+                    self.canvas.plot(x, y, ' ', base);
                 }
+                self.canvas.plot(x0, y, '│', base + 0.08);
+                self.canvas.plot(x1, y, '│', base + 0.08);
             }
-            for y in (y0 + 1..h as i32).step_by(2) {
-                for x in (x0 + 1..x1).step_by(2) {
+            for x in x0..=x1 {
+                self.canvas.plot(x, y0, '─', base + 0.10);
+            }
+            for y in (y0 + 2..h as i32).step_by(3) {
+                for x in (x0 + 1..x1).step_by(3) {
                     let band = unit(bands[(x + y).rem_euclid(32) as usize]);
-                    let threshold = 0.16 + bass * 0.30 + band * 0.22;
+                    let threshold = 0.10 + bass * 0.22 + band * 0.16;
                     if hash2(x + bucket, y) < threshold {
-                        let level = 0.32 + bass * 0.35 + band * 0.25;
+                        let level = base + 0.12 + band * 0.04;
                         self.canvas.plot(x, y, '▪', level);
                     }
                 }
@@ -389,23 +402,24 @@ impl Renderer {
             if building.seed % 5 == 0 {
                 let ax = (x0 + x1) / 2;
                 for d in 1..=3 {
-                    self.canvas.plot(ax, y0 - d, '│', 0.30);
+                    self.canvas.plot(ax, y0 - d, '│', base + 0.14);
                 }
                 let blink = 0.5 + 0.5 * (t * 2.0 + building.seed as f32).sin();
-                self.canvas.plot(ax, y0 - 4, '·', 0.25 + blink * 0.45);
+                self.canvas
+                    .plot(ax, y0 - 4, '·', base + 0.12 + blink * 0.06);
             }
-            if energy > 0.45 && building.layer == 2 && building.seed % 7 == 0 {
+            if energy > 0.65 && building.layer == 2 && building.seed % 11 == 0 {
                 let ax = (x0 + x1) as f32 * 0.5;
-                let spread = 0.15 + treble * 0.15;
+                let spread = 0.10 + treble * 0.08;
                 self.canvas.stroke(
                     [ax, y0 as f32],
                     [ax - fw * spread, 0.0],
-                    0.12 + energy * 0.12,
+                    0.08 + energy * 0.08,
                 );
                 self.canvas.stroke(
                     [ax, y0 as f32],
                     [ax + fw * spread, 0.0],
-                    0.12 + energy * 0.12,
+                    0.08 + energy * 0.08,
                 );
             }
         }
@@ -425,11 +439,11 @@ impl Renderer {
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
         let cols = (w / 4).max(1);
-        let rows = (h / 3).max(1);
+        let rows = (h / 4).max(1);
         let cw = fw / cols as f32;
         let ch = fh / rows as f32;
         let bucket = (t * 2.0) as i32;
-        let sweep = (unit(audio.beat_phase) * rows as f32) as i32;
+        let sweep = (unit(audio.locked_beat_phase()) * rows as f32) as i32;
         for gy in 0..rows {
             let y0 = (gy as f32 * ch).round() as i32;
             let y1 = (((gy + 1) as f32 * ch).round() as i32 - 1).max(y0);
@@ -437,8 +451,9 @@ impl Renderer {
                 let x0 = (gx as f32 * cw).round() as i32;
                 let x1 = (((gx + 1) as f32 * cw).round() as i32 - 1).max(x0);
                 let band = unit(bands[(gx * 3 + gy * 5) % 32]);
+                let floor_lit = hash2(gy as i32 + bucket / 2, 71) < 0.45 + bass * 0.35;
                 let lit = gy as i32 == sweep
-                    || hash2(gx as i32 + bucket, gy as i32) < 0.20 + bass * 0.34 + band * 0.22;
+                    || (floor_lit && hash2(gx as i32 + bucket, gy as i32) < 0.55 + band * 0.30);
                 let (mark, level) = if lit {
                     ('▓', 0.30 + band * 0.42 + bass * 0.22)
                 } else {
@@ -515,13 +530,34 @@ impl Renderer {
                 }
             }
         }
+        for (sx, hue) in [((fw * 0.06) as i32, 0.96), ((fw * 0.94) as i32, 0.55)] {
+            let top = horizon + 1;
+            for y in top..=(top + 5) {
+                self.canvas.plot_tinted(sx, y, '│', 0.45, hue);
+                self.canvas.plot_tinted(sx + 2, y, '│', 0.45, hue);
+                self.canvas.plot_tinted(
+                    sx + 1,
+                    y,
+                    if y % 2 == 0 { '▒' } else { '·' },
+                    0.28 + treble * 0.15,
+                    hue,
+                );
+            }
+            for x in sx..=(sx + 2) {
+                self.canvas.plot_tinted(x, top, '─', 0.50, hue);
+                self.canvas.plot_tinted(x, top + 5, '─', 0.50, hue);
+            }
+        }
         // Distant skyline in the gap above the road.
-        for x in (0..w as i32).step_by(7) {
-            let height = 2 + (hash2(x, 91) * 10.0) as i32;
-            for y in (horizon - height)..horizon {
-                self.canvas.plot(x, y, '▓', 0.08);
-                if hash2(x, y) < 0.2 {
-                    self.canvas.plot(x, y, '▪', 0.20);
+        for x in (0..w as i32).step_by(9) {
+            let width = 3 + (hash2(x, 91) * 4.0) as i32;
+            let height = 2 + (hash2(x, 92) * 8.0) as i32;
+            for bx in x..(x + width) {
+                for y in (horizon - height)..horizon {
+                    self.canvas.plot(bx, y, '▓', 0.06);
+                    if hash2(bx, y) < 0.10 {
+                        self.canvas.plot(bx, y, '▪', 0.16);
+                    }
                 }
             }
         }
@@ -542,8 +578,10 @@ impl Renderer {
             let half = (0.025 + 0.46 * d) * fw;
             for side in [-1.0f32, 1.0] {
                 let x = vp + side * half * 0.9;
-                self.canvas.dot(x, y, '│', 0.28);
-                self.canvas.dot(x, y - 1.0, '·', 0.35 + treble * 0.25);
+                for d in 0..3 {
+                    self.canvas.dot(x, y - d as f32, '│', 0.20);
+                }
+                self.canvas.dot(x, y - 3.0, '·', 0.35 + treble * 0.25);
             }
         }
     }
@@ -569,10 +607,9 @@ impl Renderer {
         }
         for i in 0..w {
             let y = fh * (0.70 + 0.05 * i as f32 / fw) + (i as f32 * 0.02 + t * 0.2).sin() * 2.0;
-            for dy in -1..=1 {
-                self.canvas
-                    .plot(i as i32, (y + dy as f32).round() as i32, '≈', 0.05);
-            }
+            let band = unit(bands[i % 32]);
+            self.canvas
+                .plot(i as i32, y.round() as i32, '≈', 0.035 + band * 0.02);
         }
         for (li, line) in self.metro.iter().enumerate() {
             for pair in line.pts.windows(2) {
@@ -633,10 +670,10 @@ impl Renderer {
         for j in (deck as i32 + 2)..h as i32 {
             for i in 0..w as i32 {
                 let wave = (i as f32 * 0.13 + j as f32 * 0.5 + t * 2.2).sin();
-                if wave > 0.70 {
+                if wave > 0.86 {
                     self.canvas
-                        .plot(i, j, '≈', 0.07 + (wave - 0.70) * 0.30 + bass * 0.04);
-                } else if hash2(i, j) < 0.025 {
+                        .plot(i, j, '≈', 0.05 + (wave - 0.86) * 0.25 + bass * 0.03);
+                } else if hash2(i, j) < 0.02 {
                     self.canvas.plot(i, j, '·', 0.05);
                 }
             }
@@ -644,18 +681,21 @@ impl Renderer {
         for tx in [t1, t2] {
             let x = tx.round() as i32;
             for y in top as i32..deck as i32 {
-                self.canvas.plot(x, y, '│', 0.45);
+                self.canvas.plot(x, y, '│', 0.55);
+                self.canvas.plot(x + 1, y, '│', 0.40);
                 if y % 6 == 0 {
-                    for dx in -2..=2 {
+                    for dx in -2..=3 {
                         self.canvas.plot(x + dx, y, '─', 0.32);
                     }
                 }
             }
-            for dx in -2..=2 {
+            for dx in -2..=3 {
                 self.canvas.plot(x + dx, top as i32, '─', 0.55);
                 self.canvas
                     .plot(x + dx, (top + fh * 0.12) as i32, '─', 0.48);
             }
+            let blink = 0.5 + 0.5 * (t * 2.4 + tx * 0.05).sin();
+            self.canvas.plot(x, top as i32 - 1, '·', 0.25 + blink * 0.4);
         }
         for x in t1 as i32..=t2 as i32 {
             let u = (x as f32 - mid) / half;
@@ -663,18 +703,18 @@ impl Renderer {
             let slope = -2.0 * sag * u / half;
             self.canvas
                 .plot(x, y.round() as i32, line_glyph(1.0, slope), 0.65);
-            if x % 4 == 0 {
+            if x % 6 == 0 {
                 for yy in (y.round() as i32)..deck as i32 {
-                    self.canvas.plot(x, yy, '│', 0.16);
+                    self.canvas.plot(x, yy, '│', 0.12);
                 }
             }
         }
-        self.canvas.stroke([t1, top], [0.0, deck], 0.38);
-        self.canvas.stroke([t2, top], [fw - 1.0, deck], 0.38);
+        self.canvas.stroke([t1, top], [0.0, deck], 0.30);
+        self.canvas.stroke([t2, top], [fw - 1.0, deck], 0.30);
         for x in 0..w as i32 {
             self.canvas.plot(x, deck as i32, '─', 0.50);
-            if x % 3 == 0 {
-                self.canvas.plot(x, deck as i32 - 1, '·', 0.28);
+            if x % 5 == 0 {
+                self.canvas.plot(x, deck as i32 - 1, '·', 0.18);
             }
         }
         for k in 0..14u32 {
@@ -728,16 +768,19 @@ impl Renderer {
                     self.canvas.plot(x, y, '▓', 0.09);
                 }
             }
-            for y in (y0 + 1..roof as i32).step_by(2) {
-                for x in (x0 + 1..x1).step_by(2) {
-                    if hash2(x + bucket, y) < 0.18 + bass * 0.25 {
-                        self.canvas.plot(x, y, '▪', 0.28 + bass * 0.3);
+            for x in x0..=x1 {
+                self.canvas.plot(x, y0, '─', 0.18);
+            }
+            for y in (y0 + 1..roof as i32).step_by(3) {
+                for x in (x0 + 1..x1).step_by(3) {
+                    if hash2(x + bucket, y) < 0.12 + bass * 0.20 {
+                        self.canvas.plot(x, y, '▪', 0.22 + bass * 0.25);
                     }
                 }
             }
         }
-        for i in 0..300u32 {
-            if hash01(i * 7 + 1) > 0.28 + treble * 0.45 {
+        for i in 0..220u32 {
+            if hash01(i * 7 + 1) > 0.20 + treble * 0.35 {
                 continue;
             }
             let x = (hash01(i * 7 + 2) * fw + t * 3.0).rem_euclid(fw);
@@ -745,15 +788,18 @@ impl Renderer {
             let y = ((hash01(i * 7 + 4) * (fh + 12.0) + t * speed * fh * 0.5)
                 .rem_euclid(fh + 12.0))
                 - 6.0;
-            let level = 0.16 + treble * 0.28;
-            self.canvas.stroke([x, y], [x + 1.2, y + 2.5], level);
+            if y >= roof - 1.0 {
+                continue;
+            }
+            let level = 0.09 + treble * 0.15;
+            self.canvas.stroke([x, y], [x + 0.4, y + 2.0], level);
         }
         for j in roof as i32..h as i32 {
             for i in 0..w as i32 {
                 let n = noise2(i as f32 * 0.10, j as f32 * 0.18);
-                let level = 0.05 + n * 0.06 + energy * 0.02;
+                let level = 0.03 + n * 0.05 + energy * 0.015;
                 self.canvas
-                    .plot(i, j, if n > 0.55 { '░' } else { '·' }, level);
+                    .plot(i, j, if n > 0.62 { '░' } else { '·' }, level);
             }
         }
         for k in 0..5u32 {
@@ -761,10 +807,10 @@ impl Renderer {
             let cy = roof + 2.0 + hash01(k * 19 + 2) * (fh - roof - 3.0);
             let band = unit(bands[(k as usize * 5) % 32]);
             let ripple = 1.0 + (t * 2.0 + hash01(k * 19 + 3) * TAU).sin() * (0.4 + kick);
-            for dx in 0..10 {
-                let x = cx + (dx as f32 - 5.0) * ripple;
+            for dx in 0..12 {
+                let x = cx + (dx as f32 - 6.0) * ripple;
                 self.canvas
-                    .dot(x, cy, '≈', 0.08 + band * 0.12 + kick * 0.22);
+                    .dot(x, cy, '≈', 0.14 + band * 0.14 + kick * 0.24);
             }
             if kick > 0.3 {
                 for step in 0..6 {
@@ -783,12 +829,17 @@ impl Renderer {
         let tank_y0 = (fh * 0.58) as i32;
         let tank_y1 = (fh * 0.72) as i32;
         for x in tank_x0..=tank_x1 {
-            self.canvas.plot(x, tank_y0, '─', 0.45);
-            self.canvas.plot(x, tank_y1, '─', 0.40);
+            self.canvas.plot(x, tank_y0, '─', 0.55);
+            self.canvas.plot(x, tank_y1, '─', 0.50);
         }
         for y in tank_y0..=tank_y1 {
-            self.canvas.plot(tank_x0, y, '│', 0.45);
-            self.canvas.plot(tank_x1, y, '│', 0.45);
+            self.canvas.plot(tank_x0, y, '│', 0.55);
+            self.canvas.plot(tank_x1, y, '│', 0.55);
+        }
+        for y in (tank_y0 + 1)..tank_y1 {
+            for x in (tank_x0 + 1)..tank_x1 {
+                self.canvas.plot(x, y, '▒', 0.09 + treble * 0.03);
+            }
         }
         for x in tank_x0..=tank_x1 {
             self.canvas
@@ -839,20 +890,29 @@ impl Renderer {
                 let road_y = j.rem_euclid(sy) < 2;
                 if road_x || road_y {
                     self.canvas.plot(i, j, '·', 0.045 + treble * 0.02);
-                    if (i.rem_euclid(sx) == 1 || j.rem_euclid(sy) == 1)
-                        && (i + j + (t * 4.0) as i32) % 9 == 0
-                    {
-                        self.canvas.plot(i, j, '─', 0.14);
+                    if road_x && i.rem_euclid(sx) == 1 && (j + (t * 2.0) as i32).rem_euclid(6) < 3 {
+                        self.canvas.plot(i, j, '│', 0.12);
+                    }
+                    if road_y && j.rem_euclid(sy) == 1 && (i + (t * 3.0) as i32).rem_euclid(6) < 3 {
+                        self.canvas.plot(i, j, '─', 0.12);
                     }
                 } else {
                     let bx = i / sx;
                     let by = j / sy;
                     let band = unit(bands[((bx * 5 + by * 7) as usize) % 32]);
-                    let level = 0.06 + band * 0.12 + bass * 0.04;
-                    let mark = if hash2(bx, by) > 0.45 { '▒' } else { '░' };
-                    self.canvas.plot(i, j, mark, level);
-                    if i.rem_euclid(3) == 0 && j.rem_euclid(2) == 0 {
-                        self.canvas.plot(i, j, '▪', 0.15 + band * 0.25);
+                    let seed = hash2(bx, by);
+                    if seed > 0.86 {
+                        self.canvas.plot(i, j, '·', 0.03 + band * 0.02);
+                        if hash2(i, j) < 0.07 {
+                            self.canvas.plot(i, j, '▪', 0.16);
+                        }
+                    } else {
+                        let level = 0.06 + band * 0.12 + bass * 0.04;
+                        let mark = if seed > 0.45 { '▒' } else { '░' };
+                        self.canvas.plot(i, j, mark, level);
+                        if seed > 0.30 && i.rem_euclid(3) == 0 && j.rem_euclid(2) == 0 {
+                            self.canvas.plot(i, j, '▪', 0.15 + band * 0.25);
+                        }
                     }
                 }
             }
@@ -923,7 +983,7 @@ impl Renderer {
         let cx = fw * 0.5;
         let cy = fh * 0.44;
         let radius = (fw.min(fh * 2.0) * 0.30 * (1.0 + bass * 0.06)).max(5.0);
-        let second = -PI * 0.5 + unit(audio.beat_phase) * TAU + t * 0.6;
+        let second = -PI * 0.5 + unit(audio.locked_beat_phase()) * TAU + t * 0.6;
         let minute = -PI * 0.5 + t * 0.22;
         let hour = -PI * 0.5 + t * 0.018;
         for j in 0..h {
@@ -931,7 +991,7 @@ impl Renderer {
             for i in 0..w {
                 let dx = i as f32 - cx;
                 let d = dx.hypot(dy);
-                if d > radius * 1.10 || d < radius * 0.70 {
+                if d > radius * 1.10 {
                     continue;
                 }
                 if (d - radius).abs() < 0.9 {
@@ -957,6 +1017,12 @@ impl Renderer {
         ] {
             let end = [cx + angle.cos() * len, cy + angle.sin() * len * 0.5];
             self.canvas.stroke([cx, cy], end, level);
+            self.canvas.stroke(
+                [cx + 0.7, cy + 0.35],
+                [end[0] + 0.7, end[1] + 0.35],
+                level * 0.55,
+            );
+            self.canvas.dot(end[0], end[1], '●', level);
         }
         self.canvas.dot(cx, cy, '◉', 0.55 + kick * 0.3);
         for k in 0..24 {
@@ -1049,6 +1115,7 @@ impl Renderer {
         }
         for j in (fh * 0.62) as i32..h as i32 {
             for i in 0..w as i32 {
+                self.canvas.plot(i, j, '·', 0.02);
                 let n = noise2(i as f32 * 0.12, j as f32 * 0.2);
                 if n > 0.62 {
                     self.canvas.plot(i, j, '░', 0.04 + n * 0.04);
@@ -1064,19 +1131,26 @@ impl Renderer {
             self.canvas.dot(x, y, '░', 0.07 + energy * 0.08);
         }
         let door_x = (w / 2) as i32;
-        let door_y = (fh * 0.54) as i32;
-        for x in door_x - 2..=door_x + 2 {
-            self.canvas.plot_tinted(x, door_y, '─', 0.35, 0.10);
-            self.canvas.plot_tinted(x, door_y + 2, '─', 0.30, 0.10);
+        let door_y = (fh * 0.63) as i32;
+        for x in door_x - 3..=door_x + 3 {
+            self.canvas.plot_tinted(x, door_y, '─', 0.40, 0.10);
         }
-        for y in door_y..=door_y + 2 {
-            self.canvas.plot_tinted(door_x - 2, y, '│', 0.35, 0.10);
-            self.canvas.plot_tinted(door_x + 2, y, '│', 0.35, 0.10);
+        for y in door_y..=door_y + 3 {
+            self.canvas.plot_tinted(door_x - 3, y, '│', 0.40, 0.10);
+            self.canvas.plot_tinted(door_x + 3, y, '│', 0.40, 0.10);
         }
-        for y in door_y..=door_y + 2 {
-            for x in door_x - 1..=door_x + 1 {
-                self.canvas.plot_tinted(x, y, '░', 0.20 + kick * 0.2, 0.10);
+        for y in (door_y + 1)..=(door_y + 3) {
+            for x in (door_x - 2)..=(door_x + 2) {
+                self.canvas.plot_tinted(x, y, '░', 0.22 + kick * 0.20, 0.10);
             }
+        }
+        for side in [-1.0f32, 1.0] {
+            let end_x = door_x as f32 + side * fw * 0.22;
+            self.canvas.stroke(
+                [door_x as f32 + side * 3.0, (door_y + 3) as f32],
+                [end_x, fh - 1.0],
+                0.06,
+            );
         }
         for k in 0..8u32 {
             let cx = hash01(k * 11 + 2) * fw;
@@ -1096,7 +1170,7 @@ impl Renderer {
         let energy = unit(audio.energy);
         let bass = unit(audio.bass);
         let kick = unit(audio.kick);
-        let roads = 7;
+        let roads = 7usize;
         let bh = fh / roads as f32;
         for b in 0..roads {
             let y0 = b as f32 * bh;
@@ -1105,11 +1179,14 @@ impl Renderer {
                     self.canvas.plot(i, j, '·', 0.035);
                 }
             }
+            for i in 0..w as i32 {
+                self.canvas.plot(i, y0 as i32, '─', 0.06);
+            }
             for lane in 1..3 {
                 let ly = (y0 + bh * lane as f32 / 3.0).round() as i32;
                 for i in 0..w as i32 {
-                    if (i + (t * 6.0) as i32) % 7 < 3 {
-                        self.canvas.plot(i, ly, '─', 0.12 + treble * 0.05);
+                    if (i + b as i32 * 4 + (t * 6.0) as i32).rem_euclid(11) < 3 {
+                        self.canvas.plot(i, ly, '─', 0.10 + treble * 0.04);
                     }
                 }
             }
@@ -1124,22 +1201,23 @@ impl Renderer {
                 let x = p * fw;
                 let len = 2.0 + hash01((b * 31 + k) as u32 + 3) * 4.0 + treble * 2.5;
                 let level =
-                    0.35 + band * 0.3 + bass * 0.2 + if k % 5 == 0 { kick * 0.3 } else { 0.0 };
+                    0.45 + band * 0.3 + bass * 0.2 + if k % 5 == 0 { kick * 0.3 } else { 0.0 };
                 for d in 0..len as i32 {
                     let px = x as i32 + dir as i32 * d;
-                    self.canvas.plot(px, ly.round() as i32, '─', level);
+                    self.canvas.plot(px, ly.round() as i32, '━', level);
                 }
                 self.canvas.dot(x, ly, '●', (level + 0.35).min(1.0));
             }
         }
         for x in [0.28f32, 0.62] {
             let xi = (x * fw) as i32;
-            for j in 0..h as i32 {
-                self.canvas.plot(xi, j, '│', 0.10);
-                self.canvas.plot(xi + 1, j, '│', 0.06);
-            }
-            for j in (0..h as i32).step_by(6) {
-                self.canvas.plot(xi, j, '·', 0.30 + treble * 0.25);
+            for j in (0..h as i32).step_by(7) {
+                for d in 0..3 {
+                    self.canvas.plot(xi, j + d, '│', 0.10);
+                    self.canvas.plot(xi + 1, j + d, '│', 0.06);
+                }
+                self.canvas.plot(xi, j, '─', 0.10);
+                self.canvas.plot(xi + 1, j, '·', 0.30 + treble * 0.25);
             }
         }
         for k in 0..18u32 {
@@ -1255,49 +1333,6 @@ mod tests {
                         }
                     }
                 }
-            }
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn preview() {
-        let area = Rect::new(0, 0, 100, 40);
-        let mut renderer = Renderer::default();
-        let mut buf = Buffer::empty(area);
-        let loud = Reactivity {
-            energy: 0.8,
-            bass: 0.8,
-            mid: 0.6,
-            treble: 0.6,
-            beat: 0.5,
-            kick: 0.5,
-            beat_phase: 0.3,
-            ..Reactivity::default()
-        };
-        let mut bands = [0.0f32; 32];
-        for (i, band) in bands.iter_mut().enumerate() {
-            *band = 0.4 + 0.5 * ((i as f32 * 0.7).sin() * 0.5 + 0.5);
-        }
-        for (mode, _) in NAMES.iter().enumerate() {
-            for frame in 0..30 {
-                renderer.draw(
-                    &mut buf,
-                    area,
-                    frame as f32 / 30.0,
-                    mode,
-                    0,
-                    &bands,
-                    &loud,
-                    &Theme::default(),
-                );
-            }
-            println!("=== {} {}", mode, NAMES[mode]);
-            for y in 0..area.height {
-                let row: String = (0..area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect();
-                println!("{row}");
             }
         }
     }
