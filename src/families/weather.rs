@@ -2,8 +2,9 @@
 //! hail, thunderheads, dust devils, and radar echoes.
 //!
 //! Geometry is computed in cell space; static particle fields and radar echoes
-//! are generated once and reused. All motion is a pure function of time so a
-//! frame is deterministic for a given audio state.
+//! are generated once and reused. Motion is a function of time and the audio
+//! state, so a frame is deterministic for a given call sequence; lightning is
+//! the one scene that carries a decaying strike envelope between frames.
 use crate::{palette::Theme, visuals::Reactivity};
 use ratatui::{buffer::Buffer, layout::Rect};
 use std::f32::consts::{PI, TAU};
@@ -266,6 +267,12 @@ pub struct Renderer {
     clouds: Vec<Cloud>,
     echoes: Vec<Echo>,
     last_time: Option<f32>,
+    /// Decaying strike light for the lightning scene; the only cross-frame
+    /// state in this family, so the afterglow can outlive its transient.
+    flash: f32,
+    bolt_seed: u32,
+    bolt_strength: f32,
+    bolt_age: f32,
 }
 
 impl Renderer {
@@ -287,6 +294,10 @@ impl Renderer {
         } else {
             self.last_time.unwrap_or(0.0)
         };
+        let dt = self
+            .last_time
+            .map(|prev| (now - prev).clamp(0.0, 0.1))
+            .unwrap_or(0.0);
         self.last_time = Some(now);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
@@ -297,7 +308,7 @@ impl Renderer {
         self.canvas.reset(w, h);
         match mode {
             0 => self.draw_rain(w, h, now, bands, audio),
-            1 => self.draw_lightning(w, h, now, bands, audio),
+            1 => self.draw_lightning(w, h, now, dt, bands, audio),
             2 => self.draw_cumulus(w, h, now, audio),
             3 => self.draw_fog(w, h, now, audio),
             4 => self.draw_snow(w, h, now, audio),
@@ -342,25 +353,31 @@ impl Renderer {
     }
 
     /// Slanted rain streaks, a low mist, and splash rings on the ground.
+    ///
+    /// Treble sets how many drops fall, bass and mid set how fast they cross
+    /// the frame, and onset shears the whole field sideways as a gust.
     fn draw_rain(&mut self, w: usize, h: usize, t: f32, bands: &[f32; 32], audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let energy = unit(audio.energy);
+        let bass = unit(audio.bass);
+        let mid = unit(audio.mid);
         let treble = unit(audio.treble);
-        let slant = 0.34 + unit(audio.mid) * 0.35;
-        let density = 0.25 + treble * 0.55 + energy * 0.20 + unit(bands[5]) * 0.15;
-        let wind = t * (2.0 + unit(audio.mid) * 5.0);
-        for i in 0..420u32 {
+        let gust = unit(audio.onset) * 0.7 + unit(audio.kick) * 0.3;
+        let slant = 0.28 + mid * 0.42 + gust * 0.16;
+        let density = (0.50 + treble * 0.30 + energy * 0.08 + unit(bands[5]) * 0.10).min(1.0);
+        let wind = t * (1.6 + mid * 4.0) + gust * fw * 0.07;
+        for i in 0..520u32 {
             if hash01(i * 7 + 1) > density {
                 continue;
             }
-            let speed = 0.35 + hash01(i * 7 + 3) * 0.5 + unit(audio.bass) * 0.4;
+            let speed = 0.40 + hash01(i * 7 + 3) * 0.55 + bass * 0.35 + unit(audio.kick) * 0.20;
             let len = 1.5 + hash01(i * 7 + 4) * 3.0;
             let y = ((hash01(i * 7 + 5) * (fh + 16.0) + t * speed * fh * 0.55)
                 .rem_euclid(fh + 16.0))
                 - 8.0;
             let x = (hash01(i * 7 + 2) * fw + y * slant + wind).rem_euclid(fw);
-            let level = 0.20 + treble * 0.40 + hash01(i * 7 + 6) * 0.12;
+            let level = 0.20 + treble * 0.35 + hash01(i * 7 + 6) * 0.12;
             self.canvas
                 .stroke([x, y], [x + slant * len, y + len], level);
             self.canvas.dot(x, y, '·', level + 0.15);
@@ -368,14 +385,18 @@ impl Renderer {
         let mist = (h / 4).max(1);
         for j in 0..mist {
             for i in 0..w {
-                let n = noise2(i as f32 * 0.10 + t * 0.04, j as f32 * 0.16);
-                if n > 0.60 {
-                    let level = (n - 0.60) * 0.35 + 0.03 + treble * 0.03;
+                let n = noise2(
+                    i as f32 * 0.10 + t * (0.04 + mid * 0.10) + gust * 3.0,
+                    j as f32 * 0.16,
+                );
+                if n > 0.58 {
+                    let level = (n - 0.58) * 0.35 + 0.03 + treble * 0.03;
                     self.canvas.plot(i as i32, j as i32, '░', level);
                 }
             }
         }
-        for k in 0..14u32 {
+        let splashes = 10 + (unit(audio.kick) * 20.0) as u32;
+        for k in 0..splashes {
             let x = hash01(k * 13 + 3) * fw;
             let pulse = 0.5 + 0.5 * (t * 2.2 + hash01(k * 13 + 4) * TAU).sin();
             let level = (0.15 + unit(audio.kick) * 0.50) * pulse;
@@ -388,56 +409,80 @@ impl Renderer {
     }
 
     /// A cloud deck split by a recursive fork of lightning.
+    ///
+    /// A transient arms a new bolt; the same bolt keeps drawing while its
+    /// afterglow decays, so the fork outlives the attack that caused it.
     fn draw_lightning(
         &mut self,
         w: usize,
         h: usize,
         t: f32,
+        dt: f32,
         bands: &[f32; 32],
         audio: &Reactivity,
     ) {
         let fw = w as f32;
         let fh = h as f32;
         let energy = unit(audio.energy);
-        let flash = unit(audio.transients[0])
+        let treble = unit(audio.treble);
+        let strike = unit(audio.transients[0])
             .max(unit(audio.transients[2]))
-            .max(energy * 0.35);
+            .max(unit(audio.onset) * 0.9);
+        self.bolt_age += dt;
+        if strike > 0.35 && (self.bolt_strength <= 0.0 || self.bolt_age > 0.12) {
+            self.bolt_seed = ((t.max(0.0) * 977.0) as u32) ^ ((strike * 1024.0) as u32);
+            self.bolt_strength = strike;
+            self.bolt_age = 0.0;
+        }
+        self.flash = (self.flash * (-dt * 4.5).exp()).max(strike);
+        let glow = self.flash;
+        let afterglow = (1.0 - self.bolt_age / 0.65).clamp(0.0, 1.0) * self.bolt_strength;
+        let hot = glow.max(afterglow);
+
         for j in 0..h {
             for i in 0..w {
                 let n = noise2(i as f32 * 0.075 + t * 0.03, j as f32 * 0.11 - t * 0.012);
-                let level = (n - 0.56).max(0.0) * 0.55 * (0.45 + energy) + flash * 0.04;
+                let level = (n - 0.54).max(0.0) * 0.60 * (0.45 + energy) + glow * 0.05;
                 if level > 0.02 {
-                    let mark = if n > 0.76 { '▒' } else { '░' };
+                    let mark = if n > 0.74 { '▒' } else { '░' };
                     self.canvas.plot(i as i32, j as i32, mark, level);
                 }
             }
         }
-        let seed = (t * 0.8).floor() as u32;
-        let branch_skip =
-            (0.38 - unit(audio.onset) * 0.20 - unit(audio.treble) * 0.06).clamp(0.04, 0.50);
-        let bright = 0.35 + flash * 0.60;
-        for bolt in build_bolt(seed, fw, fh, branch_skip) {
-            self.canvas
-                .stroke(bolt.a, bolt.b, bright - bolt.depth as f32 * 0.03);
-            self.canvas
-                .dot(bolt.b[0] + 1.0, bolt.b[1], '·', bright * 0.28);
-            self.canvas
-                .dot(bolt.b[0] - 1.0, bolt.b[1], '·', bright * 0.28);
-        }
-        if energy > 0.45 {
-            for bolt in build_bolt(seed ^ 0xA5A5, fw, fh, branch_skip + 0.05) {
-                self.canvas.stroke(
-                    bolt.a,
-                    bolt.b,
-                    0.25 + flash * 0.45 - bolt.depth as f32 * 0.02,
-                );
+
+        if self.bolt_strength > 0.0 && hot > 0.02 {
+            let branch_skip = (0.36 - self.bolt_strength * 0.24 - treble * 0.06).clamp(0.03, 0.50);
+            let bright = 0.18 + hot * 0.72;
+            for bolt in build_bolt(self.bolt_seed, fw, fh, branch_skip) {
+                let level = (bright - bolt.depth as f32 * 0.035).max(0.0);
+                self.canvas.stroke(bolt.a, bolt.b, level);
+                if hot > 0.35 {
+                    self.canvas.stroke(
+                        [bolt.a[0] + 0.8, bolt.a[1]],
+                        [bolt.b[0] + 0.8, bolt.b[1]],
+                        level * 0.4,
+                    );
+                }
+                self.canvas
+                    .dot(bolt.b[0] + 1.0, bolt.b[1], '·', level * 0.35);
+                self.canvas
+                    .dot(bolt.b[0] - 1.0, bolt.b[1], '·', level * 0.35);
+            }
+            if energy > 0.45 {
+                for bolt in build_bolt(self.bolt_seed ^ 0xA5A5, fw, fh, branch_skip + 0.05) {
+                    self.canvas.stroke(
+                        bolt.a,
+                        bolt.b,
+                        (0.20 + hot * 0.40 - bolt.depth as f32 * 0.02).max(0.0),
+                    );
+                }
             }
         }
         let band = unit(bands[3]);
         if band > 0.3 {
             for k in 0..20 {
-                let x = hash01(seed + k * 11) * fw;
-                let y = hash01(seed + k * 11 + 7) * fh;
+                let x = hash01(self.bolt_seed + k * 11) * fw;
+                let y = hash01(self.bolt_seed + k * 11 + 7) * fh;
                 self.canvas.dot(x, y, '·', band * 0.25);
             }
         }
@@ -487,24 +532,35 @@ impl Renderer {
     }
 
     /// Layered fog banks drifting sideways with a fine internal texture.
+    ///
+    /// Bass drives the bank advection, mid rolls the billows, treble adds
+    /// wisps, and an onset gust slides the whole bank field across the frame.
     fn draw_fog(&mut self, w: usize, h: usize, t: f32, audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let flatness = unit(audio.flatness);
         let bass = unit(audio.bass);
+        let mid = unit(audio.mid);
         let treble = unit(audio.treble);
+        let gust = unit(audio.onset) * 0.28 + unit(audio.kick) * 0.10;
+        let advect = t * (0.05 + bass * 0.55 + mid * 0.20) + gust;
         for j in 0..h {
             let v = j as f32 / fh;
             for i in 0..w {
                 let u = i as f32 / fw;
-                let warp = (u * 5.0 + t * 0.06).sin() * 0.12 + (v * 3.0 + t * 0.04).cos() * 0.08;
+                let warp =
+                    (u * 4.5 + advect * 1.6).sin() * 0.14 + (v * 3.2 - advect * 0.7).cos() * 0.10;
                 let band =
-                    (v * 7.0 - t * 0.09 + warp * 4.0 + (u * 2.5 + t * 0.03).sin() * 0.9).sin();
-                let fine = noise2(u * 14.0 + t * 0.05, v * 10.0 - t * 0.03);
-                let density =
-                    0.52 + band * 0.26 + (fine - 0.5) * 0.55 + flatness * 0.18 + bass * 0.05
-                        - (v - 0.5).abs() * 0.22;
-                let mut level = (density - 0.47).max(0.0);
+                    (v * 6.5 - advect * 2.4 + warp * 4.0 + (u * 2.5 + advect * 0.9).sin() * 0.9)
+                        .sin();
+                let fine = noise2(u * 14.0 + advect * 4.5, v * 10.0 - t * 0.03 + gust);
+                let density = 0.52
+                    + band * (0.24 + mid * 0.08)
+                    + (fine - 0.5) * 0.55
+                    + flatness * 0.16
+                    + mid * 0.10
+                    - (v - 0.5).abs() * 0.20;
+                let mut level = (density - 0.46).max(0.0);
                 if level > 0.01 {
                     let mut mark = if level > 0.30 {
                         '▒'
@@ -513,7 +569,7 @@ impl Renderer {
                     } else {
                         '·'
                     };
-                    if treble > 0.30 && hash2(i as i32, j as i32) < treble * 0.12 {
+                    if treble > 0.25 && hash2(i as i32, j as i32) < treble * 0.14 {
                         mark = '≈';
                         level += 0.10;
                     }
@@ -524,16 +580,20 @@ impl Renderer {
     }
 
     /// Three layers of drifting flakes over an accumulating ground drift.
+    ///
+    /// Treble thickens the fall, bass and kick drive it down, mid lengthens
+    /// the sway, and an onset gust shoves every layer sideways at once.
     fn draw_snow(&mut self, w: usize, h: usize, t: f32, audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let bass = unit(audio.bass);
         let mid = unit(audio.mid);
         let treble = unit(audio.treble);
-        let density = 0.48 + treble * 0.45;
+        let gust = unit(audio.onset) * fw * 0.06 + unit(audio.kick) * fw * 0.02;
+        let density = (0.52 + treble * 0.32 + unit(audio.energy) * 0.06).min(1.0);
         let glyphs = ['❄', '✻', '·'];
         for layer in 0..3usize {
-            let count = [130usize, 170, 210][layer];
+            let count = [190usize, 250, 310][layer];
             let level = 0.48 - layer as f32 * 0.13;
             for i in 0..count {
                 let seed = layer as u32 * 1000 + i as u32 * 5;
@@ -542,20 +602,22 @@ impl Renderer {
                 }
                 let bx = hash01(seed + 2);
                 let by = hash01(seed + 3);
-                let fall =
-                    (0.06 + hash01(seed + 4) * 0.05) * (1.0 + layer as f32 * 0.5) + bass * 0.03;
+                let fall = (0.06 + hash01(seed + 4) * 0.05) * (1.0 + layer as f32 * 0.5)
+                    + bass * 0.10
+                    + unit(audio.kick) * 0.05;
                 let phase = hash01(seed + 5) * TAU;
-                let y = (by * fh + t * fall * fh * 1.5).rem_euclid(fh);
+                let y = (by * fh + t * fall * fh * 1.5 + gust * 0.25).rem_euclid(fh);
                 let sway = (t * (0.7 + hash01(seed + 6) * 1.2) + phase).sin()
-                    * (1.0 + mid * 4.0)
+                    * (1.0 + mid * 6.0)
                     * (0.6 + layer as f32 * 0.7);
-                let x = (bx * fw + sway + t * (1.0 + mid * 3.0)).rem_euclid(fw);
+                let x = (bx * fw + sway + t * (1.0 + mid * 3.0) + gust).rem_euclid(fw);
                 self.canvas.dot(x, y, glyphs[layer], level + treble * 0.12);
             }
         }
         for x in 0..w as i32 {
-            let height = 1 + (noise2(x as f32 * 0.12 + t * 0.02, 3.7) * 2.0 + bass * 2.0) as i32;
-            for k in 0..height.clamp(0, 4) {
+            let height = 1
+                + (noise2(x as f32 * 0.12 + t * 0.02 + gust * 0.05, 3.7) * 2.0 + bass * 3.0) as i32;
+            for k in 0..height.clamp(0, 5) {
                 self.canvas
                     .plot(x, h as i32 - 1 - k, '░', 0.12 + treble * 0.08);
             }
@@ -609,40 +671,51 @@ impl Renderer {
     }
 
     /// Fast round hailstones, bouncing impacts, and a low accumulation ridge.
+    ///
+    /// Treble raises the stone count, bass and kick speed the fall, mid and
+    /// onset throw the whole shower sideways, and kicks fire impact rings.
     fn draw_hail(&mut self, w: usize, h: usize, t: f32, audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let bass = unit(audio.bass);
+        let mid = unit(audio.mid);
         let treble = unit(audio.treble);
-        let density = 0.20 + treble * 0.35;
-        let wind = t * (1.5 + unit(audio.mid) * 5.0);
-        for i in 0..200u32 {
+        let kick = unit(audio.kick);
+        let gust = unit(audio.onset) * fw * 0.06 + kick * fw * 0.02;
+        let density = (0.48 + treble * 0.32 + unit(audio.energy) * 0.06).min(1.0);
+        let wind = t * (1.2 + mid * 4.0) + gust;
+        for i in 0..320u32 {
             if hash01(i * 9 + 1) > density {
                 continue;
             }
             let x0 = hash01(i * 9 + 2) * fw;
-            let speed = (0.8 + bass * 0.4) * (0.7 + hash01(i * 9 + 3) * 0.6);
+            let speed = (0.8 + bass * 0.5 + kick * 0.35) * (0.7 + hash01(i * 9 + 3) * 0.6);
             let y = ((hash01(i * 9 + 4) * (fh + 10.0) + t * speed * fh * 0.8)
                 .rem_euclid(fh + 10.0))
                 - 5.0;
-            let x = (x0 + y * 0.16 + wind).rem_euclid(fw);
+            let x = (x0 + y * (0.16 + gust * 0.01) + wind).rem_euclid(fw);
             let len = 1.5 + hash01(i * 9 + 5) * 2.0;
             self.canvas
                 .stroke([x - 0.6 * len, y - len], [x, y], 0.20 + treble * 0.25);
-            self.canvas
-                .dot(x, y, if bass > 0.5 { '◉' } else { '●' }, 0.55 + bass * 0.25);
+            let stone = if bass > 0.55 || kick > 0.60 {
+                '◉'
+            } else {
+                '●'
+            };
+            self.canvas.dot(x, y, stone, 0.55 + bass * 0.25);
         }
-        for k in 0..12u32 {
+        let impacts = 10 + (kick * 22.0) as u32;
+        for k in 0..impacts {
             let phase = (t * (0.7 + hash01(k * 17 + 1) * 0.7) + hash01(k * 17 + 2)).rem_euclid(1.0);
-            let x = hash01(k * 17 + 3) * fw + phase * 10.0;
-            let height = (2.0 + unit(audio.kick) * 5.0) * (phase * PI).sin();
+            let x = (hash01(k * 17 + 3) * fw + phase * 10.0 + gust).rem_euclid(fw);
+            let height = (2.0 + kick * 5.0) * (phase * PI).sin();
             let y = fh - 1.0 - height;
-            self.canvas.dot(x, y, '○', 0.45 + unit(audio.kick) * 0.40);
+            self.canvas.dot(x, y, '○', 0.45 + kick * 0.40);
         }
         for x in 0..w as i32 {
-            let n = noise2(x as f32 * 0.16 + t * 0.03, 1.3);
-            let height = 1 + (n * 2.0 + bass * 2.0) as i32;
-            for k in 0..height.clamp(0, 4) {
+            let n = noise2(x as f32 * 0.16 + t * 0.03 + gust * 0.04, 1.3);
+            let height = 1 + (n * 2.0 + bass * 3.0) as i32;
+            for k in 0..height.clamp(0, 5) {
                 self.canvas
                     .plot(x, h as i32 - 1 - k, '░', 0.14 + bass * 0.14);
             }
@@ -1006,6 +1079,191 @@ mod tests {
         }
     }
 
+    fn symbols_for(mode: usize, audio: &Reactivity, frames: usize) -> Vec<char> {
+        snapshot_for(mode, audio, &[0.0; 32], frames)
+            .into_iter()
+            .map(|(symbol, _, _)| symbol.chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn ink(symbols: &[char]) -> usize {
+        symbols.iter().filter(|symbol| **symbol != ' ').count()
+    }
+
+    fn bolt_cells(buf: &Buffer) -> usize {
+        buf.content
+            .iter()
+            .filter(|cell| "─│╲╱".contains(cell.symbol()))
+            .count()
+    }
+
+    #[test]
+    fn named_scenes_paint_enough_ink() {
+        let quiet = Reactivity::default();
+        let cells = 96 * 36;
+        for (mode, floor) in [
+            (0, cells / 8),
+            (1, cells / 12),
+            (3, cells / 3),
+            (4, cells / 8),
+            (6, cells / 8),
+        ] {
+            let painted = ink(&symbols_for(mode, &quiet, 90));
+            assert!(
+                painted > floor,
+                "{} painted only {painted} cells",
+                NAMES[mode]
+            );
+        }
+    }
+
+    #[test]
+    fn precipitation_answers_bands_with_shape_and_gusts() {
+        let quiet = Reactivity::default();
+        let dense = Reactivity {
+            treble: 1.0,
+            ..Reactivity::default()
+        };
+        let fast = Reactivity {
+            bass: 0.95,
+            ..Reactivity::default()
+        };
+        let gust = Reactivity {
+            onset: 0.95,
+            ..Reactivity::default()
+        };
+        for (mode, name) in [
+            (0, "Rain Curtain"),
+            (4, "Blizzard Veil"),
+            (6, "Hail Shower"),
+        ] {
+            let base = symbols_for(mode, &quiet, 90);
+            let dense_symbols = symbols_for(mode, &dense, 90);
+            assert!(
+                ink(&dense_symbols) > ink(&base) + ink(&base) / 10,
+                "{name} should thicken on treble"
+            );
+            assert_ne!(
+                base,
+                symbols_for(mode, &fast, 90),
+                "{name} should change shape with fall speed"
+            );
+            assert_ne!(
+                base,
+                symbols_for(mode, &gust, 90),
+                "{name} should shift the whole field on a gust"
+            );
+        }
+    }
+
+    #[test]
+    fn fog_advects_with_bands_and_gusts() {
+        let quiet = Reactivity::default();
+        let base = symbols_for(3, &quiet, 90);
+        assert!(
+            ink(&base) > 96 * 36 / 3,
+            "Fog Bank should read as a bank, painted {}",
+            ink(&base)
+        );
+        for (input, audio) in [
+            (
+                "bass",
+                Reactivity {
+                    bass: 0.95,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "mid",
+                Reactivity {
+                    mid: 0.95,
+                    ..Reactivity::default()
+                },
+            ),
+            (
+                "gust",
+                Reactivity {
+                    onset: 0.95,
+                    ..Reactivity::default()
+                },
+            ),
+        ] {
+            assert_ne!(base, symbols_for(3, &audio, 90), "Fog Bank ignores {input}");
+        }
+        let glyphs: std::collections::HashSet<char> = base
+            .iter()
+            .copied()
+            .filter(|symbol| *symbol != ' ')
+            .collect();
+        assert!(glyphs.len() >= 3, "Fog Bank has no internal structure");
+    }
+
+    #[test]
+    fn lightning_forks_from_transients_and_keeps_an_afterglow() {
+        let area = Rect::new(0, 0, 96, 36);
+        let mut buf = Buffer::empty(area);
+        let mut renderer = Renderer::default();
+        let quiet = Reactivity::default();
+        let strike = Reactivity {
+            energy: 0.7,
+            treble: 0.6,
+            onset: 1.0,
+            transients: [1.0, 0.0, 0.2, 0.0],
+            ..Reactivity::default()
+        };
+        let draw = |renderer: &mut Renderer, buf: &mut Buffer, time: f32, audio: &Reactivity| {
+            renderer.draw(buf, area, time, 1, 0, &[0.0; 32], audio, &Theme::default());
+        };
+        draw(&mut renderer, &mut buf, 0.0, &strike);
+        let hit = bolt_cells(&buf);
+        assert!(hit > 80, "a strike should fork widely, painted {hit}");
+        let flash = renderer.flash;
+        assert!(flash > 0.9);
+        draw(&mut renderer, &mut buf, 0.03, &quiet);
+        assert!(bolt_cells(&buf) > 0, "the fork should leave an afterglow");
+        assert!(renderer.flash < flash, "the strike light should decay");
+        for frame in 0..90 {
+            draw(&mut renderer, &mut buf, 0.03 + frame as f32 / 60.0, &quiet);
+        }
+        assert_eq!(bolt_cells(&buf), 0, "the afterglow should fade out");
+    }
+
+    #[test]
+    fn named_scenes_are_deterministic_and_bounded() {
+        let audio = Reactivity {
+            energy: 0.8,
+            bass: 0.7,
+            mid: 0.6,
+            treble: 0.7,
+            onset: 0.3,
+            kick: 0.5,
+            transients: [0.4, 0.2, 0.3, 0.1],
+            ..Reactivity::default()
+        };
+        let wild = Reactivity {
+            energy: f32::INFINITY,
+            bass: f32::NAN,
+            mid: -3.0,
+            treble: 2.0,
+            onset: f32::NAN,
+            transients: [f32::INFINITY; 4],
+            ..Reactivity::default()
+        };
+        for mode in [0, 1, 3, 4, 6] {
+            let first = snapshot_for(mode, &audio, &[0.5; 32], 60);
+            let second = snapshot_for(mode, &audio, &[0.5; 32], 60);
+            assert_eq!(first, second, "{} should be deterministic", NAMES[mode]);
+            assert_eq!(first.len(), 96 * 36);
+            let wild_symbols = symbols_for(mode, &wild, 20);
+            assert_eq!(wild_symbols.len(), 96 * 36);
+            assert!(
+                ink(&wild_symbols) < 96 * 36,
+                "{} filled every cell with bad input",
+                NAMES[mode]
+            );
+        }
+    }
+
     #[test]
     #[ignore = "manual visual preview"]
     fn preview() {
@@ -1024,6 +1282,7 @@ mod tests {
             beat_phase: 0.4,
             centroid: 0.6,
             flatness: 0.4,
+            transients: [0.8, 0.2, 0.4, 0.1],
             ..Reactivity::default()
         };
         for (mode, _) in NAMES.iter().enumerate() {
