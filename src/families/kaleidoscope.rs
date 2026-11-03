@@ -656,6 +656,7 @@ mod tests {
             chroma: [1.0; 12],
             centroid: 0.8,
             flatness: 0.6,
+            ..Reactivity::default()
         }
     }
 

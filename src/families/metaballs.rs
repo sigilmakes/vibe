@@ -715,6 +715,7 @@ mod tests {
             waveform: [0.8; 32],
             transients: [1.0; 4],
             chroma: [1.0; 12],
+            ..Reactivity::default()
         }
     }
 

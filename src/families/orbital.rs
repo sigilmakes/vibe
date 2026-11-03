@@ -615,9 +615,15 @@ impl Renderer {
                     let radial = (inner / (r + 0.02)).powf(0.95);
                     let doppler = 0.62 + 0.38 * (phi + t * 0.35).sin();
                     let grain = 0.55 + 0.45 * hash(i as i32 * 5 + 2, j as i32 * 3 + 7);
-                    let e =
-                        2.2 * radial * (0.34 + 0.66 * arm) * doppler * grain * (0.70 + 0.45 * mid);
-                    if e > 0.045 {
+                    let fade = (-r * 0.45).exp();
+                    let e = 3.0
+                        * radial
+                        * (0.34 + 0.66 * arm)
+                        * doppler
+                        * grain
+                        * (0.70 + 0.45 * mid)
+                        * fade;
+                    if e > 0.06 {
                         mark = if e > 0.78 {
                             '█'
                         } else if e > 0.52 {
@@ -680,9 +686,9 @@ impl Renderer {
         sprinkle_stars(buf, visible, palette, theme, t, 0.8);
         let energy = unit(audio.energy);
         let bass = unit(audio.bass);
-        let star = [0.70_f32, 0.10];
-        let a = 1.05_f32;
-        let e = 0.55_f32;
+        let star = [0.45_f32, 0.10];
+        let a = 1.00_f32;
+        let e = 0.45_f32;
         let b = a * (1.0 - e * e).sqrt();
         let rot = 0.15_f32;
         let cr = rot.cos();
@@ -751,11 +757,26 @@ impl Renderer {
             }
         }
         let burst = unit(audio.onset) + unit(audio.kick);
-        c.circle(head, 0.10 + burst * 0.05, '·', 0.36, 0.32 + burst * 0.3);
-        c.circle(head, 0.055, '∘', 0.40, 0.55);
+        c.circle(head, 0.13 + burst * 0.05, '·', 0.36, 0.26 + burst * 0.3);
+        c.circle(head, 0.065, '∘', 0.40, 0.55);
         c.plot(head, '●', 0.55, 0.96);
-        c.plot(star, '✦', 0.12, 0.85);
-        c.circle(star, 0.035, '·', 0.14, 0.45);
+        c.plot(star, '✦', 0.12, 0.95);
+        c.circle(star, 0.045, '·', 0.14, 0.60);
+        c.circle(star, 0.085, '·', 0.14, 0.32);
+        let treble = unit(audio.treble);
+        for k in 0..8 {
+            let a = k as f32 / 8.0 * TAU + t * 0.06;
+            c.line(
+                [star[0] + a.cos() * 0.04, star[1] + a.sin() * 0.04],
+                [
+                    star[0] + a.cos() * (0.10 + treble * 0.05),
+                    star[1] + a.sin() * (0.10 + treble * 0.05),
+                ],
+                '·',
+                0.14,
+                0.42,
+            );
+        }
     }
 
     fn assist(
@@ -1349,48 +1370,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    #[ignore = "manual snapshot dump"]
-    fn dump_snapshots() {
-        let audio = Reactivity {
-            energy: 0.5,
-            bass: 0.6,
-            mid: 0.4,
-            treble: 0.3,
-            kick: 0.8,
-            onset: 0.6,
-            beat: 0.5,
-            beat_phase: 0.25,
-            chroma: [0.6; 12],
-            ..Reactivity::default()
-        };
-        for style in 0..NAMES.len() {
-            let area = Rect::new(0, 0, 100, 36);
-            let mut buf = Buffer::empty(area);
-            let mut r = Renderer::default();
-            for f in 0..240 {
-                r.draw(
-                    &mut buf,
-                    area,
-                    f as f32 / 60.0,
-                    style,
-                    0,
-                    &[0.4; 32],
-                    &audio,
-                    &Theme::default(),
-                );
-            }
-            let mut out = String::new();
-            for y in 0..36 {
-                for x in 0..100 {
-                    out.push_str(buf[(x, y)].symbol());
-                }
-                out.push('\n');
-            }
-            std::fs::write(format!("/tmp/orbital_{style}.txt"), out).unwrap();
         }
     }
 

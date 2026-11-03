@@ -438,7 +438,7 @@ impl Renderer {
                         let ring = (m / step).floor() as i32 % 2 == 0;
                         let radius = 0.42 + 0.12 * bass + 0.04 * kick;
                         let inside = m < radius;
-                        let zig = ((gx as f32 / 4.0 + band * 0.5).fract() - 0.5).abs();
+                        let zig = ((gx / 4.0 + band * 0.5).fract() - 0.5).abs();
                         let teeth = !inside && fh > 0.62 + zig * 0.5;
                         let hue = if inside {
                             chroma * 0.4 + 0.55
@@ -625,6 +625,7 @@ mod tests {
             chroma: std::array::from_fn(|i| (i % 3) as f32 / 2.0),
             centroid: 0.8,
             flatness: 0.7,
+            ..Reactivity::default()
         }
     }
 
@@ -710,27 +711,6 @@ mod tests {
             let first = symbols(&render(style, &loud(), 24));
             let second = symbols(&render(style, &loud(), 24));
             assert_eq!(first, second, "style {style} was not deterministic");
-        }
-    }
-
-    #[test]
-    #[ignore = "manual scene preview"]
-    fn preview() {
-        for (style, name) in NAMES.iter().enumerate() {
-            let buf = render(style, &loud(), 90);
-            println!("=== {style} {name} ===");
-            for y in 0..AREA.height {
-                let row: String = (0..AREA.width)
-                    .map(|x| {
-                        buf[(AREA.x + x, AREA.y + y)]
-                            .symbol()
-                            .chars()
-                            .next()
-                            .unwrap_or(' ')
-                    })
-                    .collect();
-                println!("{row}");
-            }
         }
     }
 

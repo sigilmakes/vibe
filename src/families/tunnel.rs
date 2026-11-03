@@ -551,6 +551,7 @@ mod tests {
             chroma: std::array::from_fn(|i| (i % 3) as f32 / 2.0),
             centroid: 0.8,
             flatness: 0.7,
+            ..Reactivity::default()
         }
     }
 
