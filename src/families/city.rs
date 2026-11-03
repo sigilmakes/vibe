@@ -28,6 +28,15 @@ fn unit(v: f32) -> f32 {
     }
 }
 
+/// The strongest attack in the current frame. Scenes that should jolt on a hit
+/// read this instead of sustained loudness.
+fn hit(audio: &Reactivity) -> f32 {
+    audio
+        .transients
+        .iter()
+        .fold(0.0, |strongest, value| strongest.max(unit(*value)))
+}
+
 fn hash01(x: u32) -> f32 {
     let mut n = x.wrapping_mul(0x9E37_79B1) ^ 0x85EB_CA6B;
     n ^= n >> 15;
@@ -255,9 +264,40 @@ pub struct Renderer {
     skyline: Vec<Building>,
     metro: Vec<MetroLine>,
     last_time: Option<f32>,
+    /// How far the city's traffic has travelled, in [0, 1024). The rate follows
+    /// tempo, energy, and bass, so the roads speed up with the music instead of
+    /// a wall clock setting the pace.
+    travel: f32,
+    /// Completed beat count, used where a scene should step once per beat.
+    beat: u32,
+    last_beat_phase: f32,
 }
 
 impl Renderer {
+    fn advance_clock(&mut self, dt: f32, audio: &Reactivity) {
+        let rate = 0.16
+            + unit(audio.energy) * 0.85
+            + unit(audio.bass) * 0.35
+            + unit(audio.tempo_confidence) * 0.30;
+        self.travel = (self.travel + dt * rate).rem_euclid(1024.0);
+        let phase = unit(audio.locked_beat_phase());
+        if phase + 0.5 < self.last_beat_phase {
+            self.beat = self.beat.wrapping_add(1);
+        }
+        self.last_beat_phase = phase;
+    }
+
+    /// A beat-locked sweep position in [0, 1) after `beats` beats. It holds
+    /// still while the tempo is unknown rather than drifting on wall time.
+    fn sweep(&self, audio: &Reactivity, beats: f32) -> f32 {
+        ((self.beat as f32 + unit(audio.locked_beat_phase())) / beats.max(0.25)).rem_euclid(1.0)
+    }
+
+    /// A slowly advancing index for hash-driven window occupancy, derived from
+    /// the audio-driven travel clock so lit windows change with the music.
+    fn tick(&self) -> i32 {
+        (self.travel * 3.0).rem_euclid(4096.0) as i32
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -276,7 +316,11 @@ impl Renderer {
         } else {
             self.last_time.unwrap_or(0.0)
         };
+        let dt = self
+            .last_time
+            .map_or(1.0 / 60.0, |last| (now - last).clamp(0.0, 0.08));
         self.last_time = Some(now);
+        self.advance_clock(dt, audio);
         let visible = area.intersection(buf.area);
         if visible.is_empty() {
             return;
@@ -369,8 +413,13 @@ impl Renderer {
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
+        let kick = unit(audio.kick);
         self.night_sky(w, h, 0.80, t, treble);
-        let bucket = (t * 1.5) as i32;
+        let tick = self.tick();
+        // A wave of windows sweeps the skyline once every four beats: windows the
+        // crest has passed stay lit, and the crest itself is the brightest band.
+        let front = self.sweep(audio, 4.0) * 1.35;
+        let crest_width = 0.10 + bass * 0.04;
         for building in &self.skyline {
             let x0 = (building.x * fw).round() as i32;
             let x1 = ((building.x + building.w) * fw).round() as i32;
@@ -389,12 +438,28 @@ impl Renderer {
             for x in x0..=x1 {
                 self.canvas.plot(x, y0, '─', base + 0.10);
             }
+            let roof_reach = (x0 + x1) as f32 * 0.5 / fw;
+            if front > roof_reach && front - roof_reach < 0.09 {
+                for x in x0..=x1 {
+                    self.canvas.plot(x, y0, '─', base + 0.16 + kick * 0.10);
+                }
+            }
             for y in (y0 + 2..h as i32).step_by(3) {
                 for x in (x0 + 1..x1).step_by(3) {
                     let band = unit(bands[(x + y).rem_euclid(32) as usize]);
-                    let threshold = 0.10 + bass * 0.22 + band * 0.16;
-                    if hash2(x + bucket, y) < threshold {
-                        let level = base + 0.12 + band * 0.04;
+                    let reach = x as f32 / fw + y as f32 / fh * 0.35;
+                    let crest = (reach - front).abs() < crest_width + band * 0.04;
+                    let swept = reach < front;
+                    let lit = crest || swept || hash2(x + tick, y) < 0.07 + bass * 0.15;
+                    if lit {
+                        let level = base
+                            + if crest {
+                                0.18 + kick * 0.12
+                            } else if swept {
+                                0.10 + band * 0.04
+                            } else {
+                                0.04
+                            };
                         self.canvas.plot(x, y, '▪', level);
                     }
                 }
@@ -404,7 +469,10 @@ impl Renderer {
                 for d in 1..=3 {
                     self.canvas.plot(ax, y0 - d, '│', base + 0.14);
                 }
-                let blink = 0.5 + 0.5 * (t * 2.0 + building.seed as f32).sin();
+                let blink = 0.5
+                    + 0.5
+                        * (unit(audio.locked_beat_phase()) * TAU + building.seed as f32 * 0.7)
+                            .sin();
                 self.canvas
                     .plot(ax, y0 - 4, '·', base + 0.12 + blink * 0.06);
             }
@@ -423,10 +491,15 @@ impl Renderer {
                 );
             }
         }
-        let wave = ((unit(audio.kick) * 0.9 + t * 0.35) % 1.0) * fh;
-        for y in (wave as i32 - 1)..=(wave as i32 + 1) {
-            for x in 0..w as i32 {
-                self.canvas.plot(x, y, '─', 0.18 + unit(audio.kick) * 0.25);
+        // A scan line follows the same beat-locked sweep, so the facade answers
+        // the beat instead of drifting on a wall clock. Without a tempo there is
+        // no sweep to follow, so it is not drawn.
+        if audio.tempo_confidence >= 0.25 {
+            let scan = (front / 1.35 * fh) as i32;
+            for y in (scan - 1)..=(scan + 1) {
+                for x in 0..w as i32 {
+                    self.canvas.plot(x, y, '─', 0.14 + kick * 0.22);
+                }
             }
         }
     }
@@ -484,9 +557,17 @@ impl Renderer {
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
+        let flare = hit(audio).max(unit(audio.kick) * 0.7);
         let horizon = (fh * 0.40).round() as i32;
-        let vp = fw * 0.5 + (t * 0.06).sin() * fw * 0.012;
-        let bucket = (t * 1.6) as i32;
+        // The camera drifts across the street on the beat and with the stereo
+        // image, so the canyon walls move instead of holding a fixed frame.
+        let vp =
+            fw * 0.5 + ((unit(audio.locked_beat_phase()) - 0.5) * 0.02 + audio.pan() * 0.012) * fw;
+        let tick = self.tick();
+        let travel = self.travel;
+        // Wall lights switch on as a wave of light travels from the far end of
+        // the street toward the camera, once every four beats.
+        let front = self.sweep(audio, 4.0);
         self.night_sky(w, h, 0.40, t, treble);
         for j in horizon..h as i32 {
             let d = (j - horizon) as f32 / (h as i32 - horizon).max(1) as f32;
@@ -504,22 +585,30 @@ impl Renderer {
                     let wy = ((j - horizon) as f32 / window_h).floor() as i32;
                     let fx = (dist / window_w).fract();
                     let fy = ((j - horizon) as f32 / window_h).fract();
-                    let lit = hash2(wx + side * 777 + bucket, wy)
-                        < 0.16 + bass * 0.26 + unit(bands[(wx as usize + wy as usize) % 32]) * 0.2;
+                    let band = unit(bands[(wx.max(0) as usize + wy.max(0) as usize) % 32]);
+                    let crest = (front - d).rem_euclid(1.0) < 0.12 + bass * 0.05;
+                    let lit = crest
+                        || hash2(wx + side * 777 + tick, wy) < 0.14 + bass * 0.22 + band * 0.18;
                     if lit && fx < 0.6 && fy < 0.55 {
-                        self.canvas
-                            .plot(i, j, '▪', 0.30 + bass * 0.34 + treble * 0.10);
+                        self.canvas.plot(
+                            i,
+                            j,
+                            '▪',
+                            0.28 + bass * 0.30
+                                + treble * 0.10
+                                + if crest { flare * 0.16 } else { 0.0 },
+                        );
                     } else {
                         self.canvas.plot(i, j, '▓', 0.10 + d * 0.02);
                     }
                 } else {
                     let lane = (x - vp) / half;
                     if lane.abs() < 0.025 {
-                        if ((j as f32 + t * 9.0) as i32 / 3) % 2 == 0 {
+                        if ((j as f32 + travel * 9.0) as i32 / 3) % 2 == 0 {
                             self.canvas.plot(i, j, '─', 0.32);
                         }
                     } else if (lane.abs() - 0.52).abs() < 0.018 {
-                        if ((j as f32 + t * 6.0) as i32 / 2) % 2 == 0 {
+                        if ((j as f32 + travel * 6.0) as i32 / 2) % 2 == 0 {
                             self.canvas.plot(i, j, '│', 0.22);
                         }
                     } else if (lane.abs() - 0.96).abs() < 0.02 {
@@ -561,9 +650,11 @@ impl Renderer {
                 }
             }
         }
+        // Headlights ride the audio-driven traffic clock: a faster or louder
+        // passage pulls the cars toward the camera more quickly.
         for k in 0..54u32 {
             let speed = 0.45 + hash01(k * 5 + 1) * 0.8 + energy * 0.6;
-            let p = (t * speed + hash01(k * 5 + 2)).fract();
+            let p = (travel * speed + hash01(k * 5 + 2)).fract();
             let d = p * p * p;
             let y = horizon as f32 + d * (h as i32 - horizon) as f32;
             let half = (0.025 + 0.46 * d) * fw;
@@ -571,6 +662,9 @@ impl Renderer {
             let x = vp + lane * half;
             self.canvas.dot(x, y, '●', 0.45 + d * 0.5);
             self.canvas.dot(x, y - 1.0, '·', 0.20 + d * 0.3);
+            if flare > 0.2 {
+                self.canvas.dot(x, y + 1.0, '·', flare * d * 0.45);
+            }
         }
         for step in 1..5 {
             let d = step as f32 / 5.0;
@@ -578,10 +672,24 @@ impl Renderer {
             let half = (0.025 + 0.46 * d) * fw;
             for side in [-1.0f32, 1.0] {
                 let x = vp + side * half * 0.9;
-                for d in 0..3 {
-                    self.canvas.dot(x, y - d as f32, '│', 0.20);
+                for dy in 0..3 {
+                    self.canvas.dot(x, y - dy as f32, '│', 0.20);
                 }
-                self.canvas.dot(x, y - 3.0, '·', 0.35 + treble * 0.25);
+                let head = if flare > 0.45 { '●' } else { '·' };
+                self.canvas
+                    .dot(x, y - 3.0, head, 0.32 + treble * 0.22 + flare * 0.40);
+                // The lamp's pool on the wet asphalt swells with each transient.
+                if flare > 0.05 {
+                    for k in -4..=4i32 {
+                        let dx = k as f32;
+                        let reach = dx.abs() / 4.0;
+                        if reach > flare {
+                            continue;
+                        }
+                        self.canvas
+                            .dot(x + dx, y - 2.0, '░', 0.08 + flare * 0.26 * (1.0 - reach));
+                    }
+                }
             }
         }
     }
@@ -659,6 +767,13 @@ impl Renderer {
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
         let bass = unit(audio.bass);
+        let kick = unit(audio.kick);
+        let strike = hit(audio);
+        // Cable vibration, water chop and traffic all read the audio clocks, so
+        // a hit visibly shakes the span instead of only recolouring it.
+        let vibration = kick * 1.6 + strike * 0.8;
+        let front = self.sweep(audio, 4.0);
+        let travel = self.travel;
         self.night_sky(w, h, 0.60, t, treble);
         let deck = fh * 0.58;
         let top = fh * 0.20;
@@ -669,7 +784,7 @@ impl Renderer {
         let sag = fh * 0.13;
         for j in (deck as i32 + 2)..h as i32 {
             for i in 0..w as i32 {
-                let wave = (i as f32 * 0.13 + j as f32 * 0.5 + t * 2.2).sin();
+                let wave = (i as f32 * 0.13 + j as f32 * 0.5 + travel * 1.6).sin();
                 if wave > 0.86 {
                     self.canvas
                         .plot(i, j, '≈', 0.05 + (wave - 0.86) * 0.25 + bass * 0.03);
@@ -694,15 +809,23 @@ impl Renderer {
                 self.canvas
                     .plot(x + dx, (top + fh * 0.12) as i32, '─', 0.48);
             }
-            let blink = 0.5 + 0.5 * (t * 2.4 + tx * 0.05).sin();
-            self.canvas.plot(x, top as i32 - 1, '·', 0.25 + blink * 0.4);
+            let blink = 0.5 + 0.5 * (unit(audio.locked_beat_phase()) * TAU + tx * 0.05).sin();
+            self.canvas
+                .plot(x, top as i32 - 1, '·', 0.24 + blink * 0.34 + strike * 0.35);
         }
+        // The main cable ripples along its length on each kick, and the hangers
+        // hang from wherever the cable has moved to.
         for x in t1 as i32..=t2 as i32 {
             let u = (x as f32 - mid) / half;
-            let y = top + sag * (1.0 - u * u);
+            let bend = (u * 3.0 - front * TAU).sin() * vibration * (1.0 - u * u);
+            let y = top + sag * (1.0 - u * u) + bend;
             let slope = -2.0 * sag * u / half;
-            self.canvas
-                .plot(x, y.round() as i32, line_glyph(1.0, slope), 0.65);
+            self.canvas.plot(
+                x,
+                y.round() as i32,
+                line_glyph(1.0, slope),
+                0.65 + kick * 0.2,
+            );
             if x % 6 == 0 {
                 for yy in (y.round() as i32)..deck as i32 {
                     self.canvas.plot(x, yy, '│', 0.12);
@@ -713,13 +836,24 @@ impl Renderer {
         self.canvas.stroke([t2, top], [fw - 1.0, deck], 0.30);
         for x in 0..w as i32 {
             self.canvas.plot(x, deck as i32, '─', 0.50);
-            if x % 5 == 0 {
-                self.canvas.plot(x, deck as i32 - 1, '·', 0.18);
-            }
+        }
+        // Deck lamps light in a string that runs across the span on the beat,
+        // and each lamp leaves a reflection in the water.
+        for x in (0..w as i32).step_by(5) {
+            let reach = (x as f32 / fw.max(1.0)).clamp(0.0, 1.0);
+            let behind = (front - reach).rem_euclid(1.0);
+            let (lamp, mark) = if behind < 0.12 {
+                (0.70 + kick * 0.25, '●')
+            } else {
+                (0.16 + treble * 0.10, '·')
+            };
+            self.canvas.plot(x, deck as i32 - 1, mark, lamp);
+            self.canvas
+                .plot(x, deck as i32 + 2, '·', lamp * 0.45 + bass * 0.05);
         }
         for k in 0..14u32 {
-            let speed = 0.12 + hash01(k * 11 + 1) * 0.16 + energy * 0.26;
-            let p = (t * speed + hash01(k * 11 + 2)).fract();
+            let speed = 0.5 + hash01(k * 11 + 1) * 0.7 + energy * 1.0;
+            let p = (travel * speed + hash01(k * 11 + 2)).fract();
             let x = p * fw;
             let lane = if k % 2 == 0 { deck - 1.0 } else { deck - 2.0 };
             self.canvas.dot(x, lane, '●', 0.72 + energy * 0.2);
@@ -728,7 +862,7 @@ impl Renderer {
         for x in (t1 as i32..=t2 as i32).step_by(6) {
             for k in 0..3 {
                 self.canvas
-                    .plot(x, deck as i32 + 2 + k * 2, '·', 0.07 + treble * 0.04);
+                    .plot(x, deck as i32 + 3 + k * 2, '·', 0.07 + treble * 0.04);
             }
         }
         let band = unit(bands[7]);
@@ -752,9 +886,14 @@ impl Renderer {
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
         let kick = unit(audio.kick);
+        let strike = hit(audio);
         let roof = fh * 0.55;
         self.night_sky(w, h, 0.55, t, treble);
-        let bucket = (t * 1.4) as i32;
+        let tick = self.tick();
+        // Gusts follow the stereo image and the beat, so the rain slants with the
+        // music instead of falling straight on a wall clock.
+        let wind = audio.pan() * 2.0 + (self.sweep(audio, 4.0) * TAU).sin() * 0.6;
+        let slant = if wind < 0.0 { -1.0 } else { 1.0 } * (1.0 + wind.abs().min(1.0));
         for building in &self.skyline {
             if building.layer < 2 {
                 continue;
@@ -773,26 +912,39 @@ impl Renderer {
             }
             for y in (y0 + 1..roof as i32).step_by(3) {
                 for x in (x0 + 1..x1).step_by(3) {
-                    if hash2(x + bucket, y) < 0.12 + bass * 0.20 {
+                    if hash2(x + tick, y) < 0.12 + bass * 0.20 {
                         self.canvas.plot(x, y, '▪', 0.22 + bass * 0.25);
                     }
                 }
             }
         }
+        // Rain thickens and falls faster on each transient, so a hit lands as a
+        // gust rather than a colour change.
         for i in 0..220u32 {
-            if hash01(i * 7 + 1) > 0.20 + treble * 0.35 {
+            if hash01(i * 7 + 1) > 0.20 + treble * 0.30 + strike * 0.35 {
                 continue;
             }
-            let x = (hash01(i * 7 + 2) * fw + t * 3.0).rem_euclid(fw);
-            let speed = 0.5 + hash01(i * 7 + 3) * 0.6;
+            let x = (hash01(i * 7 + 2) * fw + wind * 4.0).rem_euclid(fw);
+            let speed = 0.5 + hash01(i * 7 + 3) * 0.6 + strike * 0.8;
             let y = ((hash01(i * 7 + 4) * (fh + 12.0) + t * speed * fh * 0.5)
                 .rem_euclid(fh + 12.0))
                 - 6.0;
             if y >= roof - 1.0 {
                 continue;
             }
-            let level = 0.09 + treble * 0.15;
-            self.canvas.stroke([x, y], [x + 0.4, y + 2.0], level);
+            let level = 0.08 + treble * 0.10 + strike * 0.10;
+            self.canvas.stroke([x, y], [x + slant, y + 2.0], level);
+        }
+        // Splashes burst across the roof surface on each attack.
+        if strike > 0.2 {
+            for k in 0..14u32 {
+                let sx = (hash01(k * 23 + 7) * fw).round();
+                let sy = roof + (hash01(k * 23 + 9) * 3.0).floor();
+                for dx in -1..=1i32 {
+                    self.canvas
+                        .dot(sx + dx as f32, sy, '·', 0.12 + strike * 0.35);
+                }
+            }
         }
         for j in roof as i32..h as i32 {
             for i in 0..w as i32 {
@@ -806,7 +958,8 @@ impl Renderer {
             let cx = hash01(k * 19 + 1) * fw;
             let cy = roof + 2.0 + hash01(k * 19 + 2) * (fh - roof - 3.0);
             let band = unit(bands[(k as usize * 5) % 32]);
-            let ripple = 1.0 + (t * 2.0 + hash01(k * 19 + 3) * TAU).sin() * (0.4 + kick);
+            let ripple = 1.0
+                + (self.sweep(audio, 4.0) * TAU + hash01(k * 19 + 3) * TAU).sin() * (0.4 + kick);
             for dx in 0..12 {
                 let x = cx + (dx as f32 - 6.0) * ripple;
                 self.canvas
@@ -861,8 +1014,9 @@ impl Renderer {
             self.canvas.plot(ax + d, ay + 3, '─', 0.25);
             self.canvas.plot(ax + d, ay + 6, '─', 0.25);
         }
-        let blink = 0.5 + 0.5 * (t * 2.0).sin();
-        self.canvas.plot(ax, ay - 1, '·', 0.30 + blink * 0.4);
+        let blink = 0.5 + 0.5 * (unit(audio.locked_beat_phase()) * TAU).sin();
+        self.canvas
+            .plot(ax, ay - 1, '·', 0.28 + blink * 0.30 + strike * 0.30);
         let vent_x = (fw * 0.52) as i32;
         let vent_y = (fh * 0.66) as i32;
         for x in vent_x..(vent_x + 4) {
@@ -875,13 +1029,15 @@ impl Renderer {
 
 impl Renderer {
     /// Top-down city blocks with streets, rooftop details, and moving cars.
-    fn draw_aerial(&mut self, w: usize, h: usize, t: f32, bands: &[f32; 32], audio: &Reactivity) {
+    fn draw_aerial(&mut self, w: usize, h: usize, _t: f32, bands: &[f32; 32], audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
         let energy = unit(audio.energy);
         let kick = unit(audio.kick);
+        let strike = hit(audio);
+        let travel = self.travel;
         let sx = (w / 7).max(7) as i32;
         let sy = (h / 5).max(5) as i32;
         for j in 0..h as i32 {
@@ -890,10 +1046,16 @@ impl Renderer {
                 let road_y = j.rem_euclid(sy) < 2;
                 if road_x || road_y {
                     self.canvas.plot(i, j, '·', 0.045 + treble * 0.02);
-                    if road_x && i.rem_euclid(sx) == 1 && (j + (t * 2.0) as i32).rem_euclid(6) < 3 {
+                    if road_x
+                        && i.rem_euclid(sx) == 1
+                        && (j + (travel * 2.0) as i32).rem_euclid(6) < 3
+                    {
                         self.canvas.plot(i, j, '│', 0.12);
                     }
-                    if road_y && j.rem_euclid(sy) == 1 && (i + (t * 3.0) as i32).rem_euclid(6) < 3 {
+                    if road_y
+                        && j.rem_euclid(sy) == 1
+                        && (i + (travel * 3.0) as i32).rem_euclid(6) < 3
+                    {
                         self.canvas.plot(i, j, '─', 0.12);
                     }
                 } else {
@@ -911,26 +1073,33 @@ impl Renderer {
                         let mark = if seed > 0.45 { '▒' } else { '░' };
                         self.canvas.plot(i, j, mark, level);
                         if seed > 0.30 && i.rem_euclid(3) == 0 && j.rem_euclid(2) == 0 {
-                            self.canvas.plot(i, j, '▪', 0.15 + band * 0.25);
+                            self.canvas
+                                .plot(i, j, '▪', 0.15 + band * 0.25 + strike * 0.12);
                         }
                     }
                 }
             }
         }
+        // Cars drive the audio-driven traffic clock, so a louder passage moves
+        // more of the grid's traffic per second.
         for k in 0..56u32 {
             let speed = 1.5 + hash01(k * 3 + 1) * 2.5 + energy * 4.0;
             if k % 2 == 0 {
                 let road = ((hash01(k * 3 + 2) * (w / sx as usize).max(1) as f32) as i32) * sx;
                 let lane = road + if k % 4 == 0 { 0 } else { 1 };
-                let y = (hash01(k * 3 + 3) * fh + t * speed).rem_euclid(fh);
+                let length = 1.0 + strike * 3.0;
+                let y = (hash01(k * 3 + 3) * fh + travel * speed).rem_euclid(fh);
                 self.canvas.dot(lane as f32, y, '●', 0.45 + energy * 0.35);
-                self.canvas.dot(lane as f32, y + 1.0, '·', 0.22);
+                self.canvas
+                    .dot(lane as f32, y - length, '·', 0.22 + strike * 0.25);
             } else {
                 let road = ((hash01(k * 3 + 4) * (h / sy as usize).max(1) as f32) as i32) * sy;
                 let lane = road + if k % 4 == 1 { 0 } else { 1 };
-                let x = (hash01(k * 3 + 5) * fw + t * speed).rem_euclid(fw);
+                let length = 1.0 + strike * 3.0;
+                let x = (hash01(k * 3 + 5) * fw + travel * speed).rem_euclid(fw);
                 self.canvas.dot(x, lane as f32, '●', 0.45 + energy * 0.35);
-                self.canvas.dot(x + 1.0, lane as f32, '·', 0.22);
+                self.canvas
+                    .dot(x - length, lane as f32, '·', 0.22 + strike * 0.25);
             }
         }
         for ix in (0..w as i32).step_by(sx as usize) {
@@ -959,7 +1128,9 @@ impl Renderer {
         let bass = unit(audio.bass);
         let treble = unit(audio.treble);
         let kick = unit(audio.kick);
+        let strike = hit(audio);
         self.night_sky(w, h, 0.60, t, treble);
+        let tick = self.tick();
         for building in &self.skyline {
             if building.layer < 2 {
                 continue;
@@ -974,8 +1145,8 @@ impl Renderer {
             }
             for y in (y0 + 2..h as i32).step_by(3) {
                 for x in (x0 + 1..x1).step_by(3) {
-                    if hash2(x, y) < 0.2 {
-                        self.canvas.plot(x, y, '▪', 0.18);
+                    if hash2(x + tick, y) < 0.2 {
+                        self.canvas.plot(x, y, '▪', 0.16 + strike * 0.12);
                     }
                 }
             }
@@ -983,9 +1154,19 @@ impl Renderer {
         let cx = fw * 0.5;
         let cy = fh * 0.44;
         let radius = (fw.min(fh * 2.0) * 0.30 * (1.0 + bass * 0.06)).max(5.0);
-        let second = -PI * 0.5 + unit(audio.locked_beat_phase()) * TAU + t * 0.6;
-        let minute = -PI * 0.5 + t * 0.22;
-        let hour = -PI * 0.5 + t * 0.018;
+        // The clock runs on beats, not on wall time: the second hand sweeps once
+        // per beat, the minute hand steps one mark per beat, and the hour hand
+        // takes 144 beats to turn. A transient nudges the hands forward, and an
+        // unknown tempo leaves the second hand on the audio-driven travel clock.
+        let phase = if audio.tempo_confidence >= 0.25 {
+            self.sweep(audio, 1.0)
+        } else {
+            self.travel.rem_euclid(1.0)
+        };
+        let second = -PI * 0.5 + phase * TAU + strike * 0.18;
+        let minute = -PI * 0.5 + (self.beat % 12) as f32 / 12.0 * TAU + kick * 0.05;
+        let hour = -PI * 0.5 + (self.beat % 144) as f32 / 144.0 * TAU;
+        let stretch = 1.0 + strike * 0.12;
         for j in 0..h {
             let dy = (j as f32 - cy) * 2.0;
             for i in 0..w {
@@ -1000,9 +1181,9 @@ impl Renderer {
                     self.canvas
                         .plot(i as i32, j as i32, '░', 0.09 + treble * 0.03);
                     let angle = dy.atan2(dx);
-                    let tick = (angle / TAU * 12.0).round();
-                    let frac = (angle / TAU * 12.0 - tick).abs();
-                    let band = unit(bands[((tick as i32).rem_euclid(12)) as usize]);
+                    let mark = (angle / TAU * 12.0).round();
+                    let frac = (angle / TAU * 12.0 - mark).abs();
+                    let band = unit(bands[(mark as i32).rem_euclid(12) as usize]);
                     if frac < 0.055 && d > radius * 0.80 {
                         self.canvas
                             .plot(i as i32, j as i32, '▪', 0.30 + band * 0.35);
@@ -1015,18 +1196,19 @@ impl Renderer {
             (minute, radius * 0.74, 0.85),
             (second, radius * 0.88, 0.62),
         ] {
+            let len = len * stretch;
             let end = [cx + angle.cos() * len, cy + angle.sin() * len * 0.5];
+            self.canvas.dot(end[0], end[1], '●', level);
             self.canvas.stroke([cx, cy], end, level);
             self.canvas.stroke(
                 [cx + 0.7, cy + 0.35],
                 [end[0] + 0.7, end[1] + 0.35],
                 level * 0.55,
             );
-            self.canvas.dot(end[0], end[1], '●', level);
         }
         self.canvas.dot(cx, cy, '◉', 0.55 + kick * 0.3);
         for k in 0..24 {
-            let angle = k as f32 / 24.0 * TAU + t * 0.02;
+            let angle = k as f32 / 24.0 * TAU + self.beat as f32 * 0.05;
             let x = cx + angle.cos() * radius * 1.10;
             let y = cy + angle.sin() * radius * 1.10 * 0.5;
             self.canvas.dot(x, y, '·', 0.12 + treble * 0.12);
@@ -1034,13 +1216,18 @@ impl Renderer {
     }
 
     /// A neon alley: sign panels, wet floor reflections, and steam.
-    fn draw_neon(&mut self, w: usize, h: usize, t: f32, bands: &[f32; 32], audio: &Reactivity) {
+    fn draw_neon(&mut self, w: usize, h: usize, _t: f32, bands: &[f32; 32], audio: &Reactivity) {
         let fw = w as f32;
         let fh = h as f32;
         let energy = unit(audio.energy);
         let treble = unit(audio.treble);
         let kick = unit(audio.kick);
-        let bucket = (t * 2.0) as u32;
+        let strike = hit(audio);
+        let tick = self.tick() as u32;
+        let travel = self.travel;
+        // Signs switch on as a wave of light runs down the alley once every four
+        // beats; a transient flares every lit sign at once.
+        let front = self.sweep(audio, 4.0);
         let left_wall = fw * 0.30;
         let right_wall = fw * 0.70;
         for j in 0..h {
@@ -1075,9 +1262,17 @@ impl Renderer {
                         continue;
                     }
                     let band = unit(bands[((row * 3 + col) as usize) % 32]);
-                    let lit = hash01(id as u32 * 13 + bucket) < 0.45 + treble * 0.3 + band * 0.2;
+                    let reach = row as f32 / 8.0;
+                    let crest = (front - reach).abs() < 0.13;
+                    let swept = reach < front;
+                    let lit = crest
+                        || swept
+                        || hash01(id as u32 * 13 + tick) < 0.35 + treble * 0.25 + band * 0.2;
                     let level = if lit {
-                        0.25 + band * 0.40 + treble * 0.15
+                        0.22 + band * 0.36
+                            + treble * 0.14
+                            + strike * 0.16
+                            + if crest { 0.10 } else { 0.0 }
                     } else {
                         0.055
                     };
@@ -1098,13 +1293,13 @@ impl Renderer {
                     let cx = x0 as f32 + sw as f32 * 0.5;
                     if lit {
                         for y in (y0 + sh + 1)..h as i32 {
-                            let wobble = (y as f32 * 0.5 + t * 2.2).sin() * 1.2;
+                            let wobble = (y as f32 * 0.5 + front * TAU).sin() * (0.6 + kick * 1.4);
                             if (y + id) % 2 == 0 {
                                 self.canvas.dot_tinted(
                                     cx + wobble,
                                     y as f32,
                                     '·',
-                                    0.10 + band * 0.14,
+                                    0.10 + band * 0.14 + strike * 0.06,
                                     hue,
                                 );
                             }
@@ -1124,11 +1319,12 @@ impl Renderer {
         }
         for k in 0..40u32 {
             let base = hash01(k * 7 + 1) * fw;
-            let speed = 0.06 + hash01(k * 7 + 2) * 0.10 + energy * 0.06;
-            let p = (t * speed + hash01(k * 7 + 3)).fract();
+            let speed = 0.25 + hash01(k * 7 + 2) * 0.40 + energy * 0.35 + strike * 0.30;
+            let p = (travel * speed + hash01(k * 7 + 3)).fract();
             let y = fh * 0.78 - p * fh * 0.45;
-            let x = base + (p * 9.0 + t * 0.8).sin() * 3.0;
-            self.canvas.dot(x, y, '░', 0.07 + energy * 0.08);
+            let x = base + (p * 9.0 + front * TAU).sin() * 3.0;
+            self.canvas
+                .dot(x, y, '░', 0.07 + energy * 0.08 + strike * 0.05);
         }
         let door_x = (w / 2) as i32;
         let door_y = (fh * 0.63) as i32;
@@ -1156,8 +1352,13 @@ impl Renderer {
             let cx = hash01(k * 11 + 2) * fw;
             let cy = (fh * 0.66) + hash01(k * 11 + 3) * (fh * 0.25);
             for dx in 0..6 {
-                self.canvas
-                    .dot(cx + (dx as f32 - 3.0) * 1.2, cy, '≈', 0.08 + kick * 0.18);
+                let puff = 1.0 + strike * 1.6;
+                self.canvas.dot(
+                    cx + (dx as f32 - 3.0) * 1.2 * puff,
+                    cy,
+                    '≈',
+                    0.08 + kick * 0.18 + strike * 0.16,
+                );
             }
         }
     }
@@ -1263,6 +1464,392 @@ mod tests {
             .iter()
             .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
             .collect()
+    }
+
+    fn frame(
+        renderer: &mut Renderer,
+        mode: usize,
+        t: f32,
+        audio: &Reactivity,
+        area: Rect,
+    ) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        renderer.draw(
+            &mut buf,
+            area,
+            t,
+            mode,
+            0,
+            &[0.0; 32],
+            audio,
+            &Theme::default(),
+        );
+        buf
+    }
+
+    fn cars(buf: &Buffer) -> std::collections::BTreeSet<usize> {
+        buf.content
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.symbol() == "●")
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn positions_with(buf: &Buffer, area: Rect, symbol: &str) -> Vec<(usize, usize)> {
+        buf.content
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| cell.symbol() == symbol)
+            .map(|(i, _)| (i % area.width as usize, i / area.width as usize))
+            .collect()
+    }
+
+    fn beat_audio(frame: usize) -> Reactivity {
+        Reactivity {
+            beat_phase: frame as f32 / 10.0,
+            tempo_confidence: 1.0,
+            ..Reactivity::default()
+        }
+    }
+
+    /// Draw `beats` beats of ten frames each and return the frame at mid-beat.
+    fn run_beats(renderer: &mut Renderer, mode: usize, beats: usize, area: Rect) -> Vec<Buffer> {
+        let mut mid = Vec::new();
+        for beat in 0..beats {
+            for step in 0..10 {
+                let buf = frame(
+                    renderer,
+                    mode,
+                    (beat * 10 + step) as f32 / 60.0,
+                    &beat_audio(step),
+                    area,
+                );
+                if step == 5 {
+                    mid.push(buf);
+                }
+            }
+        }
+        mid
+    }
+
+    fn centroid_y(buf: &Buffer, area: Rect, symbol: &str) -> f32 {
+        let cells = positions_with(buf, area, symbol);
+        assert!(!cells.is_empty(), "no {symbol} cells to measure");
+        cells.iter().map(|(_, y)| *y as f32).sum::<f32>() / cells.len() as f32
+    }
+
+    #[test]
+    fn skyline_windows_light_in_a_travelling_wave() {
+        let area = Rect::new(0, 0, 96, 36);
+        let mut renderer = Renderer::default();
+        let frames = run_beats(&mut renderer, 0, 5, area);
+        let lit: Vec<usize> = frames
+            .iter()
+            .map(|buf| positions_with(buf, area, "▪").len())
+            .collect();
+        assert_eq!(
+            renderer.beat, 4,
+            "the harness should have counted the beats"
+        );
+        for pair in lit[..4].windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "the lit-window wave should sweep the skyline: {lit:?}"
+            );
+        }
+        assert!(
+            lit[3] > lit[0] * 4,
+            "the wave should light most of the skyline by the end of its cycle: {lit:?}"
+        );
+        assert!(
+            lit[4] < lit[0],
+            "the wave should start over after four beats: {lit:?}"
+        );
+    }
+
+    #[test]
+    fn street_canyon_pans_on_the_beat_and_its_lamps_flare_on_hits() {
+        let area = Rect::new(0, 0, 96, 36);
+        let bottom = area.height as usize - 1;
+        let wall_edges: Vec<usize> = [0.0f32, 0.25, 0.5, 0.75]
+            .iter()
+            .map(|phase| {
+                let mut renderer = Renderer::default();
+                let audio = Reactivity {
+                    beat_phase: *phase,
+                    tempo_confidence: 1.0,
+                    ..Reactivity::default()
+                };
+                let buf = frame(&mut renderer, 2, 0.0, &audio, area);
+                (0..area.width as usize)
+                    .find(|x| buf.content[bottom * area.width as usize + x].symbol() != "▓")
+                    .expect("the wall should reach the frame edge")
+            })
+            .collect();
+        let span = wall_edges.iter().max().unwrap() - wall_edges.iter().min().unwrap();
+        assert!(
+            span > 0,
+            "the canyon should pan with the beat: {wall_edges:?}"
+        );
+        assert!(span <= 6, "the pan should stay bounded: {wall_edges:?}");
+
+        let pools = |audio: &Reactivity| {
+            let mut renderer = Renderer::default();
+            let buf = frame(&mut renderer, 2, 0.0, audio, area);
+            positions_with(&buf, area, "░").len()
+        };
+        let quiet = pools(&Reactivity {
+            treble: 0.3,
+            ..Reactivity::default()
+        });
+        let strike = pools(&Reactivity {
+            treble: 0.3,
+            transients: [0.9; 4],
+            ..Reactivity::default()
+        });
+        assert_eq!(quiet, 0, "lamps should not pool light without a hit");
+        assert!(
+            strike > 24,
+            "a transient should spread light pools on the road, saw {strike}"
+        );
+    }
+
+    #[test]
+    fn rooftop_rain_thickens_on_transients() {
+        let area = Rect::new(0, 0, 96, 36);
+        let roof_row = (area.height as f32 * 0.55) as usize - 1;
+        let streaks = |audio: &Reactivity| {
+            let mut renderer = Renderer::default();
+            let buf = frame(&mut renderer, 5, 0.5, audio, area);
+            positions_with(&buf, area, "╲")
+                .into_iter()
+                .filter(|(_, y)| *y < roof_row)
+                .count()
+        };
+        let calm = streaks(&Reactivity {
+            treble: 0.3,
+            ..Reactivity::default()
+        });
+        let storm = streaks(&Reactivity {
+            treble: 0.3,
+            transients: [0.9; 4],
+            ..Reactivity::default()
+        });
+        assert!(calm > 0, "rain should fall in quiet passages too");
+        assert!(
+            storm > calm * 2,
+            "a hit should thicken the rain: {calm} -> {storm}"
+        );
+    }
+
+    #[test]
+    fn bridge_cables_bend_on_kicks() {
+        let area = Rect::new(0, 0, 96, 36);
+        let cable_rows = |audio: &Reactivity| {
+            let mut renderer = Renderer::default();
+            let buf = frame(&mut renderer, 4, 0.4, audio, area);
+            (40..56)
+                .map(|x| {
+                    (0..area.height as usize)
+                        .find(|&y| {
+                            matches!(
+                                buf.content[y * area.width as usize + x].symbol(),
+                                "─" | "╱" | "╲" | "│"
+                            )
+                        })
+                        .expect("the main cable should cross the mid span")
+                })
+                .collect::<Vec<usize>>()
+        };
+        let quiet = cable_rows(&Reactivity::default());
+        let kick = cable_rows(&Reactivity {
+            kick: 1.0,
+            transients: [1.0; 4],
+            ..Reactivity::default()
+        });
+        assert_ne!(quiet, kick, "the cable should answer a kick: {quiet:?}");
+        assert!(
+            quiet.iter().zip(&kick).all(|(a, b)| a.abs_diff(*b) <= 4),
+            "cable displacement should stay bounded: {quiet:?} -> {kick:?}"
+        );
+    }
+
+    #[test]
+    fn aerial_grid_traffic_moves_with_the_audio_clock() {
+        let area = Rect::new(0, 0, 96, 36);
+        let moved = |energy: f32| {
+            let audio = Reactivity {
+                energy,
+                ..Reactivity::default()
+            };
+            let mut renderer = Renderer::default();
+            let mut buf = Buffer::empty(area);
+            for step in 0..30 {
+                renderer.draw(
+                    &mut buf,
+                    area,
+                    step as f32 / 60.0,
+                    6,
+                    0,
+                    &[0.0; 32],
+                    &audio,
+                    &Theme::default(),
+                );
+            }
+            let before = cars(&buf);
+            for step in 30..45 {
+                renderer.draw(
+                    &mut buf,
+                    area,
+                    step as f32 / 60.0,
+                    6,
+                    0,
+                    &[0.0; 32],
+                    &audio,
+                    &Theme::default(),
+                );
+            }
+            let after = cars(&buf);
+            // A car that moved vacates one cell and occupies another. The larger
+            // count of the two is the number of cars that went somewhere new.
+            let vacated = before.difference(&after).count();
+            let entered = after.difference(&before).count();
+            vacated.max(entered)
+        };
+        let quiet = moved(0.0);
+        let loud = moved(1.0);
+        assert!(
+            loud > quiet + 20 && loud > 40,
+            "the grid's cars should cover more ground with energy: quiet moved {quiet} cells, loud moved {loud}"
+        );
+    }
+
+    #[test]
+    fn clock_hands_tick_with_the_beat() {
+        let area = Rect::new(0, 0, 96, 36);
+        let tips = |beats: usize| {
+            let mut renderer = Renderer::default();
+            let frames = run_beats(&mut renderer, 7, beats + 1, area);
+            let buf = frames.last().expect("a frame per beat");
+            positions_with(buf, area, "●")
+        };
+        let first = tips(0);
+        let later = tips(2);
+        assert!(!first.is_empty(), "the hands should have tips");
+        assert_ne!(first, later, "the clock should tick with the beat");
+        let (cx, cy) = (48.0f32, 0.44 * area.height as f32);
+        for (x, y) in later {
+            let reach = (x as f32 - cx).hypot((y as f32 - cy) * 2.0);
+            assert!(reach <= 24.0, "hand tip {x},{y} escaped the clock face");
+        }
+    }
+
+    #[test]
+    fn neon_signs_sweep_down_the_alley() {
+        let area = Rect::new(0, 0, 96, 36);
+        let mut renderer = Renderer::default();
+        let frames = run_beats(&mut renderer, 8, 5, area);
+        let lit: Vec<usize> = frames
+            .iter()
+            .map(|buf| positions_with(buf, area, "▒").len())
+            .collect();
+        let sweep: Vec<f32> = frames
+            .iter()
+            .map(|buf| centroid_y(buf, area, "▒"))
+            .collect();
+        for pair in sweep[..4].windows(2) {
+            assert!(
+                pair[1] >= pair[0],
+                "lit signs should only travel downward: {sweep:?}"
+            );
+        }
+        assert!(
+            sweep[3] > sweep[0] + 1.5,
+            "lit signs should travel down the alley: {sweep:?}"
+        );
+        assert!(
+            lit[2] > lit[0] + 20,
+            "the wave should light more signs as it descends: {lit:?}"
+        );
+        assert!(
+            sweep[4] < sweep[3] - 1.0,
+            "the wave should start over after four beats: {sweep:?}"
+        );
+    }
+
+    #[test]
+    fn city_traffic_clock_is_audio_scaled_and_bounded() {
+        let area = Rect::new(0, 0, 32, 16);
+        let travel = |audio: &Reactivity| {
+            let mut renderer = Renderer::default();
+            let mut buf = Buffer::empty(area);
+            for step in 0..600 {
+                renderer.draw(
+                    &mut buf,
+                    area,
+                    step as f32 / 60.0,
+                    2,
+                    0,
+                    &[0.0; 32],
+                    audio,
+                    &Theme::default(),
+                );
+            }
+            renderer.travel
+        };
+        let idle = travel(&Reactivity::default());
+        let driving = travel(&Reactivity {
+            energy: 1.0,
+            bass: 1.0,
+            tempo_confidence: 1.0,
+            ..Reactivity::default()
+        });
+        assert!(idle > 0.0, "traffic should still crawl in silence");
+        assert!(
+            driving > idle * 3.0,
+            "the road should speed up with the music: {idle} vs {driving}"
+        );
+        assert!(driving < 1024.0, "the traffic clock should stay bounded");
+    }
+
+    #[test]
+    fn city_scenes_are_deterministic() {
+        let area = Rect::new(0, 0, 80, 28);
+        let run = || {
+            let mut renderer = Renderer::default();
+            let mut buf = Buffer::empty(area);
+            for mode in 0..NAMES.len() {
+                for step in 0..12 {
+                    let phase = (step as f32 * 0.17).fract();
+                    let audio = Reactivity {
+                        energy: 0.7,
+                        bass: 0.5,
+                        treble: 0.6,
+                        kick: (-phase * 5.0).exp(),
+                        beat_phase: phase,
+                        tempo_confidence: 0.9,
+                        transients: [phase.min(0.8), 0.0, 0.0, 0.0],
+                        ..Reactivity::default()
+                    };
+                    renderer.draw(
+                        &mut buf,
+                        area,
+                        step as f32 / 60.0,
+                        mode,
+                        0,
+                        &[0.3; 32],
+                        &audio,
+                        &Theme::default(),
+                    );
+                }
+            }
+            buf.content
+                .iter()
+                .map(|cell| (cell.symbol().to_owned(), cell.fg, cell.bg))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(), run(), "city scenes must replay identically");
     }
 
     #[test]
