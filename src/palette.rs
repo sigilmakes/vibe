@@ -273,27 +273,80 @@ fn ascii_glyph(symbol: &str) -> &'static str {
         "▴" | "▲" => "^",
         "░" => ".",
         "▒" => ":",
-        "─" | "━" | "▔" | "╸" | "╺" | "–" | "—" => "-",
+        "─" | "━" | "▔" | "╸" | "╺" | "–" | "—" | "┄" | "┈" => "-",
         "│" | "┃" | "┊" | "╵" => "|",
         "╱" => "/",
         "╲" => "\\",
-        "┼" | "╋" | "┏" | "┓" | "┗" | "┛" => "+",
+        "┼" | "╋" | "┏" | "┓" | "┗" | "┛" | "┌" | "┐" | "└" | "┘" | "┬" | "┴" | "├" | "┤" => {
+            "+"
+        }
         "═" => "=",
-        "●" | "•" | "∙" | "·" | "◆" | "✦" | "✧" | "✿" | "❧" | "❦" | "♣" | "▪" => {
+        "●" | "•" | "∙" | "·" | "◆" | "✦" | "✧" | "✶" | "✻" | "✿" | "❄" | "❧" | "❦" | "♣" | "▪" => {
             "*"
         }
+        "◇" | "◉" | "◍" | "◎" | "◐" | "◦" | "∘" | "○" => "o",
         "←" | "›" => "<",
         "→" => ">",
         "↑" => "^",
         "↓" => "v",
         "×" | "╳" => "x",
-        "⠿" | "⠂" | "⠐" => ".",
-        "⁝" | "⁙" | "◦" | "∘" | "○" => "o",
+        "⊕" => "o",
+        "⊻" => "x",
+        "¬" => "-",
+        "≥" => ">",
+        "⌁" => "~",
         "∽" | "≈" | "⌒" | "⌢" => "~",
+        "⁝" | "⁙" => "o",
         "˙" => ".",
         "²" => "2",
-        _ => "?",
+        // No visual block glyph should degrade to a question-mark field. A
+        // dot keeps the density and the layout readable.
+        _ => ".",
     }
+}
+
+fn luma(color: Color) -> f32 {
+    let Color::Rgb(red, green, blue) = color else {
+        return 0.0;
+    };
+    0.2126 * red as f32 + 0.7152 * green as f32 + 0.0722 * blue as f32
+}
+
+/// Half blocks carry two colors per cell. Averaging their brightness into an
+/// ASCII density ramp keeps gradients readable instead of filling the canvas
+/// with a single wall of `#`.
+fn half_block_ascii(cell: &ratatui::buffer::Cell) -> Option<&'static str> {
+    if !matches!(cell.symbol(), "▀" | "▄") {
+        return None;
+    }
+    let level = (luma(cell.fg) + luma(cell.bg)) * 0.5;
+    Some(match level as u32 {
+        0..=8 => " ",
+        9..=24 => ".",
+        25..=48 => ":",
+        49..=80 => "-",
+        81..=120 => "=",
+        121..=170 => "+",
+        _ => "#",
+    })
+}
+
+/// Braille encodes eight dots per cell. Map dot count to ASCII density so a
+/// curve stays a curve instead of becoming a row of `?`.
+fn braille_ascii(symbol: &str) -> Option<&'static str> {
+    let mut chars = symbol.chars();
+    let ch = chars.next()?;
+    if chars.next().is_some() || !(0x2800..=0x28FF).contains(&(ch as u32)) {
+        return None;
+    }
+    let dots = (ch as u32 - 0x2800).count_ones();
+    Some(match dots {
+        0 => " ",
+        1..=2 => ".",
+        3..=4 => ":",
+        5..=6 => "*",
+        _ => "#",
+    })
 }
 
 pub fn ascii_buffer(buffer: &mut ratatui::buffer::Buffer) {
@@ -301,7 +354,9 @@ pub fn ascii_buffer(buffer: &mut ratatui::buffer::Buffer) {
         if cell.symbol().is_ascii() {
             continue;
         }
-        let replacement = ascii_glyph(cell.symbol());
+        let replacement = half_block_ascii(cell)
+            .or_else(|| braille_ascii(cell.symbol()))
+            .unwrap_or_else(|| ascii_glyph(cell.symbol()));
         cell.set_symbol(replacement);
     }
 }
@@ -819,6 +874,14 @@ mod tests {
         assert_eq!(buffer[(0, 0)].bg, Color::Reset);
     }
 
+    fn ascii_of(symbol: &str) -> String {
+        let area = ratatui::layout::Rect::new(0, 0, 1, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        buffer[(0, 0)].set_symbol(symbol);
+        ascii_buffer(&mut buffer);
+        buffer[(0, 0)].symbol().to_owned()
+    }
+
     #[test]
     fn ascii_fallback_keeps_layout_and_replaces_unknown_symbols() {
         let area = ratatui::layout::Rect::new(0, 0, 3, 1);
@@ -831,6 +894,57 @@ mod tests {
         assert_eq!(buffer[(1, 0)].symbol(), "x");
         assert_eq!(buffer[(2, 0)].symbol(), "*");
         assert!(buffer.content.iter().all(|cell| cell.symbol().is_ascii()));
+        assert_eq!(ascii_of("◑"), ".", "unknown glyphs still leave a mark");
+    }
+
+    #[test]
+    fn braille_cells_keep_their_density_in_ascii() {
+        for (symbol, expected) in [
+            ("⠁", "."),
+            ("⠉", "."),
+            ("⠏", ":"),
+            ("⠿", "*"),
+            ("⣿", "#"),
+            ("⠀", " "),
+        ] {
+            assert_eq!(ascii_of(symbol), expected, "braille {symbol}");
+        }
+    }
+
+    #[test]
+    fn box_drawing_and_geometric_glyphs_have_ascii_replacements() {
+        for symbol in [
+            "┌", "┐", "└", "┘", "┬", "┴", "├", "┤", "┄", "┈", "◇", "◉", "◍", "◎", "◐", "✶", "✻",
+            "❄", "¬", "≥", "⊕", "⊻", "⌁",
+        ] {
+            assert_ne!(ascii_of(symbol), "?", "glyph {symbol}");
+        }
+    }
+
+    #[test]
+    fn ascii_half_blocks_keep_a_shading_ramp() {
+        let area = ratatui::layout::Rect::new(0, 0, 7, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        for (x, (fg, bg)) in [
+            (0_u8, 0_u8),
+            (20, 0),
+            (60, 0),
+            (120, 0),
+            (200, 0),
+            (255, 60),
+            (255, 220),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cell = &mut buffer[(x as u16, 0)];
+            cell.set_symbol("▀");
+            cell.set_fg(Color::Rgb(fg, fg, fg));
+            cell.set_bg(Color::Rgb(bg, bg, bg));
+        }
+        ascii_buffer(&mut buffer);
+        let symbols: Vec<_> = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(symbols, [" ", ".", ":", "-", "=", "+", "#"]);
     }
 
     #[test]

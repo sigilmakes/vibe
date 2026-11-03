@@ -177,6 +177,14 @@ impl Renderer {
             self.cooldown = 0.10;
         }
         self.attack = attack;
+        if style == 5 {
+            // A forge keeps a low ember stream between air attacks. Without it
+            // the scene is black whenever the track has no fourth transient.
+            self.emission += dt * (36.0 + audio.energy.clamp(0.0, 1.0) * 36.0);
+            let count = self.emission as usize;
+            self.emission -= count as f32;
+            self.emit(style, count, 0.0, audio);
+        }
         if style != 5 && style != 7 {
             let rate = match style {
                 3 => 30.0,
@@ -388,6 +396,29 @@ mod tests {
             &[0.4; 32],
             audio,
             &Theme::default(),
+        );
+    }
+
+    #[test]
+    fn spark_forge_keeps_embers_between_air_attacks() {
+        let area = Rect::new(0, 0, 100, 35);
+        let mut buffer = Buffer::empty(area);
+        let mut renderer = Renderer::default();
+        let quiet = Reactivity {
+            energy: 0.5,
+            ..Reactivity::default()
+        };
+        for i in 0..=120 {
+            render(&mut renderer, &mut buffer, area, i as f32 / 60.0, 5, &quiet);
+        }
+        let ink = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol() != " ")
+            .count();
+        assert!(
+            ink > 25,
+            "spark forge went dark between attacks: {ink} cells"
         );
     }
 
