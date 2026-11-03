@@ -481,30 +481,41 @@ fn canyon_strata(s: &mut Scene<'_>) {
     }
 }
 
-/// A fractured glacier tongue. Dark crevasses cut blue ice; treble opens more
-/// cracks and the bass slowly shifts the flow lines.
+/// A fractured glacier tongue. Kick heaves a serac wall up the frame, treble
+/// sweeps a snow glaze diagonally across the ice and opens the cut lines, and
+/// bass drifts the flow lines.
 fn glacier_crevasse(s: &mut Scene<'_>) {
-    let crack_width = 0.10 + 0.06 * s.treble;
+    let crack_width = 0.09 + 0.05 * s.treble + 0.04 * s.kick;
     let shift = s.t * (0.02 + 0.01 * s.bass);
+    // The wall climbs on a kick; kick and onset also open it.
+    let wall = 0.62 - 0.18 * s.kick + 0.03 * (s.t * 0.23).sin();
+    let wall_w = 0.09 + 0.05 * s.kick + 0.03 * s.onset;
+    // Treble carries the snow glaze across the tongue.
+    let glaze = s.t * (0.3 + 1.6 * s.treble);
     for j in 0..s.height() {
         let v = s.v(j);
+        let band = (-((v - wall) / wall_w).powi(2)).exp();
         for i in 0..s.width() {
             let u = s.u(i);
             let warp = noise2(u * 3.0, v * 2.2, 5.0);
             let field_a = (u * 7.0 + warp * 2.4 + shift).sin().abs();
-            let field_b = (v * 13.0 + warp * 1.8 - shift * 1.4).sin().abs();
+            let field_b = (v * 13.0 + warp * 1.8 - shift * 1.4 + 3.0 * band)
+                .sin()
+                .abs();
             let field_c = ((u * 19.0 + v * 17.0 + warp * 3.0).sin()).abs();
             let crack = field_a.min(field_b).min(field_c * (0.5 + 0.5 * s.treble));
             let deep = crack < crack_width;
             let serac = (noise2(u * 5.0, v * 5.0, 13.0) * 3.0).sin();
+            let streak = (u * 1.6 + v * 2.4 - glaze).sin();
+            let lit = streak > 0.97 - 0.02 * s.treble;
             let b = if deep {
                 0.02
+            } else if lit {
+                (0.55 + 0.30 * s.treble + 0.10 * s.energy).min(1.0)
+            } else if band > 0.55 {
+                (0.40 + 0.20 * serac + 0.12 * s.energy + 0.08 * s.treble).min(1.0)
             } else {
-                (0.28
-                    + 0.20 * serac
-                    + 0.10 * s.energy
-                    + 0.15 * s.treble * (u * 40.0 - s.t * 2.0).sin().abs())
-                .min(1.0)
+                (0.24 + 0.16 * serac + 0.10 * s.energy + 0.10 * band).min(1.0)
             };
             let mark = if deep {
                 if field_a < field_b {
@@ -512,6 +523,10 @@ fn glacier_crevasse(s: &mut Scene<'_>) {
                 } else {
                     '─'
                 }
+            } else if lit {
+                '▄'
+            } else if band > 0.55 {
+                '▓'
             } else if serac > 0.5 {
                 '▒'
             } else if serac > -0.2 {
@@ -521,6 +536,8 @@ fn glacier_crevasse(s: &mut Scene<'_>) {
             };
             let phase = if deep {
                 0.72 + 0.05 * s.hue
+            } else if lit {
+                0.12 + 0.04 * s.hue
             } else {
                 0.58 + 0.05 * serac + 0.08 * s.hue
             };
@@ -594,19 +611,23 @@ fn island_chain(s: &mut Scene<'_>) {
     }
 }
 
-/// A branching delta seen from above. Channels fan from the trunk into a
-/// sediment plume; mid widens them and the waveform wiggles their banks.
+/// A branching delta seen from above. Kick surges the mouth inland and opens
+/// the fan, onset re-seats the branches, treble runs a freshet down the
+/// channels, and the waveform wiggles their banks.
 fn river_delta(s: &mut Scene<'_>) {
+    let sea = 0.86 + 0.03 * s.bass - 0.10 * s.kick;
+    let split = 0.33 - 0.10 * s.kick;
+    let fan = 1.0 + 0.35 * s.kick + 0.20 * s.onset;
+    let freshet = s.t * (0.8 + 2.0 * s.treble);
     for j in 0..s.height() {
         let v = s.v(j);
-        let sea = 0.86 + 0.03 * s.bass;
         for i in 0..s.width() {
             let u = s.u(i);
             let mut channel = f32::INFINITY;
             let mut flow = 0.0;
             for k in 0..5 {
                 let idx = k as f32 - 2.0;
-                let spread = (v - 0.16).max(0.0).powf(1.15) * 0.22;
+                let spread = (v - 0.16).max(0.0).powf(1.15) * 0.22 * fan;
                 let path = 0.5
                     + idx * spread
                     + 0.03 * (v * 8.0 + idx * 1.7 + s.t * 0.4).sin()
@@ -618,7 +639,7 @@ fn river_delta(s: &mut Scene<'_>) {
                     flow = idx;
                 }
             }
-            if v < 0.33 {
+            if v < split {
                 let trunk = (u - 0.5).abs() / (0.02 + 0.02 * (1.0 - v));
                 if trunk < channel {
                     channel = trunk;
@@ -626,10 +647,13 @@ fn river_delta(s: &mut Scene<'_>) {
                 }
             }
             let (mark, phase, light) = if v > sea {
+                let mouth = v - sea < 0.02 + 0.01 * s.kick;
                 let plume = (-channel * 1.2).exp() * (1.0 - (v - sea) * 2.0).max(0.0);
                 let wave = (u * 28.0 + v * 18.0 - s.t * 1.8).sin();
                 let b = (0.15 + 0.25 * (wave * 0.5 + 0.5) + 0.35 * plume + 0.1 * s.energy).min(1.0);
-                let mark = if plume > 0.35 {
+                let mark = if mouth {
+                    '█'
+                } else if plume > 0.35 {
                     '░'
                 } else if b > 0.35 {
                     '~'
@@ -639,8 +663,11 @@ fn river_delta(s: &mut Scene<'_>) {
                 (mark, 0.55 + 0.05 * wave + 0.05 * s.hue, b)
             } else if channel < 1.0 {
                 let stream = (v * 48.0 - s.t * 3.0 + flow * 1.5 + s.mid * 2.0).sin();
+                let surge = (v * 7.0 - freshet + flow * 0.6).sin();
                 let b = (0.40 + 0.30 * (stream * 0.5 + 0.5) + 0.15 * s.energy).min(1.0);
-                let mark = if stream > 0.35 {
+                let mark = if surge > 0.90 - 0.02 * s.treble {
+                    '▓'
+                } else if stream > 0.35 {
                     '≈'
                 } else if stream > -0.4 {
                     '~'
@@ -676,8 +703,9 @@ fn river_delta(s: &mut Scene<'_>) {
     }
 }
 
-/// A profile view of a sea cliff: ledges and cracks on the left, sky and water
-/// on the right. Bass raises the sea and kicks throw surf against the rock.
+/// A profile view of a sea cliff: a lit crest, ledges and cracks on the left,
+/// sky and water on the right. Kick heaves the crest and throws surf against
+/// the rock, treble roughens the crest line, and bass raises the sea.
 fn sea_cliff(s: &mut Scene<'_>) {
     let horizon = 0.60 - 0.03 * s.bass;
     for j in 0..s.height() {
@@ -685,14 +713,25 @@ fn sea_cliff(s: &mut Scene<'_>) {
         for i in 0..s.width() {
             let u = s.u(i);
             let edge = 0.42 + 0.05 * wave(v * 3.0, 21.0) + 0.03 * (v * 12.0 - s.t * 0.5).sin();
-            let (mark, phase, light) = if u < edge {
+            let crest = 0.16
+                + (0.05 + 0.10 * s.treble) * wave(u * 2.2, 27.0)
+                + 0.02 * (u * 9.0 + s.t * 0.2).sin()
+                - 0.10 * s.kick;
+            let (mark, phase, light) = if u < edge && v >= crest {
                 let strata = v * 34.0 + noise2(u * 9.0, v * 3.0, 23.0) * 2.4 + u * 6.0;
                 let band = strata.sin();
                 let ledge = (band - 0.75).max(0.0) * 3.0;
                 let crack = (u * 46.0 + noise2(u * 5.0, v * 6.0, 29.0) * 2.0).sin();
-                let b =
-                    (0.10 + 0.30 * ledge + 0.10 * (band * 0.5 + 0.5) + 0.06 * s.energy).min(1.0);
-                let mark = if ledge > 0.5 {
+                let cap = v - crest < 0.025 + 0.01 * s.onset;
+                let b = (0.10
+                    + 0.30 * ledge
+                    + 0.10 * (band * 0.5 + 0.5)
+                    + 0.06 * s.energy
+                    + if cap { 0.25 + 0.20 * s.treble } else { 0.0 })
+                .min(1.0);
+                let mark = if cap {
+                    '▀'
+                } else if ledge > 0.5 {
                     '▄'
                 } else if crack.abs() < 0.06 {
                     '│'
@@ -741,14 +780,18 @@ fn sea_cliff(s: &mut Scene<'_>) {
     }
 }
 
-/// A quiet tundra plain under aurora curtains. Bass breathes the horizon and
-/// snow relief, while treble adds ice sparkle to the drifts.
+/// A quiet tundra plain under aurora curtains. Kick lifts a snow ridge and
+/// lights its crest, bass breathes the horizon, and treble adds ice sparkle
+/// to the drifts.
 fn tundra_silence(s: &mut Scene<'_>) {
     let horizon = 0.44 - 0.015 * s.bass;
     for j in 0..s.height() {
         let v = s.v(j);
         for i in 0..s.width() {
             let u = s.u(i);
+            // The near ridge climbs on a kick.
+            let ridge = 0.62 + 0.04 * wave(u * 2.6, 43.0) + 0.02 * (u * 5.0 + s.t * 0.15).sin()
+                - 0.10 * s.kick;
             let (mark, phase, light) = if v < horizon {
                 let ribbon = ((u * 5.0 + 0.35 * noise2(u * 3.0, v * 4.0, 41.0) + s.t * 0.12).sin()
                     + 0.55 * ((u * 9.0 - v * 3.0 - s.t * 0.17).sin()))
@@ -764,13 +807,25 @@ fn tundra_silence(s: &mut Scene<'_>) {
                     ' '
                 };
                 (mark, 0.50 + 0.08 * ribbon + 0.12 * s.hue, b)
+            } else if v < ridge {
+                let drift = noise2(u * 3.5, v * 6.0, 43.0);
+                let far = (v * 22.0 + drift * 2.4 - s.t * 0.10).sin();
+                let b = (0.04 + 0.10 * (far * 0.5 + 0.5) + 0.04 * s.energy).min(0.5);
+                let mark = if far > 0.55 { '·' } else { ' ' };
+                (mark, 0.56 + 0.04 * drift + 0.06 * s.hue, b)
             } else {
-                let depth = v - horizon;
+                let depth = v - ridge;
                 let drift = noise2(u * 3.5, v * 6.0, 43.0);
                 let dune = (v * 30.0 + drift * 3.0 - s.t * 0.15).sin();
                 let pond = noise2(u * 2.0, v * 2.5, 47.0);
                 let spark = (u * 83.0 + v * 61.0 + s.t * 2.0).sin();
-                if pond < -0.45 {
+                if depth < 0.02 + 0.01 * s.onset {
+                    (
+                        '▄',
+                        0.14 + 0.04 * s.hue,
+                        (0.40 + 0.30 * s.treble + 0.10 * s.energy).min(1.0),
+                    )
+                } else if pond < -0.45 {
                     let ice = (u * 50.0 + v * 40.0 + s.t).sin();
                     let b = (0.18 + 0.1 * (ice * 0.5 + 0.5) + 0.08 * s.treble).min(0.6);
                     (if b > 0.3 { '·' } else { ' ' }, 0.60, b)
@@ -947,6 +1002,49 @@ mod tests {
         audio
     }
 
+    const TEST_WIDTH: usize = 100;
+
+    fn glyph_rows(style: usize, audio: &Reactivity, glyph: char, frames: usize) -> Vec<usize> {
+        render_for(style, audio, frames)
+            .iter()
+            .enumerate()
+            .filter(|(_, (symbol, ..))| symbol.starts_with(glyph))
+            .map(|(index, _)| index / TEST_WIDTH)
+            .collect()
+    }
+
+    /// Mean row of a structural glyph. A scene that only recolours keeps this
+    /// fixed, so a row shift proves the shape itself moved.
+    fn glyph_centroid(style: usize, audio: &Reactivity, glyph: char, frames: usize) -> f32 {
+        let rows = glyph_rows(style, audio, glyph, frames);
+        assert!(
+            !rows.is_empty(),
+            "style {style} never paints {glyph:?} in this state"
+        );
+        rows.iter().map(|&row| row as f32).sum::<f32>() / rows.len() as f32
+    }
+
+    fn symbol_mask(style: usize, audio: &Reactivity, frames: usize) -> Vec<String> {
+        render_for(style, audio, frames)
+            .into_iter()
+            .map(|(symbol, ..)| symbol)
+            .collect()
+    }
+
+    fn mask_changes(a: &[String], b: &[String]) -> usize {
+        a.iter()
+            .zip(b)
+            .filter(|(left, right)| left != right)
+            .count()
+    }
+
+    fn kick_only() -> Reactivity {
+        Reactivity {
+            kick: 1.0,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn names_are_ten_and_unique() {
         assert_eq!(NAMES.len(), 10);
@@ -1098,6 +1196,127 @@ mod tests {
         let audio = loud();
         for style in 0..NAMES.len() {
             assert_eq!(render(style, &audio), render(style, &audio));
+        }
+    }
+
+    #[test]
+    fn glacier_serac_wall_heaves_up_on_kick() {
+        let quiet = glyph_centroid(4, &Reactivity::default(), '▓', 1);
+        let kicked = glyph_centroid(4, &kick_only(), '▓', 1);
+        assert!(
+            kicked < quiet - 4.0,
+            "serac wall stayed at row {quiet} instead of rising on a kick ({kicked})"
+        );
+    }
+
+    #[test]
+    fn glacier_snow_glaze_travels_with_treble() {
+        let still = glyph_centroid(4, &Reactivity::default(), '▄', 30);
+        let bright = glyph_centroid(
+            4,
+            &Reactivity {
+                treble: 1.0,
+                ..Default::default()
+            },
+            '▄',
+            30,
+        );
+        assert!(
+            (still - bright).abs() > 4.0,
+            "snow glaze barely moved with treble: {still} to {bright}"
+        );
+    }
+
+    #[test]
+    fn sea_cliff_crest_rises_on_kick_and_shivers_with_treble() {
+        let quiet = Reactivity::default();
+        let base = glyph_centroid(7, &quiet, '▀', 1);
+        let kicked = glyph_centroid(7, &kick_only(), '▀', 1);
+        assert!(
+            kicked < base - 2.0,
+            "cliff crest stayed at row {base} instead of rising on a kick ({kicked})"
+        );
+        let shiver = Reactivity {
+            treble: 0.9,
+            ..Default::default()
+        };
+        let changed = mask_changes(&symbol_mask(7, &quiet, 1), &symbol_mask(7, &shiver, 1));
+        assert!(
+            changed > 20,
+            "treble only repainted {changed} cells of the cliff"
+        );
+    }
+
+    #[test]
+    fn river_delta_mouth_surges_inland_on_kick() {
+        let quiet = glyph_centroid(6, &Reactivity::default(), '█', 1);
+        let kicked = glyph_centroid(6, &kick_only(), '█', 1);
+        assert!(
+            kicked < quiet - 2.0,
+            "delta mouth stayed at row {quiet} instead of surging on a kick ({kicked})"
+        );
+    }
+
+    #[test]
+    fn river_delta_fan_opens_on_kick() {
+        let changed = mask_changes(
+            &symbol_mask(6, &Reactivity::default(), 1),
+            &symbol_mask(6, &kick_only(), 1),
+        );
+        assert!(changed > 100, "kick only reshaped {changed} delta cells");
+    }
+
+    #[test]
+    fn river_delta_freshet_moves_with_treble() {
+        let still = glyph_centroid(6, &Reactivity::default(), '▓', 30);
+        let bright = glyph_centroid(
+            6,
+            &Reactivity {
+                treble: 0.9,
+                ..Default::default()
+            },
+            '▓',
+            30,
+        );
+        assert!(
+            (still - bright).abs() > 4.0,
+            "freshet barely moved with treble: {still} to {bright}"
+        );
+    }
+
+    #[test]
+    fn tundra_ridge_lifts_on_kick() {
+        let quiet = glyph_centroid(8, &Reactivity::default(), '▄', 1);
+        let kicked = glyph_centroid(8, &kick_only(), '▄', 1);
+        assert!(
+            kicked < quiet - 2.0,
+            "snow ridge stayed at row {quiet} instead of lifting on a kick ({kicked})"
+        );
+    }
+
+    #[test]
+    fn rising_scenes_clamp_hostile_audio_instead_of_drifting() {
+        let hostile = Reactivity {
+            energy: f32::INFINITY,
+            bass: f32::NEG_INFINITY,
+            mid: 4.0,
+            treble: f32::NAN,
+            onset: f32::INFINITY,
+            kick: f32::INFINITY,
+            centroid: -3.0,
+            flatness: f32::NAN,
+            ..Default::default()
+        };
+        let clamped = Reactivity {
+            mid: 1.0,
+            ..Default::default()
+        };
+        for style in [4, 6, 7, 8] {
+            assert_eq!(
+                render(style, &hostile),
+                render(style, &clamped),
+                "style {style} let hostile audio escape its bounds"
+            );
         }
     }
 }
