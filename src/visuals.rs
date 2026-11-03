@@ -469,13 +469,15 @@ impl Renderer {
         audio: &Reactivity,
         theme: &crate::palette::Theme,
     ) {
-        self.advance(time, audio);
         if area.width == 0 || area.height == 0 {
             return;
         }
         let (family, local) = scene_route(scene);
         match family {
             Family::Original => {
+                // Rotation, expansion and impact state belong only to the
+                // original seven scenes. New families keep their own clocks.
+                self.advance(time, audio);
                 self.draw_original(buf, area, time, local, palette, bands, audio, theme)
             }
             Family::Glyphs => self
@@ -1064,6 +1066,38 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_original_scenes_advance_the_shared_state() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let mut renderer = Renderer::default();
+        renderer.draw(
+            &mut buffer,
+            area,
+            1.0,
+            120,
+            0,
+            &[0.4; 32],
+            &Reactivity::default(),
+            &crate::palette::Theme::default(),
+        );
+        assert_eq!(renderer.rotation, 0.0);
+        assert!(renderer.impacts.is_empty());
+        assert_eq!(renderer.last_time, None);
+
+        renderer.draw(
+            &mut buffer,
+            area,
+            1.0,
+            0,
+            0,
+            &[0.4; 32],
+            &Reactivity::default(),
+            &crate::palette::Theme::default(),
+        );
+        assert_eq!(renderer.last_time, Some(1.0));
+    }
 
     #[test]
     fn soft_scenes_use_continuous_half_block_shading() {
