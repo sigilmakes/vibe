@@ -36,6 +36,9 @@ pub struct Renderer {
     env: [f32; ENV],
     /// Smoothed chroma hue, so noise does not flicker the palette.
     chroma: f32,
+    /// Fast attack envelope. Rises with a kick or onset and releases in about
+    /// a fifth of a second, so threads snap tight and then relax.
+    strike: f32,
 }
 
 fn unit(v: f32) -> f32 {
@@ -118,11 +121,20 @@ impl Renderer {
             *value += (target - *value) * follow;
         }
         self.chroma = approach_hue(self.chroma, chroma_hue(audio), (dt * 8.0).min(1.0));
-        self.phase = (self.phase + dt * (0.4 + unit(audio.energy) * 1.2 + self.env[1] * 0.5))
+        let strike = unit(audio.kick)
+            .max(unit(audio.onset))
+            .max(unit(audio.transients[0]))
+            .max(unit(audio.transients[1]) * 0.7);
+        self.strike = (self.strike * (-dt * 5.0).exp()).max(strike);
+        // A loom is nearly still between hits; cloth only moves when the
+        // music does.
+        self.phase = (self.phase
+            + dt * (0.10 + unit(audio.energy) * 1.5 + self.env[1] * 0.5 + self.strike * 0.7))
             .rem_euclid(TAU * 16.0);
         // No modular reset: scroll feeds sines with many different rates, so a
         // wrap would snap every woven band at once.
-        self.scroll += dt * (0.45 + unit(audio.energy) * 1.3 + self.env[3] * 0.4);
+        self.scroll +=
+            dt * (0.12 + unit(audio.energy) * 1.6 + self.env[3] * 0.4 + self.strike * 0.6);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -146,6 +158,7 @@ impl Renderer {
         let t = self.phase;
         let scroll = self.scroll;
         let [bass, mid, treble, kick, onset, centroid, flatness] = self.env;
+        let strike = self.strike;
         let energy = unit(audio.energy);
         let beat = unit(audio.beat);
         let beat_phase = if audio.locked_beat_phase().is_finite() {
@@ -209,9 +222,12 @@ impl Renderer {
                         (bright, hue.rem_euclid(1.0), glyph)
                     }
                     1 => {
-                        // Stockinette: staggered rows of V stitches.
-                        let sw = 4.2 - bass * 0.8;
-                        let sh = 2.6 + mid * 0.7;
+                        // Stockinette: staggered rows of V stitches. A hit
+                        // pulls the V tight and long, the way a knitted loop
+                        // stretches when the yarn is yanked.
+                        let tighten = 1.0 - 0.3 * strike;
+                        let sw = (4.4 - bass * 0.9) * tighten;
+                        let sh = (2.9 + mid * 0.8) * (1.0 - 0.18 * strike);
                         let row_f = gy / sh;
                         let stitch_row = row_f.floor();
                         let offset = if (stitch_row as i32) & 1 == 0 {
@@ -223,13 +239,10 @@ impl Renderer {
                         let ix = sx.floor();
                         let fx = (sx - ix) * sw;
                         let fy = (row_f - stitch_row) * sh;
-                        let bottom = [sw * 0.5, sh * 0.82];
-                        let thick = 0.62 + 0.15 * bass;
-                        let d = seg_dist([fx, fy], [0.5, 0.35], bottom).min(seg_dist(
-                            [fx, fy],
-                            [sw - 0.5, 0.35],
-                            bottom,
-                        ));
+                        let bottom = [sw * 0.5, sh * (0.78 + 0.2 * strike)];
+                        let thick = 0.56 + 0.26 * energy + 0.12 * bass + 0.18 * strike;
+                        let d = seg_dist([fx, fy], [0.5, 0.2 + 0.1 * strike], bottom)
+                            .min(seg_dist([fx, fy], [sw - 0.5, 0.2 + 0.1 * strike], bottom));
                         let s = (1.0 - d / thick).clamp(0.0, 1.0);
                         let hue = chroma * 0.45 + stitch_row * 0.03 + 0.12;
                         let glyph = if s > 0.0 {
@@ -241,7 +254,7 @@ impl Renderer {
                         } else {
                             ' '
                         };
-                        let bright = s * (0.55 + 0.25 * energy + 0.2 * band);
+                        let bright = s * (0.5 + 0.3 * energy + 0.2 * band + 0.15 * strike);
                         (bright, hue.rem_euclid(1.0), glyph)
                     }
                     2 => {
@@ -482,8 +495,8 @@ impl Renderer {
                         // Three strands crossing in repeating braid lanes.
                         let braids = 2.0 + bass.round();
                         let lv = (v * braids).rem_euclid(1.0);
-                        let phase = u * TAU * 1.15 + scroll * 0.8 + beat * 0.15;
-                        let width = 0.1 + 0.03 * bass;
+                        let phase = u * TAU * 1.15 + scroll * 0.8 + beat * 0.15 + strike * 0.35;
+                        let width = 0.09 + 0.03 * bass + 0.03 * energy + 0.04 * strike;
                         let mut best = 0.0;
                         let mut hue = 0.0;
                         let mut glyph = ' ';
@@ -504,29 +517,33 @@ impl Renderer {
                     }
                     8 => {
                         // Warp under tension: vertical threads bent toward a
-                        // vibrating pluck point.
-                        let spacing = 4.0 + treble * 1.5;
+                        // vibrating pluck point. A hit draws the warp in and
+                        // plucks it, then the cloth settles back to rest.
+                        let spacing = (4.6 - treble * 1.2 - strike * 1.3).max(2.6);
                         let tx = gx / spacing;
                         let idx = tx.round();
                         let base = idx * spacing;
-                        let pluck_y = 0.42 + 0.12 * (beat_phase * TAU).sin() + 0.03 * beat;
-                        let dy = (v - pluck_y) / (0.16 + 0.05 * bass);
+                        let pluck_y = 0.42 + 0.12 * (beat_phase * TAU).sin() + 0.04 * strike;
+                        let dy = (v - pluck_y) / (0.16 + 0.05 * bass + 0.04 * strike);
                         let shape = (-dy * dy).exp();
-                        let amp = (0.15 + 0.35 * kick + 0.2 * onset) * shape;
+                        let amp = (0.03 + 0.5 * strike + 0.2 * kick) * shape;
                         let wob =
                             amp * (t * 2.0 + idx * 0.55).sin() + 0.04 * (v * 9.0 + idx * 0.4).sin();
                         let center = base + wob * spacing;
                         let d = (gx - center).abs();
-                        let width = 0.55 + 0.2 * bass;
+                        // Energy fattens the yarn; a hit thins it as it pulls.
+                        let width = 0.55 + 0.2 * energy + 0.1 * bass + 0.05 * strike;
                         let thread = (1.0 - d / width).clamp(0.0, 1.0);
-                        let tension =
-                            0.7 + 0.3 * (v * (28.0 + mid * 16.0) - scroll * 3.0).sin().abs();
+                        // Taut on the hit (little ripple), slack between hits.
+                        let slack = 1.0 - 0.6 * strike;
+                        let tension = 1.0
+                            - 0.3 * slack * (v * (26.0 + mid * 14.0) - scroll * 3.0).sin().abs();
                         let px = (u - 0.5) * aspect;
                         let py = v - pluck_y;
                         let glow = (-(px * px + py * py) / 0.004).exp()
-                            * (0.3 + 0.5 * kick + 0.3 * transient);
+                            * (0.25 + 0.55 * strike + 0.3 * transient);
                         let hue = chroma * 0.45 + idx * 0.03 + 0.1;
-                        let bright = thread * (0.45 + 0.3 * energy + 0.2 * band) * tension + glow;
+                        let bright = thread * (0.4 + 0.3 * energy + 0.2 * band) * tension + glow;
                         let glyph = if glow > 0.35 {
                             '✦'
                         } else if (gx - center).abs() < 0.3 {
@@ -540,29 +557,31 @@ impl Renderer {
                     }
                     _ => {
                         // Macrame: thick diamond cords tied at square knots,
-                        // with a swaying fringe below.
+                        // with a swaying fringe below. A hit draws the lattice
+                        // in, thickens the cord and swings the fringe.
                         let x = u * aspect;
-                        let y = v;
-                        let cell = 0.42 + 0.05 * bass;
+                        // A pull stretches the diamonds vertically.
+                        let y = v * (1.0 + 0.14 * strike);
+                        let cell = (0.44 + 0.05 * bass) * (1.0 - 0.22 * strike);
                         let a = (x / cell + y / cell).rem_euclid(1.0) - 0.5;
                         let b = (x / cell - y / cell).rem_euclid(1.0) - 0.5;
-                        let lw = 0.12 + 0.04 * mid;
+                        let lw = 0.12 + 0.06 * energy + 0.03 * mid + 0.05 * strike;
                         let la = (1.0 - a.abs() / lw).clamp(0.0, 1.0);
                         let lb = (1.0 - b.abs() / lw).clamp(0.0, 1.0);
                         let knot = (la * lb * 4.0).min(1.0);
                         let cord = la.max(lb);
-                        let fringe = if y > 0.82 {
+                        let fringe = if v > 0.82 {
                             let spacing = 0.14 + treble * 0.03;
-                            let sway = 0.15 * (t + y * 6.0).sin();
+                            let sway = (0.06 + 0.3 * strike) * (t + v * 6.0).sin();
                             let fx = (x / spacing + sway).rem_euclid(1.0);
                             let f = (1.0 - (fx - 0.5).abs() / 0.3).clamp(0.0, 1.0);
-                            f * ((y - 0.82) / 0.18).clamp(0.0, 1.0)
+                            f * ((v - 0.82) / 0.18).clamp(0.0, 1.0)
                         } else {
                             0.0
                         };
                         let hue = chroma * 0.5 + (a + b) * 0.1 + 0.2;
                         let bright = cord * (0.4 + 0.3 * energy + 0.2 * band)
-                            + knot * (0.35 + 0.35 * onset + 0.2 * transient)
+                            + knot * (0.35 + 0.35 * onset + 0.2 * transient + 0.15 * strike)
                             + fringe * (0.3 + 0.25 * treble);
                         let glyph = if knot > 0.35 {
                             '╳'
@@ -747,6 +766,215 @@ mod tests {
             let first = symbols(&render(style, &loud(), 24));
             let second = symbols(&render(style, &loud(), 24));
             assert_eq!(first, second, "style {style} was not deterministic");
+        }
+    }
+
+    /// A bar-length audio pulse: a hard hit every half second with a drifting
+    /// spectrum in between.
+    fn music(frame: usize) -> Reactivity {
+        let hit = if frame % 30 < 2 { 1.0 } else { 0.05 };
+        let swing = 0.5 + 0.5 * (frame as f32 * 0.07).sin();
+        Reactivity {
+            energy: 0.45 + 0.4 * swing,
+            bass: 0.3 + 0.5 * hit,
+            mid: 0.25 + 0.3 * swing,
+            treble: 0.2 + 0.5 * swing,
+            onset: hit,
+            kick: hit,
+            beat: hit,
+            beat_phase: (frame as f32 / 30.0).fract(),
+            tempo_confidence: 0.8,
+            transients: [hit, hit * 0.5, 0.2, 0.1],
+            chroma: std::array::from_fn(|i| (i % 3) as f32 / 2.0),
+            centroid: 0.5 + 0.2 * swing,
+            flatness: 0.4,
+            ..Reactivity::default()
+        }
+    }
+
+    fn glyphs(buf: &Buffer) -> Vec<char> {
+        buf.content
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn ink(glyphs: &[char]) -> f32 {
+        glyphs.iter().filter(|c| **c != ' ').count() as f32 / glyphs.len() as f32
+    }
+
+    /// Median ink and median frame-to-frame glyph change over a timeline.
+    fn motion(style: usize, audio: &dyn Fn(usize) -> Reactivity) -> (f32, f32) {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        let mut moves = Vec::new();
+        let mut inks = Vec::new();
+        let mut prev: Vec<char> = Vec::new();
+        for frame in 0..150 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                style,
+                0,
+                &[0.4; 32],
+                &audio(frame),
+                &Theme::default(),
+            );
+            let current = glyphs(&buf);
+            inks.push(ink(&current));
+            if !prev.is_empty() {
+                moves.push(
+                    current
+                        .iter()
+                        .zip(prev.iter())
+                        .filter(|(a, b)| a != b)
+                        .count() as f32
+                        / current.len() as f32,
+                );
+            }
+            prev = current;
+        }
+        moves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        inks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (moves[moves.len() / 2], inks[inks.len() / 2])
+    }
+
+    #[test]
+    fn thread_scenes_fatten_with_energy() {
+        let calm = Reactivity {
+            energy: 0.15,
+            ..Reactivity::default()
+        };
+        let hot = Reactivity {
+            energy: 0.95,
+            ..Reactivity::default()
+        };
+        for style in [1usize, 8, 9] {
+            let calm_ink = ink(&glyphs(&render(style, &calm, 48)));
+            let hot_ink = ink(&glyphs(&render(style, &hot, 48)));
+            assert!(
+                hot_ink > calm_ink * 1.15,
+                "{} kept {calm_ink:.3} ink at {hot_ink:.3} under energy",
+                NAMES[style]
+            );
+        }
+    }
+
+    #[test]
+    fn kicks_pull_the_threads_out_of_shape() {
+        let rest = Reactivity {
+            energy: 0.5,
+            bass: 0.4,
+            mid: 0.3,
+            ..Reactivity::default()
+        };
+        let hit = Reactivity {
+            kick: 1.0,
+            onset: 1.0,
+            ..rest
+        };
+        for style in [1usize, 8, 9] {
+            let calm = glyphs(&render(style, &rest, 60));
+            let struck = glyphs(&render(style, &hit, 60));
+            let changed = calm
+                .iter()
+                .zip(struck.iter())
+                .filter(|(a, b)| a != b)
+                .count() as f32
+                / calm.len() as f32;
+            assert!(
+                changed > 0.05,
+                "{} changed {:.3} of its cells on a kick",
+                NAMES[style],
+                changed
+            );
+        }
+    }
+
+    #[test]
+    fn idle_loom_stays_quiet() {
+        for style in [1usize, 7, 8, 9] {
+            let quiet = motion(style, &|_| Reactivity::default());
+            let loud = motion(style, &music);
+            assert!(
+                loud.0 > 0.01,
+                "{} barely moved under music: {:.4}",
+                NAMES[style],
+                loud.0
+            );
+            assert!(
+                quiet.0 < loud.0 * 0.35,
+                "{} moved {:.1}% as much in silence",
+                NAMES[style],
+                quiet.0 / loud.0 * 100.0
+            );
+        }
+    }
+
+    #[test]
+    fn strike_rises_on_a_hit_and_releases() {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        let hit = Reactivity {
+            kick: 1.0,
+            onset: 1.0,
+            ..Reactivity::default()
+        };
+        renderer.draw(
+            &mut buf,
+            AREA,
+            0.0,
+            8,
+            0,
+            &[0.4; 32],
+            &hit,
+            &Theme::default(),
+        );
+        assert!(
+            renderer.strike > 0.9,
+            "kick only raised the strike to {:.3}",
+            renderer.strike
+        );
+        for frame in 1..=30 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                8,
+                0,
+                &[0.4; 32],
+                &Reactivity::default(),
+                &Theme::default(),
+            );
+        }
+        assert!(
+            renderer.strike < 0.2,
+            "strike held at {:.3} after half a second",
+            renderer.strike
+        );
+    }
+
+    #[test]
+    fn thread_scenes_stay_bounded_under_extremes() {
+        let wild = Reactivity {
+            energy: 1.0,
+            bass: f32::INFINITY,
+            mid: f32::NAN,
+            treble: 1.0,
+            kick: 1.0,
+            onset: 1.0,
+            beat: f32::NAN,
+            transients: [f32::NAN; 4],
+            ..Reactivity::default()
+        };
+        for style in [1usize, 8, 9] {
+            let drawn = ink(&glyphs(&render(style, &wild, 60)));
+            assert!(
+                (0.05..0.95).contains(&drawn),
+                "{} drew {drawn:.3} ink under extreme audio",
+                NAMES[style]
+            );
         }
     }
 

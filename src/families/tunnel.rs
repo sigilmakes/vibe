@@ -37,6 +37,9 @@ pub struct Renderer {
     env: [f32; ENV],
     /// Smoothed chroma hue, so noise does not flicker the palette.
     chroma: f32,
+    /// Drop envelope: rises on an attack and releases over about half a
+    /// second, so the throat pinches and then reopens.
+    attack: f32,
 }
 
 fn unit(v: f32) -> f32 {
@@ -118,6 +121,11 @@ impl Renderer {
             *value += (target - *value) * follow;
         }
         self.chroma = approach_hue(self.chroma, chroma_hue(audio), (dt * 8.0).min(1.0));
+        let hit = unit(audio.onset)
+            .max(unit(audio.kick))
+            .max(unit(audio.transients[0]))
+            .max(unit(audio.novelty) * 0.8);
+        self.attack = (self.attack * (-dt * 1.8).exp()).max(hit);
         self.phase = (self.phase + dt * (0.4 + unit(audio.energy) * 1.2 + self.env[1] * 0.5))
             .rem_euclid(TAU * 16.0);
         // No modular reset: scroll feeds sines with many different rates, so a
@@ -146,6 +154,7 @@ impl Renderer {
         let t = self.phase;
         let scroll = self.scroll;
         let [bass, mid, treble, kick, onset, centroid, flatness] = self.env;
+        let attack = self.attack;
         let energy = unit(audio.energy);
         let beat = unit(audio.beat);
         let beat_phase = if audio.locked_beat_phase().is_finite() {
@@ -230,31 +239,41 @@ impl Renderer {
                     2 => {
                         let r = px.hypot(py).max(1e-3);
                         let th = py.atan2(px);
+                        // A drop pinches the throat shut, then it springs back.
+                        let collapse = 1.0 - 0.7 * attack;
                         let pulse = 0.05 * kick + 0.02 * beat;
-                        let r0 = 0.12 + pulse;
-                        let spacing = 0.14 + mid * 0.035;
+                        let r0 = (0.12 + pulse) * collapse;
+                        // Bass deepens the well: the rings pack toward the
+                        // throat instead of sitting at a fixed radius.
+                        let spacing =
+                            (0.14 + mid * 0.035) * (1.0 - 0.25 * bass) * (1.0 - 0.3 * attack);
                         let k = ((r - r0) / spacing).clamp(0.0, 9.0).round();
-                        let ring_r = r0 + k * spacing + 0.012 * kick * ((k as usize) % 3) as f32;
+                        let ring_r = r0 + k * spacing + 0.014 * kick * ((k as usize) % 3) as f32;
                         let d = (r - ring_r).abs();
-                        let ring = (1.0 - d / (0.036 + 0.014 * treble)).clamp(0.0, 1.0);
+                        let ring = (1.0 - d / (0.04 + 0.015 * treble)).clamp(0.0, 1.0);
                         let su = th / TAU * 20.0;
                         let spoke = (1.0 - (su - su.round()).abs() * 2.0)
                             .clamp(0.0, 1.0)
                             .powf(5.0)
                             * if r > r0 { 1.0 } else { 0.0 }
-                            * (0.25 + treble * 0.75);
+                            * (0.3 + treble * 0.7);
                         let core =
                             (-(r / (0.08 + 0.04 * bass)).powi(2)).exp() * (0.5 + onset * 0.5);
-                        let bright = (ring * 0.9 + spoke * 0.35 + core * 0.9)
+                        // A dim wash between the rings keeps the portal legible
+                        // on a dark terminal instead of leaving black gaps.
+                        let haze = (0.07 + 0.11 * energy + 0.05 * band)
+                            * (-(r / 1.3).powi(2)).exp()
+                            * (1.0 - 0.5 * attack);
+                        let bright = (ring * 0.95 + spoke * 0.35 + core * 0.9 + haze * 0.5)
                             * (0.55 + energy * 0.3 + band * 0.2);
                         let glyph = if core > 0.55 && r < r0 * 0.7 {
                             '●'
-                        } else if ring > 0.35 {
+                        } else if ring > 0.3 {
                             '◎'
                         } else if spoke > 0.2 {
                             '·'
                         } else {
-                            ' '
+                            fill_char(bright)
                         };
                         let hue = (0.1 * k + chroma * 0.5 + th / TAU * 0.2 + 0.12).rem_euclid(1.0);
                         (bright, hue, glyph)
@@ -380,57 +399,94 @@ impl Renderer {
                     6 => {
                         let r = px.hypot(py).max(1e-3);
                         let th = py.atan2(px);
-                        let hole = 0.24 + 0.07 * bass + 0.04 * kick;
+                        // The well deepens with bass; a drop collapses the
+                        // throat and the rim rushes inward.
+                        let depth = 1.0 + 1.1 * bass + 0.35 * attack;
+                        let hole = (0.24 + 0.07 * bass + 0.04 * kick) * (1.0 - 0.75 * attack);
                         let outside = (r - hole).max(0.0);
-                        let edge = (1.0 - (outside / 1.05).min(1.0)).max(0.0);
+                        let reach = 1.05 * depth;
+                        let edge = (1.0 - (outside / reach).min(1.0)).max(0.0);
                         let fade = edge * edge * (3.0 - 2.0 * edge) * 0.8;
                         let rim = if r >= hole {
-                            (-(outside / (0.045 + 0.02 * kick)).powi(2)).exp()
+                            (-(outside / (0.055 + 0.025 * kick + 0.03 * attack)).powi(2)).exp()
                         } else {
                             0.0
                         };
-                        let spacing = 9.0 + mid * 3.0;
-                        let ripple = (outside * spacing - scroll * 4.0 + 0.5 * (th * 2.0).sin())
+                        let spacing = (9.0 + mid * 3.0) / depth;
+                        let wave = (outside * spacing - scroll * 4.0 + 0.5 * (th * 2.0).sin())
                             .sin()
                             .abs()
-                            .powf(5.0)
-                            * fade;
-                        let glow = (-outside * 6.0).exp() * 0.1;
-                        let bright =
-                            rim * (0.85 + onset * 0.15) + glow + ripple * (0.32 + treble * 0.25);
-                        let glyph = if rim > 0.6 { '●' } else { fill_char(bright) };
+                            .powf(3.0);
+                        // The ripple keeps a visible floor, so the well reads as
+                        // concentric depth rather than isolated specks.
+                        let ripple = (0.12 + 0.88 * wave) * fade;
+                        let glow = (-outside * 6.0).exp() * 0.16;
+                        let bright = rim * (0.9 + onset * 0.1)
+                            + glow
+                            + ripple * (0.55 + treble * 0.3 + energy * 0.2);
+                        let glyph = if rim > 0.6 {
+                            '●'
+                        } else if ripple > 0.5 {
+                            '◎'
+                        } else if bright > 0.03 {
+                            fill_char(bright)
+                        } else {
+                            ' '
+                        };
                         let hue = (0.5 + chroma * 0.5 + outside * 0.15).rem_euclid(1.0);
                         (bright, hue, glyph)
                     }
                     7 => {
                         let r = px.hypot(py).max(1e-3);
                         let th = py.atan2(px);
-                        let rad = 0.22 + 0.06 * kick + 0.02 * beat;
+                        // The horizon shrinks on a drop and grows back with the
+                        // bass, so the hole breathes instead of sitting still.
+                        let rad = (0.26 + 0.12 * bass + 0.06 * kick + 0.03 * beat)
+                            * (1.0 - 0.55 * attack);
                         let inside = r < rad;
-                        let disk_w = 0.09 + 0.06 * bass;
+                        let disk_w = (0.12 + 0.09 * bass) * (1.0 + 0.5 * bass);
                         let ellipse =
-                            ((px / (1.9 * rad.max(0.1))).powi(2) + (py / disk_w).powi(2)).sqrt();
-                        let band = (-((ellipse - 1.0) / (0.3 + 0.15 * bass)).powi(2)).exp();
+                            ((px / (2.6 * rad.max(0.1))).powi(2) + (py / disk_w).powi(2)).sqrt();
+                        let band = (-((ellipse - 1.0) / (0.32 + 0.18 * bass)).powi(2)).exp();
                         let swirl = 0.55 + 0.45 * (th * 3.0 - r * 12.0 + scroll * 2.2).sin();
-                        let photon = (-((r - rad * 1.03) / (0.035 + 0.012 * treble)).powi(2)).exp();
+                        let photon = (-((r - rad * 1.03) / (0.04 + 0.014 * treble)).powi(2)).exp();
+                        let lens = (-((r - rad * 3.3) / (0.03 + 0.015 * treble)).powi(2)).exp()
+                            * (0.3 + 0.4 * swirl);
                         let flare = (-((r - rad * 1.6) / (0.03 + 0.05 * transient)).powi(2)).exp()
                             * transient
                             * 0.7;
+                        // The drop releases a shell that travels outward as the
+                        // attack envelope decays.
+                        let shock_r = rad * 1.9 + (1.0 - attack) * 1.4;
+                        let shock =
+                            (-((r - shock_r) / (0.05 + 0.08 * attack)).powi(2)).exp() * attack;
                         let halo = (-((r - rad * 2.2) / (0.5 + 0.3 * bass)).powi(2)).exp()
                             * (-((py / (0.16 + 0.12 * bass)).powi(2))).exp()
                             * 0.3;
+                        // A dim dust field fills the frame around the disk.
+                        let haze = (0.16 + 0.12 * energy) * (-(r / 2.0).powi(2)).exp();
                         let bright = if inside {
                             0.0
                         } else {
-                            (band * (0.5 + 0.4 * swirl) + photon * 0.9 + flare + halo)
-                                * (0.65 + energy * 0.35)
+                            (band * (0.75 + 0.3 * swirl)
+                                + photon * 0.9
+                                + lens * 0.5
+                                + flare
+                                + shock * 0.7
+                                + halo
+                                + haze * 0.4)
+                                * (0.85 + energy * 0.25)
                         };
                         let glyph = if inside {
                             ' '
                         } else if photon > 0.5 {
                             '█'
-                        } else if band > 0.35 {
+                        } else if shock > 0.4 {
+                            '●'
+                        } else if band > 0.5 {
                             '▒'
+                        } else if band > 0.05 {
+                            fill_char(bright)
                         } else {
                             '·'
                         };
@@ -440,7 +496,12 @@ impl Renderer {
                     8 => {
                         let th = py.atan2(px);
                         let ang = t * 0.5 + scroll * 0.25 + beat_phase * 0.5;
-                        let pulse = 1.0 + kick * 0.13 + beat * 0.06;
+                        // A drop collapses the lane: every square shrinks
+                        // toward the vanishing point, then expands again.
+                        let pulse = (1.0 + kick * 0.13 + beat * 0.06) * (1.0 - 0.4 * attack);
+                        // Bass opens the corridor; energy and treble thicken
+                        // its walls.
+                        let shrink = 0.7 - 0.08 * bass;
                         let mut bright = 0.0;
                         let mut glyph = ' ';
                         let mut nearest = 0usize;
@@ -451,11 +512,12 @@ impl Renderer {
                             let y = px * s + py * c;
                             let m = x.abs().max(y.abs());
                             let radius = 1.15
-                                * 0.7f32.powi(k as i32)
+                                * shrink.powi(k as i32)
                                 * pulse
                                 * (1.0 + 0.05 * (scroll * 0.8 + k as f32 * 1.7).sin());
                             let d = (m - radius).abs();
-                            let line = (1.0 - d / (0.04 + 0.012 * treble)).clamp(0.0, 1.0)
+                            let line = (1.0 - d / (0.055 + 0.02 * energy + 0.015 * treble))
+                                .clamp(0.0, 1.0)
                                 * (1.0 - k as f32 * 0.07);
                             if line > bright {
                                 bright = line;
@@ -472,8 +534,24 @@ impl Renderer {
                             bright = lane;
                             glyph = line_glyph([px, py]);
                         }
+                        // A faint lattice between the squares gives the lane a
+                        // floor, so the corridor reads as structure, not wires.
+                        let step = 0.16 + 0.14 * px.hypot(py);
+                        let lx = (px / step).round();
+                        let ly = (py / step).round();
+                        let node = if (px / step - lx).abs() < 0.16 && (py / step - ly).abs() < 0.16
+                        {
+                            0.28 + 0.16 * energy
+                        } else {
+                            0.0
+                        };
+                        let (bright, glyph) = if node > bright * 0.6 {
+                            (node, '·')
+                        } else {
+                            (bright, glyph)
+                        };
                         let bright = bright
-                            * (0.45 + energy * 0.3 + band * 0.25)
+                            * (0.5 + energy * 0.3 + band * 0.2)
                             * (1.0 - (px.hypot(py) / 3.0).min(0.8));
                         let hue = (chroma * 0.6 + nearest as f32 * 0.08 + 0.1).rem_euclid(1.0);
                         (bright, hue, glyph)
@@ -691,6 +769,290 @@ mod tests {
             let first = symbols(&render(style, &loud(), 24));
             let second = symbols(&render(style, &loud(), 24));
             assert_eq!(first, second, "style {style} was not deterministic");
+        }
+    }
+
+    /// A bar-length audio pulse: a hard hit every half second with a drifting
+    /// spectrum in between.
+    fn music(frame: usize) -> Reactivity {
+        let hit = if frame % 30 < 2 { 1.0 } else { 0.05 };
+        let swing = 0.5 + 0.5 * (frame as f32 * 0.07).sin();
+        Reactivity {
+            energy: 0.45 + 0.4 * swing,
+            bass: 0.3 + 0.5 * hit,
+            mid: 0.25 + 0.3 * swing,
+            treble: 0.2 + 0.5 * swing,
+            onset: hit,
+            kick: hit,
+            beat: hit,
+            beat_phase: (frame as f32 / 30.0).fract(),
+            tempo_confidence: 0.8,
+            transients: [hit, hit * 0.5, 0.2, 0.1],
+            chroma: std::array::from_fn(|i| (i % 3) as f32 / 2.0),
+            centroid: 0.5 + 0.2 * swing,
+            flatness: 0.4,
+            ..Reactivity::default()
+        }
+    }
+
+    fn glyphs(buf: &Buffer) -> Vec<char> {
+        buf.content
+            .iter()
+            .map(|cell| cell.symbol().chars().next().unwrap_or(' '))
+            .collect()
+    }
+
+    fn ink(glyphs: &[char]) -> f32 {
+        glyphs.iter().filter(|c| **c != ' ').count() as f32 / glyphs.len() as f32
+    }
+
+    /// Median ink and median frame-to-frame glyph change over a timeline.
+    fn motion(style: usize, audio: &dyn Fn(usize) -> Reactivity) -> (f32, f32) {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        let mut moves = Vec::new();
+        let mut inks = Vec::new();
+        let mut prev: Vec<char> = Vec::new();
+        for frame in 0..150 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                style,
+                0,
+                &[0.4; 32],
+                &audio(frame),
+                &Theme::default(),
+            );
+            let current = glyphs(&buf);
+            inks.push(ink(&current));
+            if !prev.is_empty() {
+                moves.push(
+                    current
+                        .iter()
+                        .zip(prev.iter())
+                        .filter(|(a, b)| a != b)
+                        .count() as f32
+                        / current.len() as f32,
+                );
+            }
+            prev = current;
+        }
+        moves.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        inks.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (moves[moves.len() / 2], inks[inks.len() / 2])
+    }
+
+    /// A frame settled in silence, optionally followed by the first frames of
+    /// a drop.
+    fn settled(style: usize, drop: bool) -> Buffer {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        let quiet = Reactivity::default();
+        for frame in 0..60 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                style,
+                0,
+                &[0.4; 32],
+                &quiet,
+                &Theme::default(),
+            );
+        }
+        if drop {
+            let hit = Reactivity {
+                energy: 1.0,
+                onset: 1.0,
+                kick: 1.0,
+                transients: [1.0; 4],
+                ..Reactivity::default()
+            };
+            for frame in 60..63 {
+                renderer.draw(
+                    &mut buf,
+                    AREA,
+                    frame as f32 / 60.0,
+                    style,
+                    0,
+                    &[0.4; 32],
+                    &hit,
+                    &Theme::default(),
+                );
+            }
+        }
+        buf
+    }
+
+    /// Ink in the middle third of the frame, where a throat closes.
+    fn throat_ink(buf: &Buffer) -> f32 {
+        let mut ink = 0;
+        let mut total = 0;
+        for row in AREA.y + AREA.height / 3..AREA.y + AREA.height * 2 / 3 {
+            for col in AREA.x + AREA.width / 3..AREA.x + AREA.width * 2 / 3 {
+                total += 1;
+                if buf[(col, row)].symbol() != " " {
+                    ink += 1;
+                }
+            }
+        }
+        ink as f32 / total as f32
+    }
+
+    /// Distance from the centre to the first lit cell along the middle row.
+    fn throat_radius(buf: &Buffer) -> usize {
+        let row = AREA.y + AREA.height / 2;
+        let cx = AREA.x + AREA.width / 2;
+        (1..AREA.width / 2)
+            .find(|d| buf[(cx + d, row)].symbol() != " " || buf[(cx - d, row)].symbol() != " ")
+            .unwrap_or(0) as usize
+    }
+
+    #[test]
+    fn named_tunnel_scenes_keep_a_readable_ink_floor() {
+        for style in [2usize, 6, 7, 8] {
+            let quiet = motion(style, &|_| Reactivity::default()).1;
+            let loud = motion(style, &music).1;
+            assert!(
+                quiet >= 0.24,
+                "{} drew {quiet:.3} ink in silence",
+                NAMES[style]
+            );
+            assert!(
+                loud >= 0.24,
+                "{} drew {loud:.3} ink under music",
+                NAMES[style]
+            );
+        }
+    }
+
+    #[test]
+    fn bass_deepens_every_named_tunnel() {
+        let shallow = Reactivity {
+            bass: 0.1,
+            ..Reactivity::default()
+        };
+        let deep = Reactivity {
+            bass: 0.9,
+            ..Reactivity::default()
+        };
+        for style in [2usize, 6, 7, 8] {
+            let calm = glyphs(&render(style, &shallow, 60));
+            let lowered = glyphs(&render(style, &deep, 60));
+            let changed = calm
+                .iter()
+                .zip(lowered.iter())
+                .filter(|(a, b)| a != b)
+                .count() as f32
+                / calm.len() as f32;
+            assert!(
+                changed > 0.08,
+                "{} changed {:.3} of its cells with bass",
+                NAMES[style],
+                changed
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_collapses_the_named_throats() {
+        for style in [2usize, 6, 7, 8] {
+            let calm = glyphs(&settled(style, false));
+            let hit = glyphs(&settled(style, true));
+            let changed = calm.iter().zip(hit.iter()).filter(|(a, b)| a != b).count() as f32
+                / calm.len() as f32;
+            assert!(
+                changed > 0.08,
+                "{} changed {:.3} of its cells on a drop",
+                NAMES[style],
+                changed
+            );
+        }
+        // The black hole's shadow shrinks, and the portal and lane pull more
+        // material into the throat.
+        let calm = settled(7, false);
+        let hit = settled(7, true);
+        assert!(
+            throat_radius(&hit) < throat_radius(&calm),
+            "event horizon throat grew from {} to {}",
+            throat_radius(&calm),
+            throat_radius(&hit)
+        );
+        for style in [2usize, 8] {
+            let calm = throat_ink(&settled(style, false));
+            let hit = throat_ink(&settled(style, true));
+            assert!(
+                hit > calm,
+                "{} throat went from {calm:.3} to {hit:.3} ink on a drop",
+                NAMES[style]
+            );
+        }
+    }
+
+    #[test]
+    fn attack_rises_on_a_drop_and_releases() {
+        let mut renderer = Renderer::default();
+        let mut buf = Buffer::empty(AREA);
+        let hit = Reactivity {
+            onset: 1.0,
+            kick: 1.0,
+            ..Reactivity::default()
+        };
+        renderer.draw(
+            &mut buf,
+            AREA,
+            0.0,
+            7,
+            0,
+            &[0.4; 32],
+            &hit,
+            &Theme::default(),
+        );
+        assert!(
+            renderer.attack > 0.9,
+            "drop only raised the attack to {:.3}",
+            renderer.attack
+        );
+        for frame in 1..=90 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                7,
+                0,
+                &[0.4; 32],
+                &Reactivity::default(),
+                &Theme::default(),
+            );
+        }
+        assert!(
+            renderer.attack < 0.2,
+            "attack held at {:.3} after 1.5 s",
+            renderer.attack
+        );
+    }
+
+    #[test]
+    fn named_tunnel_scenes_stay_bounded_under_extremes() {
+        let wild = Reactivity {
+            energy: 1.0,
+            bass: f32::INFINITY,
+            mid: f32::NAN,
+            treble: 1.0,
+            onset: 1.0,
+            kick: 1.0,
+            beat: f32::NAN,
+            transients: [f32::NAN; 4],
+            ..Reactivity::default()
+        };
+        for style in [2usize, 6, 7, 8] {
+            let drawn = ink(&glyphs(&render(style, &wild, 60)));
+            assert!(
+                (0.05..0.98).contains(&drawn),
+                "{} drew {drawn:.3} ink under extreme audio",
+                NAMES[style]
+            );
         }
     }
 
