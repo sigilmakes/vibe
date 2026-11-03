@@ -635,6 +635,10 @@ impl Capture {
         let worker_stderr = Arc::clone(&stderr);
         let worker_info = source;
         let format = config.format;
+        // A raw file has no pacing of its own, so without this the analysis
+        // runs as fast as the CPU and the visuals see a 30x time-compressed
+        // stream. Live pipes and commands block on their own writer.
+        let paced = matches!(config.backend, Backend::File(_));
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker = thread::Builder::new()
@@ -643,6 +647,8 @@ impl Capture {
                 let mut analyzer = Analyzer::with_sample_rate(format.rate as usize);
                 let mut bytes = vec![0_u8; HOP * format.frame_bytes()];
                 let mut samples = [0.0_f32; HOP];
+                let hop_time = Duration::from_secs_f64(HOP as f64 / format.rate as f64);
+                let mut next_hop = Instant::now();
                 loop {
                     // A dropped capture stops a looping file reader, which
                     // otherwise keeps decoding into state nobody reads.
@@ -680,6 +686,15 @@ impl Capture {
                         *state = analyzed;
                     } else {
                         break;
+                    }
+                    if paced {
+                        next_hop += hop_time;
+                        if let Some(wait) = next_hop.checked_duration_since(Instant::now()) {
+                            thread::sleep(wait);
+                        } else {
+                            // A slow reader must not accumulate a burst to catch up.
+                            next_hop = Instant::now() + hop_time;
+                        }
                     }
                 }
             });
@@ -2493,6 +2508,53 @@ mod tests {
         assert!(state.width > 0.9, "anti-phase width {}", state.width);
         assert!(state.balance.abs() < 0.05);
         assert_eq!(state.energy, 0.0, "the downmix itself is silent");
+    }
+
+    #[test]
+    fn a_file_source_plays_at_its_nominal_rate() {
+        let directory = std::env::temp_dir().join(format!(
+            "vibe-pace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("pcm.raw");
+        let mut pcm = Vec::with_capacity(HOP * 8 * 4);
+        for i in 0..(HOP * 4) {
+            let value = 0.3 * (std::f32::consts::TAU * 440.0 * i as f32 / 48_000.0).sin();
+            pcm.extend_from_slice(&value.to_le_bytes());
+            pcm.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&path, pcm).unwrap();
+
+        let capture = Capture::start(CaptureConfig {
+            backend: Backend::File(path),
+            target: None,
+            format: PcmFormat::default(),
+            loop_file: true,
+        })
+        .unwrap();
+        let start = Instant::now();
+        let mut last = None;
+        let mut hops = 0;
+        while start.elapsed() < Duration::from_millis(300) {
+            let state = capture.snapshot();
+            if state.updated != last {
+                last = state.updated;
+                hops += 1;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        std::fs::remove_dir_all(&directory).unwrap();
+        // Realtime is 94 hops per second, so about 28 in 300 ms. Allow a wide
+        // band for scheduler noise, but reject the unpaced 3000 hops per second.
+        assert!(
+            (6..=45).contains(&hops),
+            "file source ran at {hops} hops in 300 ms instead of about 28"
+        );
     }
 
     #[test]
