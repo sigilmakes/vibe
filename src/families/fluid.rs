@@ -29,10 +29,11 @@ fn unit(v: f32) -> f32 {
     }
 }
 
-/// Keep the clock small enough that trigonometric fields stay precise.
+/// The clock must not wrap: fields mix many incommensurate frequencies, so
+/// any modular reset would snap the whole frame.
 fn clock(time: f32) -> f32 {
     if time.is_finite() {
-        time.rem_euclid(TAU * 64.0)
+        time
     } else {
         0.0
     }
@@ -776,6 +777,13 @@ mod tests {
                 "style {style} ignores audio"
             );
         }
+    }
+
+    #[test]
+    fn clock_does_not_wrap() {
+        let t = 64.0 * TAU + 0.25;
+        assert_eq!(clock(t), t);
+        assert_eq!(clock(f32::NAN), 0.0);
     }
 
     #[test]

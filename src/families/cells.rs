@@ -177,11 +177,26 @@ impl Renderer {
                 }
             }
             3 => {
-                for dy in 0..3 {
-                    for dx in 0..3 {
-                        let i = (y + dy) * W + x + dx;
-                        if self.cells[i] == 1 {
-                            self.cells[i] = 2;
+                // The forest is sparse, so a fixed 3x3 stamp usually lands on
+                // ash. Walk outward from this band's source until standing
+                // trees are found, then ignite up to `amount` of them.
+                let mut lit = 0usize;
+                'rings: for radius in 0..=12i32 {
+                    for dy in -radius..=radius {
+                        for dx in -radius..=radius {
+                            if radius > 0 && dx.abs() != radius && dy.abs() != radius {
+                                continue;
+                            }
+                            let x = (SOURCES[channel].0 as i32 + dx).rem_euclid(W as i32) as usize;
+                            let y = (SOURCES[channel].1 as i32 + dy).rem_euclid(H as i32) as usize;
+                            let i = y * W + x;
+                            if self.cells[i] == 1 {
+                                self.cells[i] = 2;
+                                lit += 1;
+                                if lit >= usize::from(amount.max(1)) {
+                                    break 'rings;
+                                }
+                            }
                         }
                     }
                 }
@@ -605,6 +620,17 @@ mod tests {
         tissue.step(4, &[0.0; 4]);
         assert_eq!(tissue.cells[27 * W + 31], 5); // Refractory cannot fire.
         assert_eq!(tissue.cells[26 * W + 30], 1);
+    }
+
+    #[test]
+    fn forest_fire_ignition_finds_sparse_trees() {
+        let mut fire = blank(3);
+        // One tree inside the search radius, but outside the old fixed 3x3 stamp.
+        let (sx, sy) = SOURCES[0];
+        let tree = sy * W + sx + 5;
+        fire.cells[tree] = 1;
+        fire.inject(3, 0, 1);
+        assert_eq!(fire.cells[tree], 2, "band strike missed a standing tree");
     }
 
     #[test]

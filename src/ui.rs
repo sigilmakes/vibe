@@ -9,6 +9,8 @@ use ratatui::{
     Frame,
 };
 
+/// Raw analyser values for the analysis overlay. `sensitivity` is the
+/// separate visual response multiplier, not applied to these readings.
 pub struct Status<'a> {
     pub bass: f32,
     pub mid: f32,

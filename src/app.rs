@@ -51,7 +51,7 @@ impl View<'_> {
             beat: self.audio.beat,
             bpm: self.audio.bpm,
             tempo_confidence: self.audio.tempo_confidence,
-            bands: self.bands,
+            bands: &self.audio.bands,
         }
     }
 }
@@ -1013,20 +1013,21 @@ fn demo_audio(t: f32) -> audio::AudioState {
     state.onset = kick.max(hat * 0.4);
     state.transients = [kick, hat * 0.6, hat, hat * 0.8];
     state.novelty = kick.max(hat);
-    state.chroma = [
-        1.0 / 3.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0 / 3.0,
-        0.0,
-        0.0,
-        1.0 / 3.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-    ];
+    // A slowly rotating triad keeps pitch-driven hue alive in demo mode.
+    let mut chroma = [0.0_f32; 12];
+    for (i, value) in chroma.iter_mut().enumerate() {
+        *value = (i as f32 * 0.9 + t * 0.35).sin().max(0.0).powi(4);
+    }
+    let total: f32 = chroma.iter().sum();
+    if total > 0.0 {
+        for value in &mut chroma {
+            *value /= total;
+        }
+    }
+    state.chroma = chroma;
+    // Demo audio also exercises the stereo features live capture provides.
+    state.width = 0.25 + 0.15 * (t * 0.07).sin().abs();
+    state.balance = 0.35 * (t * 0.11).sin();
     state.centroid = 0.25 + hat * 0.45;
     state.flatness = hat * 0.5;
     state.kick = kick;
@@ -1129,6 +1130,42 @@ mod tests {
         let quiet = reactivity(&state, 0.5);
         assert!((quiet.energy - 0.2).abs() < 1e-6);
         assert!((quiet.waveform[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn status_reads_raw_analyser_bands_not_the_scaled_visual_input() {
+        let mut app = demo_app();
+        app.config.appearance.sensitivity = 2.0;
+        let view = app.view(4.2);
+        let status = view.status();
+        assert_eq!(status.sensitivity, 2.0);
+        for (raw, shown) in view.audio.bands.iter().zip(status.bands) {
+            assert_eq!(raw, shown, "analysis overlay shows scaled bands");
+        }
+        assert!(
+            view.bands
+                .iter()
+                .zip(view.audio.bands.iter())
+                .any(|(a, b)| a > b),
+            "sensitivity did not scale the scene input"
+        );
+    }
+
+    #[test]
+    fn demo_audio_exercises_stereo_and_a_moving_chroma() {
+        let a = demo_audio(1.0);
+        let b = demo_audio(3.0);
+        assert_ne!(a.balance, b.balance, "demo balance is static");
+        assert_ne!(a.width, b.width, "demo width is static");
+        assert_ne!(a.chroma, b.chroma, "demo chroma is static");
+        for (width, balance) in [(a.width, a.balance), (b.width, b.balance)] {
+            assert!((0.0..=1.0).contains(&width));
+            assert!((-1.0..=1.0).contains(&balance));
+        }
+        for state in [a, b] {
+            let total: f32 = state.chroma.iter().sum();
+            assert!((total - 1.0).abs() < 1e-5, "chroma is not normalised");
+        }
     }
 
     #[test]

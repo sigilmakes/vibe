@@ -120,8 +120,9 @@ impl Renderer {
         self.chroma = approach_hue(self.chroma, chroma_hue(audio), (dt * 8.0).min(1.0));
         self.phase = (self.phase + dt * (0.4 + unit(audio.energy) * 1.2 + self.env[1] * 0.5))
             .rem_euclid(TAU * 16.0);
-        self.scroll = (self.scroll + dt * (0.5 + unit(audio.energy) * 1.5 + self.env[3] * 0.4))
-            .rem_euclid(20.0);
+        // No modular reset: scroll feeds sines with many different rates, so a
+        // wrap would snap every ring and rail at once.
+        self.scroll += dt * (0.5 + unit(audio.energy) * 1.5 + self.env[3] * 0.4);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -570,6 +571,33 @@ mod tests {
         assert_eq!(NAMES.len(), 10);
         let unique: HashSet<_> = NAMES.iter().collect();
         assert_eq!(unique.len(), NAMES.len());
+    }
+
+    #[test]
+    fn scroll_keeps_accumulating_past_one_turn() {
+        let mut renderer = Renderer {
+            scroll: 20.0 - 0.001,
+            last_time: Some(0.0),
+            ..Renderer::default()
+        };
+        let mut buf = Buffer::empty(AREA);
+        for frame in 1..=4 {
+            renderer.draw(
+                &mut buf,
+                AREA,
+                frame as f32 / 60.0,
+                0,
+                0,
+                &[0.4; 32],
+                &Reactivity::default(),
+                &Theme::default(),
+            );
+        }
+        assert!(
+            renderer.scroll > 20.0,
+            "scroll reset to {} instead of accumulating",
+            renderer.scroll
+        );
     }
 
     #[test]
